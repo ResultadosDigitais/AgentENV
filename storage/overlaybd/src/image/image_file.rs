@@ -9,8 +9,9 @@ use crate::io::transient_io_ring::shared_transient_io_ring;
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
-    open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs, LSMTFile,
-    LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, PARALLEL_LOAD_INDEX,
+    open_file_rw, open_files_ro_with_premerged_cache, stack_files, validate_readonly_layer,
+    CommitArgs, LSMTFile, LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy,
+    PARALLEL_LOAD_INDEX,
 };
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
 use anyhow::{bail, Context, Result};
@@ -485,27 +486,30 @@ impl ImageFile {
         index: usize,
     ) -> Result<OpenedLowerLayer> {
         let local_path = Self::open_localfile_path(&layer).await?;
-        let mut opened = if let Some(local_path) = local_path {
-            match Self::open_ro_file(&local_path, image_service).await {
-                Ok(file) => OpenedLowerLayer {
-                    file,
-                    download: None,
-                },
-                Err(err) if is_not_found(&err) && !layer.uuid.is_empty() => {
-                    Self::open_ro_p2p_uuid(image_service, &layer).await?
-                }
-                Err(err) => return Err(err),
+        let mut opened = match local_path {
+            Some(local_path) => {
+                Self::open_local_lower_layer(
+                    image_service,
+                    repo_blob_url,
+                    download_cfg,
+                    collect_download_requests,
+                    &layer,
+                    index,
+                    local_path,
+                )
+                .await?
             }
-        } else {
-            Self::open_ro_remote(
-                image_service,
-                repo_blob_url,
-                download_cfg,
-                collect_download_requests,
-                &layer,
-                index,
-            )
-            .await?
+            None => {
+                Self::open_ro_remote(
+                    image_service,
+                    repo_blob_url,
+                    download_cfg,
+                    collect_download_requests,
+                    &layer,
+                    index,
+                )
+                .await?
+            }
         };
 
         if let Some(prefetcher) = prefetcher {
@@ -522,6 +526,74 @@ impl ImageFile {
         }
 
         Ok(opened)
+    }
+
+    /// Open a lower layer from a local cache/commit file, self-healing when the
+    /// entry is missing or corrupt.
+    ///
+    /// A partial cache eviction (for example after a host disk-pressure episode)
+    /// can leave the image-cache or snapshot-local-cache index pointing at a
+    /// commit file that no longer exists, or whose content was truncated or
+    /// zeroed. That must behave like a cache miss: drop the broken local entry
+    /// and refetch the layer through the same remote path used for layers that
+    /// were never cached, instead of failing the whole image open with a
+    /// low-level LSMT header/trailer error.
+    async fn open_local_lower_layer(
+        image_service: &ImageService,
+        repo_blob_url: &str,
+        download_cfg: &DownloadConfig,
+        collect_download_requests: bool,
+        layer: &LayerConfig,
+        index: usize,
+        local_path: PathBuf,
+    ) -> Result<OpenedLowerLayer> {
+        let local_result = match Self::open_ro_file(&local_path, image_service).await {
+            Ok(file) => match validate_readonly_layer(&file).await {
+                Ok(()) => Ok(OpenedLowerLayer {
+                    file,
+                    download: None,
+                }),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        };
+
+        let local_err = match local_result {
+            Ok(opened) => return Ok(opened),
+            Err(err) => err,
+        };
+
+        warn!(
+            layer_index = index,
+            path = %local_path.display(),
+            error = ?local_err,
+            "local lower layer is missing or corrupt; invalidating cache entry and refetching from remote"
+        );
+        if let Err(remove_err) = tokio::fs::remove_file(&local_path).await {
+            if remove_err.kind() != ErrorKind::NotFound {
+                warn!(
+                    layer_index = index,
+                    path = %local_path.display(),
+                    error = ?remove_err,
+                    "failed to remove broken local lower layer; continuing with remote refetch"
+                );
+            }
+        }
+
+        Self::open_ro_remote(
+            image_service,
+            repo_blob_url,
+            download_cfg,
+            collect_download_requests,
+            layer,
+            index,
+        )
+        .await
+        .map_err(|remote_err| {
+            local_err.context(format!(
+                "self-heal refetch of lower layer {index} failed: {remote_err:#}"
+            ))
+        })
     }
 
     async fn open_upper(upper: &UpperConfig, io_ring: IoRingHandle) -> Result<Option<LSMTFile>> {
@@ -640,13 +712,9 @@ impl ImageFile {
         layer: &LayerConfig,
         index: usize,
     ) -> Result<OpenedLowerLayer> {
-        if layer.digest.is_empty() {
-            bail!("lower layer {index} has no local file and no digest");
-        }
-        if repo_blob_url.is_empty() {
-            bail!("repoBlobUrl is empty for remote lower layer");
-        }
-
+        // The p2p uuid facade needs neither digest nor repoBlobUrl, so it is
+        // tried first; this also keeps it as the preferred self-heal source
+        // when a local cached layer turns out missing or corrupt.
         if !layer.uuid.is_empty() && image_service.p2p_uuid_address().is_some() {
             match Self::open_ro_p2p_uuid(image_service, layer).await {
                 Ok(opened) => return Ok(opened),
@@ -659,6 +727,13 @@ impl ImageFile {
                     );
                 }
             }
+        }
+
+        if layer.digest.is_empty() {
+            bail!("lower layer {index} has no local file and no digest");
+        }
+        if repo_blob_url.is_empty() {
+            bail!("repoBlobUrl is empty for remote lower layer");
         }
 
         let url = format!("{}/{}", repo_blob_url.trim_end_matches('/'), layer.digest);
@@ -700,14 +775,6 @@ impl ImageFile {
             download,
         })
     }
-}
-
-fn is_not_found(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == ErrorKind::NotFound)
-    })
 }
 
 impl Drop for ImageFile {
@@ -2070,6 +2137,118 @@ mod tests {
                 || format!("{err:?}").contains("NotFound"),
             "expected not-found error, got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_local_lower_self_heals_via_remote_refetch() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        let payload = vec![0x81; 8192];
+        create_sealed_lower(&lower_path, &lower_index, &payload)
+            .await
+            .expect("build sealed lower");
+        let blob = std::fs::read(&lower_path).expect("read lower blob");
+        let digest = digest_of(&blob);
+
+        // Simulate a partial cache eviction that left a zeroed commit file
+        // behind: the cache index still points at it, but the LSMT header is
+        // gone ("header magic/type don't match").
+        let corrupt_path = tmp.path().join("image-cache").join("commit");
+        std::fs::create_dir_all(corrupt_path.parent().expect("parent")).expect("create cache dir");
+        std::fs::write(&corrupt_path, vec![0u8; blob.len()]).expect("write corrupt commit");
+
+        let remote_state = RemoteLayerState {
+            blob: Arc::new(blob),
+            data_bytes: Arc::new(AtomicUsize::new(0)),
+            digest: digest.clone(),
+        };
+        let remote_app = Router::new()
+            .route("/{*path}", any(handle_remote_request))
+            .route("/token", get(handle_token))
+            .with_state(remote_state.clone());
+        let (remote_base, remote_handle) = spawn_server(remote_app).await;
+
+        let service = build_service(&tmp).await;
+        let image_cfg = ImageConfig {
+            repo_blob_url: format!("{remote_base}/v2/ns/repo/blobs"),
+            lowers: vec![LayerConfig {
+                file: corrupt_path.to_string_lossy().into_owned(),
+                digest,
+                size: lower_path.metadata().expect("lower metadata").len(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig::default(),
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("corrupt local lower should self-heal from remote");
+        let got = image.read_at(0, payload.len()).await.expect("read layer");
+
+        assert_eq!(got.as_ref(), payload.as_slice());
+        assert!(remote_state.data_bytes.load(AtomicOrdering::Relaxed) > 0);
+        assert!(
+            !corrupt_path.exists(),
+            "corrupt cache entry should be invalidated"
+        );
+        remote_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_missing_local_lower_self_heals_via_remote_refetch() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        let payload = vec![0x82; 8192];
+        create_sealed_lower(&lower_path, &lower_index, &payload)
+            .await
+            .expect("build sealed lower");
+        let blob = std::fs::read(&lower_path).expect("read lower blob");
+        let digest = digest_of(&blob);
+
+        // The cache index references a commit file that was evicted from disk.
+        let missing_path = tmp.path().join("image-cache").join("missing.commit");
+
+        let remote_state = RemoteLayerState {
+            blob: Arc::new(blob),
+            data_bytes: Arc::new(AtomicUsize::new(0)),
+            digest: digest.clone(),
+        };
+        let remote_app = Router::new()
+            .route("/{*path}", any(handle_remote_request))
+            .route("/token", get(handle_token))
+            .with_state(remote_state.clone());
+        let (remote_base, remote_handle) = spawn_server(remote_app).await;
+
+        let service = build_service(&tmp).await;
+        let image_cfg = ImageConfig {
+            repo_blob_url: format!("{remote_base}/v2/ns/repo/blobs"),
+            lowers: vec![LayerConfig {
+                file: missing_path.to_string_lossy().into_owned(),
+                digest,
+                size: lower_path.metadata().expect("lower metadata").len(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig::default(),
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("missing local lower should self-heal from remote");
+        let got = image.read_at(0, payload.len()).await.expect("read layer");
+
+        assert_eq!(got.as_ref(), payload.as_slice());
+        assert!(remote_state.data_bytes.load(AtomicOrdering::Relaxed) > 0);
+        remote_handle.abort();
     }
 
     #[tokio::test]
