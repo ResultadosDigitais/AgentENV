@@ -43,6 +43,10 @@ make k8s-build
 
 This builds three images: `agentenv-runtime:latest`, `agentenv-gateway:latest`, and `agentenv-scheduler:latest`.
 
+## Configure the Access-Token Seed (Optional)
+
+See [Secure Sandboxes](../security/secure-sandboxes.md) for the optional shared seed configuration and Kubernetes Secret example.
+
 ## Deploy
 
 ```bash
@@ -95,6 +99,10 @@ make k8s-delete
 ## Local Development (k3s)
 
 A dedicated `local-dev` overlay mounts the repository's `env/` directory directly into the DaemonSet at `/workspace/env`, avoiding runtime asset copies:
+
+This overlay also generates `agentenv-runtime-secrets` with a fixed test-only
+seed so local and E2E deployments do not require production secret management.
+Do not reuse that value outside local development.
 
 ```bash
 make k8s-build

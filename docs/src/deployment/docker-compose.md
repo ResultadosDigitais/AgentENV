@@ -32,6 +32,11 @@ git clone https://github.com/kvcache-ai/AgentENV.git
 cd AgentENV
 ```
 
+## Configure the Access-Token Seed (Optional)
+
+See [Secure Sandboxes](../security/secure-sandboxes.md)
+if the deployment needs future cross-node sandbox recovery.
+
 ## Start the Cluster
 
 ```bash

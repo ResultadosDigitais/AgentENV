@@ -61,8 +61,10 @@ curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/in
   | sudo bash
 ```
 
-Edit `/etc/default/aenv` on each machine without removing the paths written by
-the installer. Node A uses:
+Edit `/etc/default/aenv` on each machine without removing the paths written by the installer.
+See [Secure Sandboxes](../security/secure-sandboxes.md) if the deployment needs future cross-node sandbox recovery.
+
+Node A uses:
 
 ```bash
 API_ADDR="0.0.0.0:8000"
