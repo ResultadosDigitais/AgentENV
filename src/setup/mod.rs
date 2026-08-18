@@ -1,6 +1,7 @@
 mod deps;
 mod kvm;
 mod network_capacity;
+mod orphans;
 pub mod overlaybd;
 mod packages;
 mod ublk;
@@ -30,6 +31,13 @@ pub async fn ensure_provisioning(config: &AppConfig) -> Result<()> {
     deps::write_generated_overlaybd_global_configs(config, None)?;
     deps::resolve_tools_image(config, config.resolved_tools_version()).await?;
     Ok(())
+}
+
+/// Terminate leftover `firecracker`/`uvm-ublk-daemon` processes orphaned by a
+/// previous server incarnation before they can wedge startup (ublk socket
+/// conflicts, RocksDB `LOCK` contention on the persisted-sandbox store).
+pub async fn reap_orphaned_runtime_processes(config: &AppConfig) -> Result<()> {
+    orphans::reap(config).await
 }
 
 /// Provision machine-wide prerequisites for the configured runtime account.
