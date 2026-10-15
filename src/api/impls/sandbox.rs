@@ -13,8 +13,9 @@ use uuid::Uuid;
 use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
-    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CreateSandboxRequest, MemoryLimitState, NewTimeout, OrchestratorError, ResourceRequest,
+    SandboxForkChildSpec, SandboxLaunchSource, SandboxListFilter, SandboxMetadata,
+    SandboxResourceStatus, SandboxState, SandboxTimeoutAction,
 };
 use crate::prometheus::SandboxStageTimer;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
@@ -71,6 +72,8 @@ impl From<OrchestratorError> for models::Error {
                 ),
             ),
             OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
+            OrchestratorError::UnsupportedResources(_) => Self::new(400, err.to_string()),
+            OrchestratorError::InsufficientCapacity(_) => Self::new(409, err.to_string()),
             other => ApiImpl::internal_error(&other),
         }
     }
@@ -337,6 +340,7 @@ impl From<SandboxTimeoutAction> for models::SandboxOnTimeout {
 
 impl From<SandboxMetadata> for models::ListedSandbox {
     fn from(m: SandboxMetadata) -> Self {
+        let allocated = m.allocated_resources();
         Self {
             template_id: m.snapshot_id,
             alias: m.snapshot_alias,
@@ -344,8 +348,10 @@ impl From<SandboxMetadata> for models::ListedSandbox {
             client_id: "".to_string(), // Deprecated field, only reserved for E2B Python SDK.
             started_at: started_at(m.created_at),
             end_at: end_at(m.expires_at),
-            cpu_count: m.resources.cpu_count,
-            memory_mb: m.resources.memory_mib,
+            cpu_count: allocated.cpu_count,
+            memory_mb: allocated.memory_mib,
+            max_cpu_count: Some(m.resources.cpu_count),
+            max_memory_mb: Some(m.resources.memory_mib),
             disk_size_mb: m.resources.disk_size_mib,
             metadata: m.user_metadata,
             state: m.state.into(),
@@ -420,6 +426,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
         let allow_internet_access = Some(allow_internet_access_from_base_policy(
             m.network_policy.base_policy,
         ));
+        let allocated = m.allocated_resources();
 
         Self {
             template_id: m.snapshot_id,
@@ -432,8 +439,10 @@ impl From<SandboxMetadata> for models::SandboxDetail {
             envd_access_token: None,
             allow_internet_access,
             domain: None,
-            cpu_count: m.resources.cpu_count,
-            memory_mb: m.resources.memory_mib,
+            cpu_count: allocated.cpu_count,
+            memory_mb: allocated.memory_mib,
+            max_cpu_count: Some(m.resources.cpu_count),
+            max_memory_mb: Some(m.resources.memory_mib),
             disk_size_mb: m.resources.disk_size_mib,
             metadata: m.user_metadata,
             state: m.state.into(),
@@ -443,6 +452,31 @@ impl From<SandboxMetadata> for models::SandboxDetail {
                 on_timeout: m.timeout_action.into(),
             }),
             volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
+        }
+    }
+}
+
+fn nullable(value: Option<u32>) -> Option<Nullable<u32>> {
+    Some(value.map_or(Nullable::Null, Nullable::Present))
+}
+
+impl From<SandboxResourceStatus> for models::SandboxResourceStatus {
+    fn from(status: SandboxResourceStatus) -> Self {
+        let memory_state = match status.memory_state() {
+            MemoryLimitState::Converged => models::SandboxMemoryLimitState::Converged,
+            MemoryLimitState::Converging => models::SandboxMemoryLimitState::Converging,
+            MemoryLimitState::Unobservable => models::SandboxMemoryLimitState::Unobservable,
+        };
+        let enforcement = status.enforcement.unwrap_or_default();
+        Self {
+            cpu_count: status.limits.cpu_count,
+            memory_mb: status.limits.memory_mib,
+            max_cpu_count: status.shape.cpu_count,
+            max_memory_mb: status.shape.memory_mib,
+            cpu_quota: nullable(enforcement.cpu_quota),
+            balloon_target_mb: nullable(enforcement.balloon_target_mib),
+            balloon_actual_mb: nullable(enforcement.balloon_actual_mib),
+            memory_state,
         }
     }
 }
@@ -794,6 +828,8 @@ impl Sandboxes<()> for ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            // The cold-start resources above define the VM shape itself.
+            resources: ResourceRequest::default(),
         };
 
         match timer
@@ -1117,6 +1153,10 @@ impl Sandboxes<()> for ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            resources: ResourceRequest {
+                cpu_count: body.cpu_count,
+                memory_mib: body.memory_mb,
+            },
         };
 
         match timer
@@ -1162,9 +1202,12 @@ impl Sandboxes<()> for ApiImpl {
                 )
                 .await;
                 cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::internal_error(&err),
-                ))
+                Ok(match err {
+                    OrchestratorError::UnsupportedResources(_) => {
+                        SandboxesPostResponse::Status400_BadRequest(err.into())
+                    }
+                    err => SandboxesPostResponse::Status500_ServerError(Self::internal_error(&err)),
+                })
             }
         }
     }
@@ -1190,6 +1233,8 @@ impl Sandboxes<()> for ApiImpl {
             custom_extension_params: body.custom_extension_params.clone(),
             mcp: body.mcp.clone(),
             volume_mounts: body.volume_mounts.clone(),
+            cpu_count: body.cpu_count,
+            memory_mb: body.memory_mb,
         };
         Ok(
             match self
@@ -1638,6 +1683,70 @@ impl Sandboxes<()> for ApiImpl {
                 ))
             }
             Err(err) => Ok(SandboxesSandboxIdNetworkPutResponse::Status500_ServerError(err.into())),
+        }
+    }
+
+    async fn sandboxes_sandbox_id_resources_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdResourcesGetPathParams,
+    ) -> Result<SandboxesSandboxIdResourcesGetResponse, ()> {
+        use SandboxesSandboxIdResourcesGetResponse::*;
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(Status404_NotFound(sandbox_not_found(path_id)));
+        };
+        match self.orchestrator.sandbox_resource_status(sandbox_id).await {
+            Ok(status) => Ok(Status200_SuccessfullyReturnedTheSandboxResources(
+                status.into(),
+            )),
+            Err(OrchestratorError::SandboxNotFound(id)) => {
+                Ok(Status404_NotFound(sandbox_not_found(id)))
+            }
+            Err(err) => Ok(Status500_ServerError(err.into())),
+        }
+    }
+
+    async fn sandboxes_sandbox_id_resources_patch(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdResourcesPatchPathParams,
+        body: &models::SandboxResourcesUpdate,
+    ) -> Result<SandboxesSandboxIdResourcesPatchResponse, ()> {
+        use SandboxesSandboxIdResourcesPatchResponse::*;
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(Status404_NotFound(sandbox_not_found(path_id)));
+        };
+        let request = ResourceRequest {
+            cpu_count: body.cpu_count,
+            memory_mib: body.memory_mb,
+        };
+        match self.orchestrator.resize_sandbox(sandbox_id, request).await {
+            Ok(status) => Ok(Status200_TheNewLimitsAreEnforcedByTheVMM(status.into())),
+            Err(OrchestratorError::SandboxNotFound(id)) => {
+                Ok(Status404_NotFound(sandbox_not_found(id)))
+            }
+            Err(err @ OrchestratorError::UnsupportedResources(_)) => {
+                Ok(Status400_BadRequest(err.into()))
+            }
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                Ok(Status409_Conflict(Self::error(
+                    409,
+                    format!("sandbox resources cannot be changed from {state} state"),
+                )))
+            }
+            Err(
+                err @ (OrchestratorError::InsufficientCapacity(_)
+                | OrchestratorError::SandboxOperationConflict { .. }),
+            ) => Ok(Status409_Conflict(err.into())),
+            Err(err) => Ok(Status500_ServerError(err.into())),
         }
     }
 

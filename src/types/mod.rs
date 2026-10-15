@@ -13,7 +13,7 @@ pub use extra_drive::{
 pub(crate) use extra_drive::{ROOTFS_DRIVE_ID, USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX};
 pub use id::SandboxId;
 pub use image_configs::ImageConfigs;
-pub use resources::{bytes_to_mib_ceil, SandboxResources};
+pub use resources::{bytes_to_mib_ceil, ResourceLimits, SandboxResources};
 pub use runtime_artifacts::RuntimeArtifactSet;
 pub use snapshot_id::{SnapshotAlias, SnapshotId};
 pub use volume_mode::VolumeMode;
