@@ -180,6 +180,29 @@ vcpu_count = 2
 # iops = 3000                          # 3000 sustained IOPS
 # iops_burst = 500                     # 500 startup IOPS; not replenished
 
+[machine.balloon]
+# virtio-balloon device given to VMs at first boot (cold starts, template
+# builds). Restored VMs keep the device their snapshot was taken with.
+# false enforces memory limits below the VM shape; true lets the guest take
+# balloon memory back under pressure, which makes them advisory.
+deflate_on_oom = true
+# Balloon statistics interval in seconds; 0 disables them. Statistics let
+# GET /sandboxes/{sandboxID}/resources report the memory the balloon holds.
+stats_polling_interval_s = 0
+
+[resize]
+# Per-sandbox cpuCount/memoryMB below the VM shape on snapshot-based creates,
+# and live resize through PATCH /sandboxes/{sandboxID}/resources.
+enabled = false
+# Enforce CPU limits with a cgroup v2 cpu.max quota on the VMM process.
+cpu_quota = true
+# Smallest effective guest memory in MiB.
+min_memory_mib = 512
+# Optional node admission for resizes that grow a sandbox, as a percentage of
+# the node's CPUs / memory allocated to running sandboxes.
+# max_cpu_allocated_percent = 400
+# max_memory_allocated_percent = 90
+
 [envd]
 # Expected envd version baked into the tools drive.
 version = "0.5.15"

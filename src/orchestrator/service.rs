@@ -16,13 +16,13 @@ use crate::image::cache::{
 };
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
-    FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet,
-    SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
-    SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy,
-    SandboxRuntimeInfo,
+    FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, ResourceLimitPlan,
+    ResourceLimitStatus, RuntimeArtifactSet, SandboxAccessTokenGenerator, SandboxBackend,
+    SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec, SandboxLaunchConfig,
+    SandboxLogEntry, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
-use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
+use crate::types::{bytes_to_mib_ceil, ResourceLimits, SandboxId, SandboxResources};
 use crate::volume::VolumeManager;
 
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
@@ -31,6 +31,7 @@ use super::metrics::{
 };
 use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
+use super::resize::{ResizePolicy, ResourceRequest};
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
@@ -133,6 +134,51 @@ pub struct Orchestrator<
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
     volume_manager: Option<Arc<VolumeManager>>,
+    resize_policy: std::sync::RwLock<ResizePolicy>,
+    /// Serializes resizes so node admission sees each one's outcome.
+    resize_admission: Mutex<()>,
+}
+
+/// A sandbox's VM shape, effective limits, and, while it runs, how the VMM
+/// enforces them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SandboxResourceStatus {
+    pub shape: SandboxResources,
+    pub limits: ResourceLimits,
+    /// `None` unless the sandbox is running.
+    pub enforcement: Option<ResourceLimitStatus>,
+}
+
+/// Whether the guest has reached its memory limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryLimitState {
+    /// The balloon holds its target, or there is nothing to hold.
+    Converged,
+    /// The guest is still moving the balloon, or cannot release memory it uses.
+    Converging,
+    /// Not running, or the VM's balloon reports no statistics.
+    Unobservable,
+}
+
+impl SandboxResourceStatus {
+    pub fn memory_state(&self) -> MemoryLimitState {
+        let Some(enforcement) = self.enforcement else {
+            return MemoryLimitState::Unobservable;
+        };
+        match (
+            enforcement.balloon_target_mib,
+            enforcement.balloon_actual_mib,
+        ) {
+            (Some(target), Some(actual)) if actual == target => MemoryLimitState::Converged,
+            (Some(_), Some(_)) => MemoryLimitState::Converging,
+            // A deflated balloon gives the guest its whole memory back.
+            (Some(0), None) => MemoryLimitState::Converged,
+            (None, _) if self.limits.memory_mib >= self.shape.memory_mib => {
+                MemoryLimitState::Converged
+            }
+            _ => MemoryLimitState::Unobservable,
+        }
+    }
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -252,6 +298,8 @@ where
             image_refs,
             access_tokens,
             volume_manager,
+            resize_policy: std::sync::RwLock::new(ResizePolicy::from_global_config()),
+            resize_admission: Mutex::new(()),
         });
 
         Self::start_metrics_task(&orchestrator);
@@ -475,6 +523,7 @@ where
             volume_mounts,
             extra_drives: launch_extra_drives,
             extra_drives_in_snapshot,
+            resources: resource_request,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
@@ -492,6 +541,16 @@ where
                         node_mode: configured_mode,
                     });
                 }
+                let resource_limits = match self
+                    .resize_policy()
+                    .launch_limits(*snapshot.resources(), resource_request)
+                {
+                    Ok(limits) => limits,
+                    Err(message) => {
+                        self.counters.record_create_fail(1);
+                        return Err(OrchestratorError::UnsupportedResources(message));
+                    }
+                };
                 let launch_image_configs = committed.image_configs.clone();
                 let mut extra_mmds = serde_json::Map::new();
                 if !launch_image_configs.is_empty() {
@@ -524,6 +583,7 @@ where
                     virtualization_mode: committed.virtualization_mode,
                     runtime_versions: committed.runtime_versions.clone(),
                     resources: *snapshot.resources(),
+                    resource_limits,
                     context: committed.context.clone(),
                     startup: committed.startup.clone(),
                     image_configs: launch_image_configs,
@@ -619,7 +679,7 @@ where
                 self.publish_sandbox_event(
                     SandboxLifecycleEventType::Create,
                     metadata.id,
-                    metadata.resources,
+                    metadata.allocated_resources(),
                 );
                 Ok(metadata)
             }
@@ -793,9 +853,14 @@ where
         let mut outcomes = Vec::with_capacity(child_specs.len());
         let mut successes = 0u64;
         let now = SystemTime::now();
+        // Children restore the source VM, so they inherit its shape and
+        // limits; the CPU quota belongs to each VMM process and is reapplied.
+        let child_limit_plan = self.resize_policy().enabled.then(|| {
+            ResourceLimitPlan::new(source_metadata.resources, source_metadata.effective_limits())
+        });
         for (child, backend) in child_specs.into_iter().zip(forked_backends) {
             let sandbox_id = child.sandbox_id;
-            let backend = match backend {
+            let mut backend = match backend {
                 Ok(backend) => backend,
                 Err(err) => {
                     warn!(%sandbox_id, error = ?err, "failed to start forked sandbox");
@@ -803,6 +868,14 @@ where
                     continue;
                 }
             };
+            if let Some(plan) = child_limit_plan.as_ref() {
+                if let Err(err) = backend.apply_resource_limits(plan).await {
+                    warn!(%sandbox_id, error = ?err, "failed to apply resource limits to forked sandbox");
+                    Self::stop_failed_fork(backend, sandbox_id).await;
+                    outcomes.push(Err(Self::fork_child_error(sandbox_id, err)));
+                    continue;
+                }
+            }
 
             let mut metadata = source_metadata.clone();
             metadata.id = sandbox_id;
@@ -840,7 +913,7 @@ where
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Fork,
                 metadata.id,
-                metadata.resources,
+                metadata.allocated_resources(),
             );
             successes += 1;
             outcomes.push(Ok(metadata));
@@ -1342,7 +1415,7 @@ where
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
                 metadata.id,
-                metadata.resources,
+                metadata.allocated_resources(),
             );
         }
         if let Err(err) = self
@@ -1609,7 +1682,7 @@ where
                 "failed to persist paused sandbox state: {err:#}"
             )));
         }
-        let resources = persisted_metadata.resources;
+        let resources = persisted_metadata.allocated_resources();
         self.store.update(persisted_metadata.clone()).await?;
 
         // Stop the sandbox to free up resources.
@@ -1750,6 +1823,7 @@ where
                 Arc::clone(paused_state),
                 timeout,
                 metadata.resources,
+                metadata.resource_limits,
                 metadata
                     .secure
                     .then(|| self.access_tokens.generate(metadata.id)),
@@ -1761,7 +1835,7 @@ where
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Resume,
                 metadata.id,
-                metadata.resources,
+                metadata.allocated_resources(),
             );
         }
         resumed
@@ -2103,6 +2177,185 @@ where
         Ok(new_params)
     }
 
+    fn resize_policy(&self) -> ResizePolicy {
+        self.resize_policy
+            .read()
+            .expect("resize policy lock poisoned")
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resize_policy_for_test(&self, policy: ResizePolicy) {
+        *self
+            .resize_policy
+            .write()
+            .expect("resize policy lock poisoned") = policy;
+    }
+
+    /// Returns a sandbox's VM shape and effective limits, and, while it runs,
+    /// how the VMM currently enforces them.
+    pub async fn sandbox_resource_status(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<SandboxResourceStatus> {
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        let enforcement = if metadata.state == SandboxState::Running {
+            let handle = {
+                let sandboxes = self.sandboxes.read().await;
+                sandboxes.get(&sandbox_id).cloned()
+            };
+            match handle {
+                Some(handle) => {
+                    let sandbox = handle.lock().await;
+                    Some(sandbox.resource_limit_status().await.map_err(|source| {
+                        OrchestratorError::SandboxOperationFailed {
+                            sandbox_id,
+                            operation: SandboxOperation::ApplyResourceLimits,
+                            source,
+                        }
+                    })?)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        Ok(SandboxResourceStatus {
+            shape: metadata.resources,
+            limits: metadata.effective_limits(),
+            enforcement,
+        })
+    }
+
+    /// Changes the effective CPU and memory of a running sandbox inside its
+    /// VM shape. Returns once the VMM enforces the new limits; a balloon may
+    /// still be inflating or deflating inside the guest.
+    pub async fn resize_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request: ResourceRequest,
+    ) -> Result<SandboxResourceStatus> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("resize", sandbox_id, async move {
+            this.resize_sandbox_inner(sandbox_id, request).await
+        })
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "resize_sandbox",
+        skip(self),
+        fields(sandbox_id = %sandbox_id)
+    )]
+    async fn resize_sandbox_inner(
+        &self,
+        sandbox_id: SandboxId,
+        request: ResourceRequest,
+    ) -> Result<SandboxResourceStatus> {
+        let policy = self.resize_policy();
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+        let current = metadata.effective_limits();
+        let target = policy
+            .resize_limits(metadata.resources, current, request)
+            .map_err(OrchestratorError::UnsupportedResources)?;
+
+        let _admission = self.resize_admission.lock().await;
+        let node = self.metrics_snapshot().await?;
+        policy
+            .admit_growth(
+                current,
+                target,
+                u64::from(node.allocated_cpu),
+                node.allocated_memory_bytes / (1024 * 1024),
+            )
+            .map_err(OrchestratorError::InsufficientCapacity)?;
+
+        let handle = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&sandbox_id).cloned()
+        }
+        .ok_or(OrchestratorError::SandboxOperationConflict {
+            sandbox_id,
+            operation: SandboxOperation::ApplyResourceLimits,
+        })?;
+        let mut sandbox = handle.lock().await;
+        // A lifecycle operation may have run while this waited for the lock.
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+
+        let previous_plan = ResourceLimitPlan::new(metadata.resources, current);
+        let plan = ResourceLimitPlan::new(metadata.resources, target);
+        if let Err(source) = sandbox.apply_resource_limits(&plan).await {
+            if let Err(error) = sandbox.apply_resource_limits(&previous_plan).await {
+                warn!(error = %format_args!("{error:#}"), "failed to restore resource limits after a failed resize");
+            }
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::ApplyResourceLimits,
+                source,
+            });
+        }
+
+        let whole = ResourceLimits::whole(metadata.resources);
+        let update = self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                metadata.resource_limits = (target != whole).then_some(target);
+            })
+            .await;
+        if let Err(err) = update {
+            if let Err(error) = sandbox.apply_resource_limits(&previous_plan).await {
+                warn!(error = %format_args!("{error:#}"), "failed to restore resource limits after a lost resize race");
+            }
+            return Err(match err {
+                StoreError::StateConflict {
+                    sandbox_id,
+                    actual_state,
+                    ..
+                } => OrchestratorError::InvalidSandboxState {
+                    sandbox_id,
+                    state: actual_state,
+                },
+                other => OrchestratorError::from(other),
+            });
+        }
+        info!(
+            cpu_count = target.cpu_count,
+            memory_mib = target.memory_mib,
+            "sandbox resized"
+        );
+
+        let enforcement = sandbox.resource_limit_status().await.ok();
+        Ok(SandboxResourceStatus {
+            shape: metadata.resources,
+            limits: target,
+            enforcement,
+        })
+    }
+
     /// Returns the current orchestrator metrics snapshot.
     ///
     /// Counter fields are read atomically; resource fields are aggregated by
@@ -2114,7 +2367,7 @@ where
             .list_with_callback(|metadata| {
                 aggregate_resource_metrics(
                     &mut metrics,
-                    SandboxContribution::new(metadata.state, metadata.resources),
+                    SandboxContribution::new(metadata.state, metadata.allocated_resources()),
                 );
             })
             .await?;
@@ -2507,6 +2760,31 @@ where
                 operation: SandboxOperation::WaitReady,
                 source,
             });
+        }
+
+        // Enforce the sandbox's CPU/memory limits before it is handed out. A
+        // restored VM keeps its snapshot's balloon target, so this also
+        // returns memory a resized source had given up.
+        if let Some(limit_plan) = self
+            .resize_policy()
+            .enabled
+            .then(|| plan.resource_limit_plan())
+            .flatten()
+        {
+            let apply_result = {
+                let mut sandbox = handle.lock().await;
+                sandbox.apply_resource_limits(&limit_plan).await
+            };
+            if let Err(source) = apply_result {
+                warn!(error = %format_args!("{source:#}"), "failed to apply sandbox resource limits");
+                self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
+                    .await;
+                return Err(OrchestratorError::SandboxOperationFailed {
+                    sandbox_id,
+                    operation: SandboxOperation::ApplyResourceLimits,
+                    source,
+                });
+            }
         }
 
         // Check for shutdown again before we persist the final state and publish the proxy route.
