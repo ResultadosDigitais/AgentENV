@@ -211,8 +211,7 @@ fn make_threaded(dir: &Path) -> Result<()> {
     if read_trimmed(&cgroup_type)? == "threaded" {
         return Ok(());
     }
-    fs::write(&cgroup_type, "threaded")
-        .with_context(|| format!("make {} threaded", dir.display()))
+    fs::write(&cgroup_type, "threaded").with_context(|| format!("make {} threaded", dir.display()))
 }
 
 fn enable_cpu_controller(dir: &Path) -> Result<()> {
@@ -315,7 +314,10 @@ mod tests {
         assert_eq!(read_trimmed(&root.join("cgroup.type"))?, "threaded");
         assert_eq!(read_trimmed(&own.join("cgroup.subtree_control"))?, "+cpu");
         assert_eq!(read_trimmed(&root.join("cgroup.subtree_control"))?, "+cpu");
-        assert!(!root.join("stale").exists(), "empty stale cgroups are removed");
+        assert!(
+            !root.join("stale").exists(),
+            "empty stale cgroups are removed"
+        );
         Ok(())
     }
 

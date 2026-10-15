@@ -92,9 +92,6 @@ mod tests {
                 disk_size_mib: 20480,
             }
         );
-        assert_eq!(
-            shape.limited_by(Some(ResourceLimits::whole(shape))),
-            shape
-        );
+        assert_eq!(shape.limited_by(Some(ResourceLimits::whole(shape))), shape);
     }
 }

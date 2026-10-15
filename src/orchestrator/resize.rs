@@ -264,7 +264,10 @@ mod tests {
     #[test]
     fn launch_limits_default_to_the_whole_shape() {
         let policy = ResizePolicy::disabled();
-        assert_eq!(policy.launch_limits(shape(8, 16384), request(None, None)), Ok(None));
+        assert_eq!(
+            policy.launch_limits(shape(8, 16384), request(None, None)),
+            Ok(None)
+        );
         assert_eq!(
             policy.launch_limits(shape(8, 16384), request(Some(8), Some(16384))),
             Ok(None),

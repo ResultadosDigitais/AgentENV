@@ -18,6 +18,7 @@ use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
     DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
 };
+use super::super::resize::NodeCapacity;
 use super::super::types::SandboxLaunchSource;
 use super::sandbox_metrics::metrics_concurrency;
 use super::*;
@@ -38,7 +39,6 @@ use crate::sandbox::{
 };
 use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
-use super::super::resize::NodeCapacity;
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -6069,7 +6069,10 @@ async fn create_below_the_template_shape_enforces_limits() -> Result<()> {
         .create_sandbox(shaped_request(8, 16384, resources(Some(4), Some(8192))))
         .await?;
 
-    assert_eq!(created.resources.cpu_count, 8, "the VM shape is the template's");
+    assert_eq!(
+        created.resources.cpu_count, 8,
+        "the VM shape is the template's"
+    );
     assert_eq!(created.resource_limits, Some(limits(4, 8192)));
     assert_eq!(created.allocated_resources().cpu_count, 4);
     assert_eq!(created.allocated_resources().memory_mib, 8192);

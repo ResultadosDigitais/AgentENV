@@ -626,11 +626,15 @@ impl SandboxBackend for FirecrackerSandbox {
     async fn apply_resource_limits(&mut self, plan: &ResourceLimitPlan) -> Result<()> {
         self.apply_cpu_quota(plan.cpu_quota())?;
         let balloon_target_mib = plan.balloon_target_mib();
-        if let Err(error) = self.fc_instance.set_balloon_target(balloon_target_mib).await {
+        if let Err(error) = self
+            .fc_instance
+            .set_balloon_target(balloon_target_mib)
+            .await
+        {
             if balloon_target_mib > 0 {
-                return Err(error.context(
-                    "memory below the VM shape needs the VM's virtio-balloon device",
-                ));
+                return Err(
+                    error.context("memory below the VM shape needs the VM's virtio-balloon device")
+                );
             }
             // A VM without a balloon already has its whole memory.
             debug!(error = %format_args!("{error:#}"), "no balloon to deflate");

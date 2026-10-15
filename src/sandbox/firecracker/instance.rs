@@ -10,9 +10,9 @@ use firecracker_client::models::instance_action_info::ActionType;
 use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
-    Balloon, BalloonStats, BalloonUpdate, BootSource, DirtyMemoryRanges, Drive,
-    InstanceActionInfo, Logger, MachineConfiguration, MemoryBackend, NetworkInterface,
-    NetworkOverride, RateLimiter, SnapshotCreateParams, SnapshotLoadParams, Vm,
+    Balloon, BalloonStats, BalloonUpdate, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo,
+    Logger, MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
+    SnapshotCreateParams, SnapshotLoadParams, Vm,
 };
 use hyper::Method;
 use nix::sys::signal::{kill, Signal};

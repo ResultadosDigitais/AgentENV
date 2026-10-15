@@ -856,7 +856,10 @@ where
         // Children restore the source VM, so they inherit its shape and
         // limits; the CPU quota belongs to each VMM process and is reapplied.
         let child_limit_plan = self.resize_policy().enabled.then(|| {
-            ResourceLimitPlan::new(source_metadata.resources, source_metadata.effective_limits())
+            ResourceLimitPlan::new(
+                source_metadata.resources,
+                source_metadata.effective_limits(),
+            )
         });
         for (child, backend) in child_specs.into_iter().zip(forked_backends) {
             let sandbox_id = child.sandbox_id;
