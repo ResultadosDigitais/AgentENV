@@ -173,6 +173,7 @@ impl TemplateBuilder {
             cpu_count: config.machine.vcpu_count,
             memory_mib: config.machine.mem_size_mib,
             disk_size_mib: 0,
+            memory_request_mib: None,
         }
     }
 

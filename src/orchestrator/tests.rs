@@ -1113,6 +1113,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
         cpu_count: 2,
         memory_mib: 512,
         disk_size_mib: 1024,
+        memory_request_mib: None,
     };
     let expected_resources = SandboxResources {
         disk_size_mib: 4,

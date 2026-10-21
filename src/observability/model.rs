@@ -17,6 +17,9 @@ pub struct MachineInfo {
 pub struct NodeMetricsSnapshot {
     pub allocated_cpu: u32,
     pub allocated_memory_bytes: u64,
+    /// Sum of effective memory requests of active sandboxes (see
+    /// `OrchestratorMetrics::requested_memory_bytes`).
+    pub requested_memory_bytes: u64,
     pub cpu_percent: u32,
     pub cpu_count: u32,
     pub memory_used_bytes: u64,

@@ -91,6 +91,7 @@ async fn publish_captured_snapshot_for_test(
                     cpu_count: 1,
                     memory_mib: 128,
                     disk_size_mib: 0,
+                    memory_request_mib: None,
                 },
                 runtime_versions: sample_runtime_versions(),
                 virtualization_mode: agentenv::cfg::ConfigManager::global_config()

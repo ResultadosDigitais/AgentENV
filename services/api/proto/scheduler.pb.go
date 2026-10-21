@@ -921,8 +921,15 @@ type NodeSnapshot struct {
 	PausedSandboxCount         uint32 `protobuf:"varint,14,opt,name=paused_sandbox_count,json=pausedSandboxCount,proto3" json:"paused_sandbox_count,omitempty"`
 	PausedAllocatedCpu         uint32 `protobuf:"varint,15,opt,name=paused_allocated_cpu,json=pausedAllocatedCpu,proto3" json:"paused_allocated_cpu,omitempty"`
 	PausedAllocatedMemoryBytes uint64 `protobuf:"varint,16,opt,name=paused_allocated_memory_bytes,json=pausedAllocatedMemoryBytes,proto3" json:"paused_allocated_memory_bytes,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	// Sum of effective memory *requests* of the active running set. Equals
+	// allocated_memory_bytes unless sandboxes were created with an explicit
+	// memory_request_mb below their nominal limit. Older nodes do not report it
+	// (0). A node with allocated_memory_bytes > 0 always has requested > 0, so
+	// "requested == 0 && allocated > 0" identifies a non-reporting node and the
+	// scheduler falls back to allocated_memory_bytes (see filter.go).
+	RequestedMemoryBytes uint64 `protobuf:"varint,17,opt,name=requested_memory_bytes,json=requestedMemoryBytes,proto3" json:"requested_memory_bytes,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *NodeSnapshot) Reset() {
@@ -1063,6 +1070,13 @@ func (x *NodeSnapshot) GetPausedAllocatedCpu() uint32 {
 func (x *NodeSnapshot) GetPausedAllocatedMemoryBytes() uint64 {
 	if x != nil {
 		return x.PausedAllocatedMemoryBytes
+	}
+	return 0
+}
+
+func (x *NodeSnapshot) GetRequestedMemoryBytes() uint64 {
+	if x != nil {
+		return x.RequestedMemoryBytes
 	}
 	return 0
 }
@@ -2366,7 +2380,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"used_bytes\x18\x04 \x01(\x04R\tusedBytes\x12\x1f\n" +
 	"\vtotal_bytes\x18\x05 \x01(\x04R\n" +
-	"totalBytes\"\xe2\x05\n" +
+	"totalBytes\"\x98\x06\n" +
 	"\fNodeSnapshot\x120\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x18.scheduler.v1.NodeStatusR\x06status\x12#\n" +
 	"\rallocated_cpu\x18\x02 \x01(\rR\fallocatedCpu\x124\n" +
@@ -2385,7 +2399,8 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x13reported_at_unix_ms\x18\r \x01(\x03R\x10reportedAtUnixMs\x120\n" +
 	"\x14paused_sandbox_count\x18\x0e \x01(\rR\x12pausedSandboxCount\x120\n" +
 	"\x14paused_allocated_cpu\x18\x0f \x01(\rR\x12pausedAllocatedCpu\x12A\n" +
-	"\x1dpaused_allocated_memory_bytes\x18\x10 \x01(\x04R\x1apausedAllocatedMemoryBytes\"A\n" +
+	"\x1dpaused_allocated_memory_bytes\x18\x10 \x01(\x04R\x1apausedAllocatedMemoryBytes\x124\n" +
+	"\x16requested_memory_bytes\x18\x11 \x01(\x04R\x14requestedMemoryBytes\"A\n" +
 	"\vP2pEndpoint\x12\x18\n" +
 	"\abackend\x18\x01 \x01(\tR\abackend\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\"\xe5\x02\n" +

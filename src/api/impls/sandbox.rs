@@ -275,11 +275,28 @@ fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResource
             "diskSizeMB must be at least 1024 and divisible by 1024".to_string(),
         ));
     }
+    let memory_request_mib = match body.memory_request_mb {
+        None => None,
+        Some(0) => {
+            return Err(ApiImpl::error(
+                400,
+                "memoryRequestMB must be greater than 0".to_string(),
+            ))
+        }
+        Some(request) if request > memory_mib => {
+            return Err(ApiImpl::error(
+                400,
+                "memoryRequestMB must not exceed memoryMB".to_string(),
+            ))
+        }
+        Some(request) => Some(request),
+    };
     Ok(SandboxResources {
         cpu_count,
         memory_mib,
         // Zero means omitted; the orchestrator fills it from the resolved rootfs.
         disk_size_mib,
+        memory_request_mib,
     })
 }
 
@@ -1411,6 +1428,29 @@ mod tests {
                 "value with spaces".to_string()
             )]))
         );
+    }
+
+    #[test]
+    fn cold_start_resources_validates_memory_request() {
+        let mut body = models::NewColdSandbox::new("ubuntu:24.04".to_string());
+        body.memory_mb = Some(512);
+        assert_eq!(
+            cold_start_resources(&body).unwrap().memory_request_mib,
+            None
+        );
+
+        body.memory_request_mb = Some(256);
+        assert_eq!(
+            cold_start_resources(&body).unwrap().memory_request_mib,
+            Some(256)
+        );
+
+        body.memory_request_mb = Some(512);
+        assert!(cold_start_resources(&body).is_ok());
+        body.memory_request_mb = Some(513);
+        assert!(cold_start_resources(&body).is_err());
+        body.memory_request_mb = Some(0);
+        assert!(cold_start_resources(&body).is_err());
     }
 
     #[test]
