@@ -47,6 +47,24 @@ type NodeResourceLimit struct {
 	MaxMemoryUsedPercent      *uint32 `json:"max_memory_used_percent"`
 	MaxMemoryAllocatedPercent *uint32 `json:"max_memory_allocated_percent"` // can exceed 100 (overcommit)
 
+	// AdmissionMode selects which per-sandbox memory figure feeds
+	// max_memory_allocated_percent:
+	//   "nominal" (default/absent): sum of VM sizes (today's behavior).
+	//   "request": sum of memory requests (memory_request_mb, defaulting to the
+	//              VM size), plus the MaxMemoryLimitOvercommitRatio cap on the
+	//              sum of nominal limits.
+	//   "shadow":  decide exactly like "nominal" but evaluate "request" in
+	//              parallel, log divergences and count them in
+	//              agentenv_scheduler_admission_shadow_total.
+	// MaxMemoryUsedPercent (real host usage) is evaluated in every mode and is
+	// the backstop against host OOM when VMs grow towards their limits.
+	AdmissionMode *string `json:"admission_mode"`
+	// MaxMemoryLimitOvercommitRatio caps (sum of nominal VM sizes) /
+	// memory_total_bytes in "request" mode (and in the hypothetical "request"
+	// decision of "shadow" mode). Default 1.5. Ignored in "nominal" mode so
+	// that the default behavior is unchanged.
+	MaxMemoryLimitOvercommitRatio *float64 `json:"max_memory_limit_overcommit_ratio"`
+
 	// Limits that apply to the sum of the active running set plus paused
 	// sandboxes. Paused sandboxes have released their VM-side CPU / memory
 	// but still occupy persisted state on the node, so operators may want a
@@ -55,6 +73,58 @@ type NodeResourceLimit struct {
 	MaxSandboxCountIncludingPaused         *uint32 `json:"max_sandbox_count_including_paused"`
 	MaxAllocatedCPUIncludingPaused         *uint32 `json:"max_allocated_cpu_including_paused"`
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
+}
+
+// Admission modes accepted by NodeResourceLimit.AdmissionMode.
+const (
+	AdmissionModeNominal = "nominal"
+	AdmissionModeRequest = "request"
+	AdmissionModeShadow  = "shadow"
+
+	// DefaultMaxMemoryLimitOvercommitRatio applies when
+	// MaxMemoryLimitOvercommitRatio is unset.
+	DefaultMaxMemoryLimitOvercommitRatio = 1.5
+)
+
+// ResolvedAdmissionMode returns the configured mode, defaulting to nominal.
+// Unknown values resolve to nominal (fail-safe); Validate rejects them at
+// startup so a typo cannot go unnoticed.
+func (l *NodeResourceLimit) ResolvedAdmissionMode() string {
+	if l == nil || l.AdmissionMode == nil {
+		return AdmissionModeNominal
+	}
+	switch mode := strings.ToLower(strings.TrimSpace(*l.AdmissionMode)); mode {
+	case AdmissionModeRequest, AdmissionModeShadow:
+		return mode
+	default:
+		return AdmissionModeNominal
+	}
+}
+
+// ResolvedMaxMemoryLimitOvercommitRatio returns the configured ratio or the default.
+func (l *NodeResourceLimit) ResolvedMaxMemoryLimitOvercommitRatio() float64 {
+	if l == nil || l.MaxMemoryLimitOvercommitRatio == nil {
+		return DefaultMaxMemoryLimitOvercommitRatio
+	}
+	return *l.MaxMemoryLimitOvercommitRatio
+}
+
+// Validate rejects unknown admission modes and non-positive ratios.
+func (l *NodeResourceLimit) Validate() error {
+	if l == nil {
+		return nil
+	}
+	if l.AdmissionMode != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.AdmissionMode)) {
+		case AdmissionModeNominal, AdmissionModeRequest, AdmissionModeShadow:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.admission_mode must be one of nominal, request, shadow, got %q", *l.AdmissionMode)
+		}
+	}
+	if l.MaxMemoryLimitOvercommitRatio != nil && !(*l.MaxMemoryLimitOvercommitRatio > 0) {
+		return errors.New("scheduler.node_resource_limit.max_memory_limit_overcommit_ratio must be greater than zero")
+	}
+	return nil
 }
 
 type SchedulerConfig struct {
@@ -445,6 +515,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Scheduler.ArtifactStoreCapacity <= 0 {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")
+		}
+		if err := c.Scheduler.NodeResourceLimit.Validate(); err != nil {
+			return err
 		}
 		switch strings.ToLower(strings.TrimSpace(c.Scheduler.Discovery.Mode)) {
 		case "static":

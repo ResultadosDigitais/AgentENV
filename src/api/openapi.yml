@@ -606,6 +606,11 @@ components:
           allOf:
             - $ref: "#/components/schemas/MemoryMB"
           description: Memory for the cold-start sandbox in MiB.
+        memoryRequestMB:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
         diskSizeMB:
           $ref: "#/components/schemas/DiskSizeMB"
         attachedDrives:

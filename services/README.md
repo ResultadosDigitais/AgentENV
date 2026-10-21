@@ -126,6 +126,8 @@ All fields are optional. Omitting a field (or setting the whole block to `null`)
 | `max_cpu_allocated_percent` | uint32 | Maximum allocated-CPU-to-physical-CPU ratio; can exceed 100 when overcommit is allowed |
 | `max_memory_used_percent` | uint32 | Maximum observed memory usage (0–100) |
 | `max_memory_allocated_percent` | uint32 | Maximum allocated-memory-to-physical-memory ratio; can exceed 100 when overcommit is allowed |
+| `admission_mode` | string | `nominal` (default), `request` or `shadow`; see "Memory admission modes" below |
+| `max_memory_limit_overcommit_ratio` | float | In `request`/`shadow` mode: cap on (sum of nominal VM sizes) / node memory. Default `1.5`; ignored in `nominal` |
 
 Example:
 
@@ -139,6 +141,18 @@ Example:
   "max_memory_allocated_percent": 150
 }
 ```
+
+### Memory admission modes
+
+A sandbox is booted with a fixed VM size (`memoryMB`, the *limit*; no memory hotplug). Sandbox creation also accepts an optional `memoryRequestMB` (> 0, <= `memoryMB`, default = `memoryMB`) which only affects scheduling; it never changes the VM size. Nodes report the sum of active requests as `requested_memory_bytes` next to `allocated_memory_bytes` (sum of limits).
+
+- `nominal` (default): `max_memory_allocated_percent` compares the sum of limits. Identical to previous releases; `memoryRequestMB`, `requested_memory_bytes` and `max_memory_limit_overcommit_ratio` are ignored.
+- `request`: `max_memory_allocated_percent` compares the sum of requests, and the sum of limits must stay <= `max_memory_limit_overcommit_ratio` x node memory. `max_memory_used_percent` still applies and is the only protection against real host exhaustion.
+- `shadow`: decides exactly like `nominal`, evaluates `request` in parallel, logs `admission shadow divergence` and increments `agentenv_scheduler_admission_shadow_total{outcome=agree|request_would_reject|request_would_admit}`. Use it to size the rollout before enabling `request`.
+
+Nodes running an older agent report no `requested_memory_bytes`; they are evaluated with their nominal figure in `request` mode. Unknown `admission_mode` values or a ratio <= 0 are rejected at startup.
+
+Risk: in `request` mode, sandboxes can grow to their limit at the same time and exhaust host memory (OOM kills of Firecracker processes). Do not enable `request` before a pressure-based pause/eviction mechanism exists on the node; paused sandboxes are not counted in the active sums.
 
 When all nodes are filtered out, the scheduler returns `Unavailable` to the caller.
 

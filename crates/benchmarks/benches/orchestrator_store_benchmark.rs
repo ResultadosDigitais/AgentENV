@@ -327,6 +327,7 @@ fn bench_metrics_snapshot_resource_scan(c: &mut Criterion) {
                         cpu_count: 1,
                         memory_mib: 128,
                         disk_size_mib: 0,
+                        memory_request_mib: None,
                     },
                     user_metadata: Some(user_metadata),
                     ..Default::default()

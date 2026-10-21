@@ -174,6 +174,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
             cpu_count: 1,
             memory_mib: 128,
             disk_size_mib: 0,
+            memory_request_mib: None,
         },
         runtime_versions: SnapshotRuntimeVersions {
             kernel_version: "test-kernel".to_string(),
