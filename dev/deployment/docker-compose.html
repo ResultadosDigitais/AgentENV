@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -185,26 +185,12 @@
 <p>Run a full multi-node stack on a single host using Docker Compose. This simulates a production-like topology with a gateway, scheduler, and multiple AgentENV backend nodes.</p>
 <p>For a real multi-machine deployment without Kubernetes, see
 <a href="./static-multi-node.html">Static Multi-Node</a>.</p>
-<h2 id="what-gets-started"><a class="header" href="#what-gets-started">What Gets Started</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Service</th><th>Port</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td>Gateway</td><td><code>:8080</code></td><td>HTTP/WebSocket reverse proxy</td></tr>
-<tr><td>Scheduler</td><td><code>:9090</code></td><td>gRPC node selection and sandbox binding</td></tr>
-<tr><td>agentenv-a</td><td><code>:8001</code></td><td>AgentENV runtime node A</td></tr>
-<tr><td>agentenv-b</td><td><code>:8002</code></td><td>AgentENV runtime node B</td></tr>
-</tbody>
-</table>
-</div>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
 <li>Linux kernel 6.8+</li>
 <li><code>/dev/kvm</code> access (passed into the runtime containers)</li>
-<li>Docker and Docker Compose</li>
-<li><code>build-essential</code> (<code>sudo apt install -y build-essential</code>)</li>
+<li>Docker Engine with Docker Compose v2 (<code>docker compose version</code>)</li>
+<li><code>curl</code> for the verification commands</li>
 </ul>
 <p>The checked-in Compose setup uses standard KVM. If the host does not support
 it, read <a href="./pvm.html">PVM Deployment</a> before adapting the runtime image and host
@@ -217,6 +203,29 @@ cd AgentENV
 <pre><code class="language-bash">sudo bash scripts/docker-setup.sh
 make deploy-up
 </code></pre>
+<p><code>make deploy-up</code> builds the runtime, gateway, and scheduler images with Docker Compose
+before starting the stack. The Rust and Go toolchains are installed in the image
+build stages, so they are not required on the host.</p>
+<p>Runtime nodes mount the host’s upstream DNS configuration read-only for guest
+networks, including template builders. The <code>make deploy-*</code> targets select
+<code>/run/systemd/resolve/resolv.conf</code> when available, otherwise <code>/etc/resolv.conf</code>.
+Override <code>HOST_RESOLV_CONF</code> with an absolute path to a resolver file containing
+DNS servers reachable from guests; loopback addresses such as <code>127.0.0.53</code> and
+Docker’s <code>127.0.0.11</code> cannot be used by guests. Direct <code>docker compose</code> commands
+default to <code>/run/systemd/resolve/resolv.conf</code>; set <code>HOST_RESOLV_CONF</code> explicitly
+on hosts without that file. Containers retain Docker DNS for service discovery.</p>
+<p>To build without starting, run <code>make deploy-build</code>. To start images that are
+already built, run <code>make deploy-up-no-build</code>:</p>
+<pre><code class="language-bash"># Build only
+make deploy-build
+
+# Start previously built images
+make deploy-up-no-build
+</code></pre>
+<p>On first startup, the runtime nodes atomically generate one API key and sandbox
+access-token seed in the shared <code>agentenv-auth</code> volume. The gateway mounts that
+volume read-only and reads the API key; sandbox tokens are validated by the
+runtime nodes. Normal <code>make deploy-down</code> calls preserve both values.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com \
@@ -227,22 +236,33 @@ nodes’ sandbox response metadata. The domain must resolve to the gateway,
 usually through wildcard DNS for <code>*.sandbox.example.com</code>.</p>
 <h2 id="verify"><a class="header" href="#verify">Verify</a></h2>
 <pre><code class="language-bash"># Health check via gateway
-curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8000/health
 
-# Cluster node snapshots via gateway
-curl http://127.0.0.1:8080/nodes
+# Authenticated cluster node snapshots via gateway
+export AENV_API_KEY="$(docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
+  cat /workspace/env/secrets/api-key)"
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8000/nodes
 
-# Direct health check on a backend node
-curl http://127.0.0.1:8001/health
+# Health check from inside a backend container
+docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
+  curl -fsS http://127.0.0.1:8000/health
 </code></pre>
 <h2 id="management-commands"><a class="header" href="#management-commands">Management Commands</a></h2>
 <pre><code class="language-bash">make deploy-ps      # Show container status
 make deploy-logs    # Stream logs from all services
 make deploy-down    # Tear down the cluster
 </code></pre>
+<p>Removing Compose volumes with <code>docker compose down -v</code> also removes both
+secrets. The next startup generates new values, so existing clients and sandbox
+access tokens are invalidated.</p>
+<p>To use an existing API key instead of the generated value, export
+<code>AENV_API_KEY</code> before starting the stack. Compose passes it to the gateway and
+both runtime nodes:</p>
+<pre><code class="language-bash">export AENV_API_KEY="e2b_..."
+make deploy-up
+</code></pre>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <p>Container deployments use <code>deploy/docker/config/default.json</code>. Scheduler and backend node endpoints are configured for the Docker network.</p>
-<p>The runtime image includes <code>uvm-ublk</code> at <code>/usr/local/bin/uvm-ublk</code>. Compose uses that path instead of a host-built <code>env/ublk/uvm-ublk</code> binary.</p>
 <p>The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:</p>
 <ul>
 <li><code>AENV_NODE_ID</code> is set explicitly per node container (<code>node-a</code>, <code>node-b</code>).</li>

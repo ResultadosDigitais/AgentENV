@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -206,6 +206,24 @@
     style node fill:transparent,stroke:gray
 </pre>
 
+<h2 id="key-components"><a class="header" href="#key-components">Key Components</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>Location</th><th>Responsibility</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>API Server</strong></td><td><code>src/api/</code></td><td>Exposes the E2B-compatible HTTP API and reverse proxy endpoints.</td></tr>
+<tr><td><strong>Orchestrator</strong></td><td><code>src/orchestrator/</code></td><td>Coordinates sandbox lifecycle transitions, persistence, and cleanup.</td></tr>
+<tr><td><strong>Firecracker Runtime</strong></td><td><code>src/sandbox/firecracker/</code></td><td>Creates and controls the microVM used by each sandbox.</td></tr>
+<tr><td><strong>Block Device Layer</strong></td><td><code>storage/overlaybd/</code>, <code>storage/ublk/</code></td><td>Provides layered root filesystems, attached drives, and snapshot-backed block devices.</td></tr>
+<tr><td><strong>envd Integration</strong></td><td><code>thirdparty/envd/</code>, <code>src/sandbox/</code></td><td>Handles in-guest command execution, file operations, process interaction, and health reporting.</td></tr>
+<tr><td><strong>Reverse Proxy</strong></td><td><code>src/api/proxy.rs</code></td><td>Routes HTTP, SSE, and WebSocket traffic to services inside sandboxes.</td></tr>
+<tr><td><strong>Snapshot Manager</strong></td><td><code>src/snapshot/</code></td><td>Commits, resolves, and deletes durable sandbox snapshots.</td></tr>
+<tr><td><strong>Template Builder</strong></td><td><code>src/template/</code></td><td>Builds user-facing templates and publishes their committed snapshots.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="storage"><a class="header" href="#storage">Storage</a></h2>
 <p>The storage subsystem turns layered image files into block devices mountable by VMs, and provides ublk-backed memory snapshot restore for snapshot resume. Four crates compose the active subsystem:</p>
 <h3 id="overlaybd-storageoverlaybd"><a class="header" href="#overlaybd-storageoverlaybd">overlaybd (<code>storage/overlaybd/</code>)</a></h3>
@@ -243,6 +261,7 @@
 <p>Long-running daemon process (<code>uvm-ublk-daemon</code>) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.</p>
 <ul>
 <li>Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.</li>
+<li>All remote image I/O (OSS/registry reads) is dispatched from the per-queue runtimes onto a dedicated per-<code>ImageService</code> remote-io runtime via <code>RuntimeDispatchFile</code> (<code>storage/overlaybd/src/io/dispatch_file.rs</code>), because opendal/reqwest pin pooled HTTP connection tasks to whatever runtime polls them and per-device runtimes are dropped on device teardown; the lazily-built remote runtime (file-cache workers, background-download scheduler) is likewise constructed and driven on that dedicated runtime so its internal <code>tokio::spawn</code> calls bind there. The runtime is created when the overlaybd global config sets <code>remoteIoWorkers</code> &gt; 0 (agentenv-generated configs emit it from <code>ublk.overlaybd.remote_io_workers</code>, default 4); with it unset/zero, remote I/O runs on the runtime that constructed the <code>ImageService</code>.</li>
 <li><code>UblkDaemonClient</code> spawns and monitors the daemon process from the node runtime.</li>
 <li><code>UblkDeviceManager</code> (<code>src/sandbox/ublk/device.rs</code>) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.</li>
 </ul>
@@ -288,17 +307,7 @@ PVM currently requires x86_64 and the <code>kvm_pvm</code> host module.</p>
 </table>
 </div>
 <h3 id="sandbox-networking"><a class="header" href="#sandbox-networking">Sandbox Networking</a></h3>
-<p>Sandbox networking is managed by a process-wide <code>NetworkManager</code> (<code>src/sandbox/network/manager.rs</code>) plus per-slot <code>Slot</code> objects (<code>src/sandbox/network/slot.rs</code>).</p>
-<ul>
-<li>Each slot owns a stable index-derived address bundle from <code>[network.internal]</code> (defaulting to <code>10.11.0.0/16</code> and <code>10.12.0.0/16</code>) plus the fixed VM tap link <code>169.254.0.20/30</code>, together with the host veth name, namespace path, and iptables rules for one sandbox network namespace.</li>
-<li>Network policy supports base allow/deny plus explicit egress rules. The <code>/sandboxes/{sandboxID}/network</code> endpoint replaces per-sandbox <code>allowOut</code> (CIDR/IP/domain patterns) and <code>denyOut</code> (CIDR/IP only) rules at runtime; allow rules always take precedence.</li>
-<li><code>allocate_any()</code> first tries a warm-slot pool and falls back to creating a new namespace/veth/tap/iptables setup on demand.</li>
-<li>Warm-pool maintenance uses a single Condvar-driven background worker with low/high watermarks.</li>
-<li><code>release()</code> enqueues slots back to the warm pool; when maintenance is enabled, even releases above high watermark are first enqueued and then drained asynchronously by the worker.</li>
-<li><code>[pool]</code> provides shared watermarks and <code>[pool.network].maintenance_enabled</code> controls network worker behavior.</li>
-<li>Because the manager is a process-wide singleton, orchestrator shutdown explicitly calls <code>NetworkManager::shutdown()</code> after deleting remaining sandboxes so cached slots are drained and no new allocations race with teardown.</li>
-<li>Although calling <code>NetworkManager::shutdown()</code> on exit is recommended for clean teardown, the manager also has a <code>Drop</code> and <code>libc::atexit</code> handler to best-effort cleanup of any remaining namespaces and veth interfaces on unexpected shutdown and during testing.</li>
-</ul>
+<p>The network subsystem is managed by a process-wide <code>NetworkManager</code> and per-slot <code>Slot</code> objects. See <a href="./networking.html">Sandbox Network Architecture</a> for the namespace topology, address plan, packet paths, firewall ordering, egress proxy, policy replacement, warm-pool behavior, and verification steps.</p>
 <p>Snapshot resume can also use <code>[pool.firecracker]</code> to pre-spawn <code>(network slot, Firecracker process)</code> pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. <code>[pool.block]</code> controls the ublk daemon’s overlaybd warm-device pool; it shares the same top-level watermarks but performs async refill from request paths because reusable block devices are image/size-specific.</p>
 <h3 id="observability-data-flow"><a class="header" href="#observability-data-flow">Observability Data Flow</a></h3>
 <p>The node observability path combines request-time host collection with request-time projection:</p>
@@ -366,10 +375,11 @@ sandbox proxy hosts reverse proxy to sandbox services</li>
 </ul>
 <p><strong>Limitations</strong>: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.</p>
 <p><strong>Deployment</strong>:</p>
-<pre><code class="language-bash"># local dev (single node)
+<pre><code class="language-bash">export AENV_API_KEY="e2b_$(openssl rand -hex 32)" # shared by local runtime and gateway processes
+# local dev (single node)
 make start-server &amp;&amp; make -C services run-scheduler &amp;&amp; make -C services run-gateway
 
-# docker compose (multi-node)
+# docker compose (multi-node; shared auth volume is provisioned automatically)
 make deploy-up     # gateway + scheduler + 2 backend nodes
 make deploy-down   # teardown
 
@@ -447,11 +457,11 @@ services/                       # distributed control plane (Go)
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../troubleshooting/common-issues.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/env-vars.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../internals/sandbox-testing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../internals/networking.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -461,11 +471,11 @@ services/                       # distributed control plane (Go)
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../troubleshooting/common-issues.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/env-vars.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../internals/sandbox-testing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../internals/networking.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

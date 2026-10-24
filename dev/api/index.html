@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,26 +182,40 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <style>
-  main { padding: 0 !important; }
+  /* Stoplight uses its own multi-column navigation, so let it use the full
+     mdBook content area instead of the default narrow reading column. */
+  html,
+  body,
+  .page-wrapper,
+  .page {
+    height: 100% !important;
+    overflow: hidden !important;
+  }
+  .content {
+    height: calc(100vh - 50px) !important;
+    overflow: hidden !important;
+    padding: 0 !important;
+  }
+  .content main {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  /* This page has navigation inside Stoplight; mdBook chapter arrows overlap it. */
+  .nav-chapters,
+  .mobile-nav-chapters {
+    display: none !important;
+  }
 </style>
-<iframe id="swagger-frame" src="../swagger-ui.html" scrolling="no" style="width:100%; border:none; display:block; min-height:600px;">
+<iframe id="stoplight-elements-frame" src="../stoplight-elements.html#/paths/health/get" title="AgentENV API Reference rendered with Stoplight Elements" style="width: 100%; height: calc(100vh - 50px); border: none; display: block;">
 </iframe>
-<script>
-document.getElementById('swagger-frame').addEventListener('load', function () {
-  var frame = this;
-  var resize = function () {
-    frame.style.height = frame.contentDocument.documentElement.scrollHeight + 'px';
-  };
-  resize();
-  new ResizeObserver(resize).observe(frame.contentDocument.body);
-});
-</script>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../concepts/proxy.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../concepts/custom-extension/connect-and-use.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -215,7 +229,7 @@ document.getElementById('swagger-frame').addEventListener('load', function () {
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../concepts/proxy.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../concepts/custom-extension/connect-and-use.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

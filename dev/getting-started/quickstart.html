@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -218,6 +218,7 @@ default. Transient namespace and daemon-socket state lives under <code>/run/aenv
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest
 docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -p 8000:8000 \
   ghcr.io/kvcache-ai/aenv-server:latest
@@ -226,6 +227,7 @@ docker run --rm -it \
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/config/default.toml -o config.toml
 vim config.toml
 docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -v "$PWD/config.toml:/workspace/config/default.toml:ro" \
   -p 8000:8000 \
@@ -240,12 +242,23 @@ docker run --rm -it \
 <p>Supports Linux and macOS on x86_64 and arm64:</p>
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 </code></pre>
+<p>The installation script downloads and verifies the platform release archive
+containing <code>aenv</code> and <code>aenv-buildctl</code>. Set <code>INSTALL_DIR</code> for a user-local
+installation. For manual installation, extract the archive and keep <code>aenv</code> and
+<code>aenv-buildctl</code> in the same directory.</p>
 <h3 id="3-authenticate"><a class="header" href="#3-authenticate">3. Authenticate</a></h3>
+<p>The server generates the key on its first normal startup. Native installations
+reuse the managed key; a normal Docker container keeps it in its writable
+container layer:</p>
+<pre><code class="language-bash"># Native
+sudo cat /var/lib/aenv/secrets/api-key
+# Docker
+docker exec aenv-server cat /workspace/env/secrets/api-key
+</code></pre>
 <pre><code class="language-bash">aenv auth
 # AENV server URL [http://localhost:8000]: http://127.0.0.1:8000
-# API key: dummy
+# API key: &lt;paste the generated key&gt;
 </code></pre>
-<p>For local development, any non-empty string works as the API key.</p>
 <h3 id="4-pull-a-template-and-run-a-sandbox"><a class="header" href="#4-pull-a-template-and-run-a-sandbox">4. Pull a template and run a sandbox</a></h3>
 <pre><code class="language-bash">aenv pull ubuntu:22.04 --name ubuntu
 aenv start ubuntu            # starts a sandbox and attaches an interactive shell

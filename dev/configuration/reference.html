@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -224,13 +224,13 @@ local path overrides, not the default dependency catalog.</p>
 <tr><td><code>version</code></td><td>string</td><td>manifest value</td><td>Optional Firecracker release override for auto-download</td></tr>
 <tr><td><code>url</code></td><td>string</td><td>manifest value</td><td>Optional download URL template override with <code>{version}</code> and <code>{arch}</code> placeholders</td></tr>
 <tr><td><code>binary_path</code></td><td>string</td><td>derived from manifest/config version</td><td>Explicit path to a local <code>firecracker</code> binary. Setup skips the Firecracker download and requires this to be a readable, non-empty, executable regular file</td></tr>
-<tr><td><code>boot_args</code></td><td>string</td><td><code>"console=ttyS0 reboot=k panic=1 pci=off init=/init …"</code></td><td>Kernel command line arguments. The shipped default also includes DAMON memory-reclaim parameters; see <code>config/default.toml</code> for the full value.</td></tr>
+<tr><td><code>boot_args</code></td><td>string</td><td><code>"console=ttyS0 reboot=k panic=1 pci=off init=/init …"</code></td><td>Complete kernel command line. The shipped default also includes DAMON memory-reclaim and free-page-reporting parameters; see <code>config/default.toml</code> for the full value.</td></tr>
 <tr><td><code>allowed_extra_boot_args_prefixes</code></td><td>array of strings</td><td><code>[]</code></td><td>Allowed prefixes for <code>extraBootArgs</code> on cold-start sandboxes. If empty, no request-provided extra boot args are appended</td></tr>
 <tr><td><code>socket_timeout_secs</code></td><td>integer</td><td><code>3</code></td><td>Max seconds to wait for the Firecracker API socket</td></tr>
 <tr><td><code>socket_poll_ms</code></td><td>integer</td><td><code>1</code></td><td>Poll interval (ms) for checking socket availability</td></tr>
 <tr><td><code>work_dir</code></td><td>string</td><td><code>"$AENV_HOME/firecracker-work"</code></td><td>Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as <code>overlaybd/upper.data</code> and <code>overlaybd/upper.index</code></td></tr>
-<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker serial output (per-sandbox subdirectories)</td></tr>
-<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value, Firecracker’s own logging is enabled and written to a <code>firecracker.log</code> file in each sandbox’s log directory (alongside the serial output). Empty/unset disables it</td></tr>
+<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging</td></tr>
+<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). A non-empty value enables <code>firecracker.log</code> and stdout/stderr capture in each sandbox’s log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream</td></tr>
 </tbody>
 </table>
 </div>
@@ -248,8 +248,24 @@ local path overrides, not the default dependency catalog.</p>
 </tbody>
 </table>
 </div>
+<h2 id="overlaybd"><a class="header" href="#overlaybd"><code>[overlaybd]</code></a></h2>
+<p>Optional override for the OverlayBD tools release that setup downloads. When the
+section is omitted, the release in <code>config/deps_manifest.toml</code> is used.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>version</code></td><td>string</td><td>manifest value</td><td>OverlayBD tools release; required when the section is set</td></tr>
+<tr><td><code>package_url</code></td><td>string</td><td>manifest value</td><td>Download URL template for the tools archive, with <code>{version}</code> and <code>{arch}</code> placeholders</td></tr>
+<tr><td><code>url</code></td><td>string</td><td>unset</td><td>Fallback for <code>package_url</code></td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="tools"><a class="header" href="#tools"><code>[tools]</code></a></h2>
-<p>Tools drive image used to boot the AgentENV control plane inside each microVM.</p>
+<p>Tools drive image used to boot the AgentENV control plane inside each microVM.
+The default release is selected automatically; most deployments can leave this section unchanged.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -263,11 +279,20 @@ local path overrides, not the default dependency catalog.</p>
 </tbody>
 </table>
 </div>
-<p>Snapshots and paused sandboxes keep using the tools drive version they were
-created with. Launch does not download missing releases: operators must install
-the recorded version under <code>&lt;deps_path&gt;/tools/&lt;version&gt;/tools.ext4</code> before
-restore. Setup retains previously installed versions until they are removed
-manually.</p>
+<p>Snapshots and paused sandboxes record only <code>tools_drive_version</code>. Launch and
+restore fetch that version from the configured URL template when it is missing
+locally. Releases must be immutable and retained for the lifetime of their
+snapshots; changing the default version affects new sandboxes and templates.</p>
+<p>OCI tools rootfs images carry <code>io.agentenv.tools-drive.format=oci-rootfs-v1</code>
+(the tools Dockerfile adds it automatically). They are downloaded and converted
+locally with a stable, pinned conversion contract. Converted layers live in the
+versioned dependency directory, independently of image-cache eviction. Explicit
+<code>--setup-only</code> prepares the default release for dependency bundles.</p>
+<p>Native OverlayBD images keep lazy reads and automatically download tools layers
+in the background after envd is ready, independently of memory and user disks.
+Legacy images without the format label provide <code>tools.ext4</code>, which is downloaded
+and mounted read-only. Tools are not uploaded into snapshot storage. A local
+<code>drive_path</code> only identifies its declared version.</p>
 <h2 id="template-rootfs-images"><a class="header" href="#template-rootfs-images">Template Rootfs Images</a></h2>
 <p>User-visible rootfs images are selected at the template API layer.
 <code>POST /v2/templates/{templateID}/builds/{buildID}</code> accepts an optional
@@ -286,6 +311,7 @@ and <code>node:20</code></li>
 </thead>
 <tbody>
 <tr><td><code>default_image</code></td><td>string</td><td><code>ubuntu:24.04</code></td><td>Image used when template builds omit <code>fromImage</code></td></tr>
+<tr><td><code>convert_standard_oci</code></td><td>boolean</td><td><code>true</code></td><td>Convert standard OCI tar layers into local OverlayBD commits. Set <code>false</code> to require OverlayBD-native images or referrers and fail fast otherwise</td></tr>
 <tr><td><code>search_registries</code></td><td>array of strings</td><td><code>["docker.io", "ghcr.io"]</code></td><td>Registries tried when resolving short image references</td></tr>
 <tr><td><code>allowed_registries</code></td><td>array of strings</td><td>unset (no restriction)</td><td>Whitelist of registry hosts (e.g. <code>docker.io</code>, <code>registry.example.com:5000</code>). <strong>Omitting the key</strong> imposes no restriction; an <strong>explicit empty list <code>[]</code></strong> denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, <code>ImageReferenceError</code>) error. See <em>How the three registry settings interact</em> below.</td></tr>
 <tr><td><code>try_referrers_overlaybd_prefixes</code></td><td>array of strings</td><td><code>[]</code></td><td>Image reference prefixes for which AgentENV tries OCI Referrers API via <code>regctl</code> for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple <code>starts_with</code>; include the trailing slash yourself, for example <code>registry.example.com/</code> or <code>registry.example.com/team/</code>. Requires <code>regctl</code> on <code>PATH</code>; lookup failures fall back to the source image.</td></tr>
@@ -359,7 +385,7 @@ list, e.g. <code>try_referrers_overlaybd_prefixes = ["myregistry.azurecr.io/"]</
 each pass reconciles metadata from the on-disk source configs and then deletes
 hard-commit objects that are no longer rooted by source configs, held by
 image-cache leases, or referenced by the in-process running set. Committed
-snapshots are durable SnapshotRepository state and do not pin ImageCache
+snapshots are durable repository state and do not pin ImageCache
 commits. With <code>capacity_gb</code> set, GC first evicts least-recently-used source
 configs over the high watermark so hard-commit GC can reclaim what they unrooted.</p>
 <div class="table-wrapper">
@@ -389,6 +415,7 @@ eviction.</p>
 </thead>
 <tbody>
 <tr><td><code>max_size_gb</code></td><td>integer</td><td><code>100</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
+<tr><td><code>open_evict_idle_secs</code></td><td>integer</td><td><code>600</code></td><td>Idle age in seconds after which a cache entry held open by a running sandbox may have its cached blocks reclaimed under capacity pressure. The entry is kept and refills on demand; <code>0</code> disables open-entry eviction. Written to generated overlaybd <code>cacheConfig.openEvictIdleSecs</code> and applies to both <code>remote-blocks</code> and <code>memory-blocks</code> caches</td></tr>
 </tbody>
 </table>
 </div>
@@ -467,6 +494,22 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </tbody>
 </table>
 </div>
+<h2 id="machinedisk_rate_limit"><a class="header" href="#machinedisk_rate_limit"><code>[machine.disk_rate_limit]</code></a></h2>
+<p>Per-sandbox disk I/O limits, applied through Firecracker’s virtio-blk rate limiter.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enable per-sandbox disk I/O rate limiting</td></tr>
+<tr><td><code>bandwidth_bytes_per_sec</code></td><td>integer</td><td><code>0</code></td><td>Sustained disk bandwidth limit in bytes per second; <code>0</code> means unlimited</td></tr>
+<tr><td><code>bandwidth_burst_bytes</code></td><td>integer</td><td><code>0</code></td><td>One-time bandwidth burst in bytes, granted once when the VM starts (Firecracker’s <code>one_time_burst</code>). It is consumed before the sustained bucket and never replenished, so it only absorbs the initial I/O spike. Requires <code>bandwidth_bytes_per_sec</code></td></tr>
+<tr><td><code>iops</code></td><td>integer</td><td><code>0</code></td><td>Sustained IOPS limit; <code>0</code> means unlimited</td></tr>
+<tr><td><code>iops_burst</code></td><td>integer</td><td><code>0</code></td><td>One-time IOPS burst, granted once when the VM starts. Consumed before the sustained bucket and never replenished. Requires <code>iops</code></td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="envd"><a class="header" href="#envd"><code>[envd]</code></a></h2>
 <p>In-guest <code>envd</code> daemon settings.</p>
 <div class="table-wrapper">
@@ -481,6 +524,32 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </tbody>
 </table>
 </div>
+<h2 id="sandbox"><a class="header" href="#sandbox"><code>[sandbox]</code></a></h2>
+<p>Sandbox control communication settings.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>access_token_hash_seed</code></td><td>string</td><td>auto-generated</td><td>Optional override for the secret used to derive sandbox envd and traffic access tokens. When unset, normal server startup creates and reuses <code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code>. Configure an explicit shared value for clustered deployments.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.</p>
+<p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.</p>
+<h2 id="volume"><a class="header" href="#volume"><code>[volume]</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_size_mb</code></td><td>integer</td><td><code>262144</code></td><td>Maximum persistent volume size in MiB (256 GiB).</td></tr>
+<tr><td><code>max_volume_count</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">
@@ -490,6 +559,8 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </thead>
 <tbody>
 <tr><td><code>auto_evict_interval_ms</code></td><td>integer</td><td><code>1000</code></td><td>Poll interval (ms) for background timeout eviction</td></tr>
+<tr><td><code>metrics_interval_secs</code></td><td>integer</td><td><code>15</code></td><td>Guest metrics scan interval; 0 disables collection</td></tr>
+<tr><td><code>metrics_retention_secs</code></td><td>integer</td><td><code>3600</code></td><td>Node-local in-memory guest sample retention (seconds)</td></tr>
 <tr><td><code>default_sandbox_timeout_secs</code></td><td>integer</td><td><code>15</code></td><td>Default keep-alive timeout for sandboxes</td></tr>
 <tr><td><code>auto_resume_min_sandbox_timeout_secs</code></td><td>integer</td><td><code>300</code></td><td>When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration</td></tr>
 <tr><td><code>persisted_sandbox_store_path</code></td><td>string</td><td><code>"$AENV_HOME/persisted-sandboxes"</code></td><td>Directory for persisted sandbox state</td></tr>
@@ -516,9 +587,12 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tr><th>Section</th><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>[pool.network]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>When <code>false</code>, disables the network-slot maintenance worker; slots are still created on demand</td></tr>
 <tr><td><code>[pool.network]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background network-slot maintenance worker</td></tr>
+<tr><td><code>[pool.network]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Accepted but currently unused</td></tr>
 <tr><td><code>[pool.block]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the ublk overlaybd warm-device pool</td></tr>
-<tr><td><code>[pool.block]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Prewarm block devices after the first reusable image shape is known</td></tr>
+<tr><td><code>[pool.block]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Ignored: the block pool always refills at request time, because the reusable device shape depends on the image and size</td></tr>
+<tr><td><code>[pool.block]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td>capability-based</td><td>Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports <code>UBLK_F_UPDATE_SIZE</code>; an explicit value overrides detection</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable pre-spawned Firecracker processes for snapshot resume</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background Firecracker process maintenance worker</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Spawn warm Firecracker entries up to the low watermark during server startup</td></tr>
@@ -616,7 +690,7 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 </table>
 </div>
 <h2 id="custom_extension"><a class="header" href="#custom_extension"><code>[custom_extension]</code></a></h2>
-<p>Custom extension service configuration. When <code>url</code> is unset, the integration is fully disabled. See <a href="../concepts/custom-extension.html">Custom Extension</a>.</p>
+<p>Custom extension service configuration. When <code>url</code> is unset, the integration is fully disabled. See <a href="../concepts/custom-extension/index.html">Custom Extension</a>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -658,6 +732,70 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 </tbody>
 </table>
 </div>
+<h2 id="snapshotpublish_compression"><a class="header" href="#snapshotpublish_compression"><code>[snapshot.publish_compression]</code></a></h2>
+<p>Publish-time compression for snapshot layers uploaded to OSS/ACR. Local layers
+always stay raw, so local resume pays no decompression cost; enabled by default,
+memory layers and incremental read-write layers are compressed once as they
+are uploaded, cutting network bytes for cross-node resume. This is the only
+compression switch; the legacy capture-time knobs under <code>[memory_snapshot]</code>
+and <code>[template_build]</code> were removed from the configuration schema.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Compress memory layers and incremental read-write layers when uploading them to OSS/ACR.</td></tr>
+<tr><td><code>algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
+<tr><td><code>workers</code></td><td>integer</td><td><code>1</code></td><td>Number of blocking threads used to compress 4 KiB blocks within a layer. <code>1</code> is sequential; higher values run in parallel without changing the output layout. Clamped to 64.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Known impact: compressed layers are recorded without a layer uuid (ZFile
+layers carry no LSMT uuid), so P2P uuid-keyed acceleration does not apply to
+them. Snapshot P2P publication also skips digest-keyed advertisements for
+local raw layers whose digest is absent from the committed record — the
+record names the compressed bytes, so the raw digest key would never be
+looked up by consumers.</p>
+<h2 id="snapshotmemory_startup_pack"><a class="header" href="#snapshotmemory_startup_pack"><code>[snapshot.memory_startup_pack]</code></a></h2>
+<p>Optional startup-memory trace recording and best-effort prefetch for both
+<code>oss</code> and <code>posix_fs</code> repositories. It is disabled by default. Publishing never
+waits for recording: a completed trace is encoded as a SHA-256-verified
+manifest and attached to the already committed snapshot. Snapshots without a
+descriptor, with a missing/corrupt manifest, or with a failed prefetch always
+resume through the ordinary on-demand path.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>Record a first-touch trace after capture and persist a manifest when recording succeeds.</td></tr>
+<tr><td><code>record_min_window_ms</code></td><td>integer</td><td><code>200</code></td><td>Minimum recorder observation window after its first read.</td></tr>
+<tr><td><code>record_quiet_ms</code></td><td>integer</td><td><code>300</code></td><td>Stop recording after this quiet interval.</td></tr>
+<tr><td><code>record_max_window_ms</code></td><td>integer</td><td><code>2000</code></td><td>Hard recorder observation-window cap.</td></tr>
+<tr><td><code>record_budget_secs</code></td><td>integer</td><td><code>10</code></td><td>Best-effort recording budget; it never blocks the snapshot publish.</td></tr>
+<tr><td><code>max_pack_bytes</code></td><td>integer</td><td><code>1073741824</code></td><td>Maximum recorded page-data budget and POSIX logical prefetch budget.</td></tr>
+<tr><td><code>consume_enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enable resume-time prefetch; leave disabled for rollout and A/B comparisons.</td></tr>
+<tr><td><code>consume_timeout_secs</code></td><td>integer</td><td><code>30</code></td><td>Deadline for queueing and dispatching further prefetch reads; an in-kernel read may outlive it.</td></tr>
+</tbody>
+</table>
+</div>
+<p>For POSIX, the resolver hands the normal sandbox start path a <code>LocalPath</code>
+manifest. After acquiring the actual shared memory ublk device, the executor
+reads its logical manifest ranges through a buffered device handle, concurrently
+with recovery. This warms the device page cache used by Firecracker, rather
+than the separate cache of lower-layer files. Each run uses one reader and a
+1 MiB buffer; at most four readers run process-wide. In-flight sharing includes
+the manifest digest and live device generation.</p>
+<p>Cancellation and the time budget stop dispatch of subsequent reads. An already
+executing kernel read cannot be interrupted. Stop and retry wait up to the sandbox
+socket timeout for prefetch cleanup; after that it continues in the background,
+retaining the device lease until the read finishes. <code>O_DIRECT</code>
+(<code>io_engine = 2</code>) remains explicitly skipped pending validation of that lower-I/O
+configuration with device prefetch; this is not a claim that device page cache
+is bypassed. The configured I/O engine is never changed. OSS retains its existing
+physical-range planner and executor. Prefetch is not a correctness dependency.</p>
 <h2 id="backendposix_fs"><a class="header" href="#backendposix_fs"><code>[backend.posix_fs]</code></a></h2>
 <p>POSIX filesystem-backed snapshot repository configuration. This section is used when <code>snapshot.repository_backend = "posix_fs"</code>.</p>
 <div class="table-wrapper">
@@ -690,6 +828,7 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 <tr><td><code>access_key_secret</code></td><td>string</td><td>unset</td><td>Static OSS access key secret. Required when <code>credential_process</code> is not set</td></tr>
 <tr><td><code>security_token</code></td><td>string</td><td>unset</td><td>Optional session token paired with static access key credentials</td></tr>
 <tr><td><code>region</code></td><td>string</td><td>none</td><td>Region passed to the S3-compatible object-store client; required for current OSS backend</td></tr>
+<tr><td><code>addressing_style</code></td><td>string</td><td>auto-detect</td><td>Bucket addressing style, <code>"virtual"</code> or <code>"path"</code>. When unset, the backend auto-detects: Alibaba OSS and bucket-in-endpoint hosts use virtual-host style, other endpoints default to path style. Set either value when a provider’s required or preferred style differs from the detected default</td></tr>
 <tr><td><code>cache_max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the node-local OSS artifact cache in GiB</td></tr>
 </tbody>
 </table>
@@ -699,7 +838,16 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 <li><code>credential_process</code> and static access key settings are mutually exclusive in practice; when <code>credential_process</code> is set, the backend ignores static credential fields.</li>
 <li><code>credential_process</code> should be written as a portable argv-style command line. Avoid <code>$VAR</code>, backticks, <code>$(...)</code>, pipes, and shell builtins.</li>
 <li>Although the config section is still named <code>oss</code>, the runtime path is implemented via a shared S3-compatible client, so <code>region</code> must be configured.</li>
+<li>Leave <code>addressing_style</code> unset when endpoint-based detection is correct. Set it to <code>"virtual"</code> or <code>"path"</code> when the provider’s required or preferred style differs from the detected default; for example, some Tigris or Cloudflare R2 deployments use virtual-host addressing.</li>
+<li>The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (<code>ossConfig.defaultAddressingStyle</code>), which the runtime uses when reading remote managed snapshot layers during sandbox restore.</li>
 </ul>
+<p>For an S3-compatible provider where virtual-host addressing is required or preferred — for example <a href="https://www.tigrisdata.com/docs/">Tigris</a> — set <code>addressing_style</code> explicitly:</p>
+<pre><code class="language-toml">[backend.oss]
+endpoint = "https://t3.storage.dev"
+bucket = "agentenv-snapshots"
+region = "auto"
+addressing_style = "virtual"
+</code></pre>
 <p>Other path override:</p>
 <ul>
 <li><code>AENV_DEPS_PATH</code></li>
@@ -755,6 +903,7 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 <tr><td><code>runtime_upper_mode</code></td><td>string</td><td><code>"hybridLogStructured"</code></td><td>Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are <code>"logStructured"</code>, <code>"hybridLogStructured"</code>, and <code>"sparse"</code>. Existing source uppers keep their own mode</td></tr>
 <tr><td><code>allow_shrink</code></td><td>boolean</td><td><code>false</code></td><td>Allows an explicit cold-start <code>diskSizeMB</code> smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes.</td></tr>
 <tr><td><code>resize_timeout_secs</code></td><td>integer</td><td><code>120</code></td><td>Timeout in seconds for the cold-start OverlayBD resize tool. Must be greater than zero.</td></tr>
+<tr><td><code>remote_io_workers</code></td><td>integer</td><td><code>4</code></td><td>Worker threads of the overlaybd runtime’s dedicated remote-I/O runtime (OSS and registry downloads), written as <code>remoteIoWorkers</code> into generated overlaybd global configs. Must be greater than zero.</td></tr>
 <tr><td><code>download_enable</code></td><td>boolean</td><td><code>false</code></td><td>Enables overlaybd layer-level background download for remote layers</td></tr>
 <tr><td><code>p2p_lookup_timeout_ms</code></td><td>integer</td><td><code>300</code></td><td>Timeout for one foreground Overlaybd descriptor lookup through the localhost P2P HTTP facade. Timeout is treated as a cacheable miss.</td></tr>
 <tr><td><code>p2p_fetch_range_timeout_ms</code></td><td>integer</td><td><code>2000</code></td><td>Timeout for one foreground Overlaybd range fetch through the localhost P2P HTTP facade before falling back to the origin registry.</td></tr>
@@ -783,9 +932,7 @@ the default path on every startup.</p>
 </thead>
 <tbody>
 <tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
-<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>false</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true</code> to enable it.</td></tr>
-<tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for memory snapshot layers. When disabled, <code>compression_algorithm</code> is still parsed but has no effect. This setting affects only memory layers; the physical file name remains <code>overlaybd.commit</code>.</td></tr>
-<tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm for memory snapshot layers. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
+<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>true</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false</code> to disable it.</td></tr>
 </tbody>
 </table>
 </div>
@@ -832,12 +979,33 @@ and are then re-fetched on demand.</p>
 </tbody>
 </table>
 </div>
+<h2 id="template_build"><a class="header" href="#template_build"><code>[template_build]</code></a></h2>
+<p>Managed Dockerfile builder resources. The first Dockerfile
+build on a node prepares a reusable internal builder template. Each build mounts
+a separate clone of the repository’s shared cache seed; concurrent builds do not
+queue for cache ownership. The last successfully published cache becomes the next
+seed, with best-effort reuse of concurrent branches.
+Builder resources do not change the resulting template’s CPU or memory.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_concurrent_builds</code></td><td>integer</td><td><code>4</code></td><td>Per-node limit for managed builds, including preparation, publication, and cleanup. Must be greater than zero. Excess builder PUT requests return HTTP 429 and leave the build waiting for retry.</td></tr>
+<tr><td><code>builder_image</code></td><td>string</td><td><code>"docker.io/moby/buildkit:v0.33.0"</code></td><td>Image containing the managed BuildKit daemon, client, and OCI runtime.</td></tr>
+<tr><td><code>builder_cpu_count</code></td><td>integer</td><td><code>16</code></td><td>Builder vCPUs, from 1 to 255.</td></tr>
+<tr><td><code>builder_memory_mb</code></td><td>integer</td><td><code>32768</code></td><td>Builder memory in MiB, from 256 to 2147483647.</td></tr>
+<tr><td><code>cache_size_mb</code></td><td>integer</td><td><code>65536</code></td><td>Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most <code>volume.max_size_mb</code>; changing it does not resize existing caches.</td></tr>
+</tbody>
+</table>
+</div>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../deployment/pvm.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../troubleshooting/common-issues.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -851,7 +1019,7 @@ and are then re-fetched on demand.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../deployment/pvm.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../troubleshooting/common-issues.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

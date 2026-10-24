@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -211,6 +211,7 @@
 <li>Docker</li>
 <li><code>build-essential</code> (<code>sudo apt install -y build-essential</code>)</li>
 <li><code>kubectl</code> with Kustomize support</li>
+<li>shared storage across all runtime nodes, using either POSIXFS or OSS</li>
 </ul>
 <p>The provided manifests use standard KVM. To prepare a separate PVM node pool
 when standard KVM is unavailable, see <a href="./pvm.html">PVM Deployment</a>.</p>
@@ -222,6 +223,9 @@ cd AgentENV
 <pre><code class="language-bash">make k8s-build
 </code></pre>
 <p>This builds three images: <code>agentenv-runtime:latest</code>, <code>agentenv-gateway:latest</code>, and <code>agentenv-scheduler:latest</code>.</p>
+<h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
+<p>See <a href="../concepts/authentication/access-token-seed.html">Sandbox Access-Token Seed</a>
+for the shared sandbox access-token seed configuration.</p>
 <h2 id="deploy"><a class="header" href="#deploy">Deploy</a></h2>
 <pre><code class="language-bash"># Run on each worker node before deploying
 sudo bash scripts/docker-setup.sh
@@ -232,6 +236,17 @@ make k8s-render
 # Apply to cluster
 make k8s-apply
 </code></pre>
+<p><code>make k8s-apply</code> generates a 256-bit API key on the first deployment and stores
+it in <code>Secret/agentenv-auth</code>. Later applies reuse it. Read the key locally when
+configuring clients:</p>
+<pre><code class="language-bash">kubectl -n agentenv-system get secret agentenv-auth \
+  -o go-template='{{index .data "AENV_API_KEY" | base64decode}}{{"\n"}}'
+</code></pre>
+<p>Set <code>AENV_API_KEY</code> when applying to supply your own value. A standalone
+<code>make k8s-render</code> uses an invalid <code>REDACTED</code> placeholder so preview output never
+contains a deployable API key. The optional runtime seed keeps its existing
+<code>agentenv-runtime-secrets</code> contract described in
+<a href="../concepts/authentication/access-token-seed.html">Sandbox Access-Token Seed</a>.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com make k8s-apply
@@ -260,6 +275,9 @@ make k8s-delete
 </code></pre>
 <h2 id="local-development-k3s"><a class="header" href="#local-development-k3s">Local Development (k3s)</a></h2>
 <p>A dedicated <code>local-dev</code> overlay mounts the repository’s <code>env/</code> directory directly into the DaemonSet at <code>/workspace/env</code>, avoiding runtime asset copies:</p>
+<p>The apply helper provisions the same generated API key used by the default
+overlay. The local development overlay retains its fixed test-only runtime seed;
+do not reuse that seed outside local development.</p>
 <pre><code class="language-bash">make k8s-build
 make k8s-load-dev       # Import images into k3s/containerd
 make k8s-render-dev     # Preview manifests

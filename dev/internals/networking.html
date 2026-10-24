@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Proxy - AgentENV Documentation</title>
+        <title>Sandbox Network Architecture - AgentENV Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -147,7 +147,7 @@
                         <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
                             <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
                         </a>
-                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/concepts/proxy.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/internals/networking.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
                         </a>
 
@@ -181,62 +181,184 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="proxy"><a class="header" href="#proxy">Proxy</a></h1>
-<p>The reverse proxy lets you reach services running inside a sandbox from outside. It supports HTTP requests, SSE streams, and WebSocket connections.</p>
-<h2 id="endpoints"><a class="header" href="#endpoints">Endpoints</a></h2>
+                        <h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
+<p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>
+<p>The user-facing policy contract is documented in the public
+<a href="../concepts/sandboxes/networking.html">Sandboxes networking documentation</a>.
+This page explains how that contract is implemented.</p>
+<h2 id="topology"><a class="header" href="#topology">Topology</a></h2>
+<p>Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named <code>vpeer</code> and the host side is named <code>veth-{slot}</code>.</p>
+<pre class="mermaid">flowchart LR
+    subgraph sandbox["Sandbox network namespace"]
+        direction LR
+        subgraph vm["Firecracker VM"]
+            direction LR
+            eth0["eth0\n169.254.0.21"]
+        end
+        tap["tap0\n169.254.0.22"]
+        vpeer["vpeer\nveth pool 10.12.0.0/16\n/31 per slot"]
+        proxy["EgressProxy listener\n0.0.0.0:15000"]
+        eth0 &lt;--&gt; tap
+        tap &lt;--&gt; vpeer
+        tap -. "TCP 80/443 REDIRECT" .-&gt; proxy
+        proxy --&gt; vpeer
+    end
+    style sandbox fill:transparent,stroke:gray
+
+    subgraph host["Host network namespace"]
+        direction LR
+        veth["veth-{slot}\n10.12.0.0/16\n/31 per slot"]
+        host-interaction["Host interaction IP\n10.11.0.0/16\n/31 per slot"]
+        internet["Internet"]
+        veth &lt;-- "Host routing" --&gt; host-interaction
+        veth -- "Host routing" --&gt; internet
+    end
+    style host fill:transparent,stroke:gray
+
+    vpeer &lt;--&gt; veth
+</pre>
+
+<p>The process contains one global <code>NetworkManager</code> and one global <code>EgressProxy</code> registry. The registry is shared for lifecycle and policy bookkeeping, but each namespace that uses proxy-backed policy has its own listener socket and listener thread. The fixed port <code>15000</code> is therefore reusable across namespaces without a host-port collision.</p>
+<h2 id="ownership"><a class="header" href="#ownership">Ownership</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Owner</th><th>Source</th><th>Responsibility</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NetworkManager</code></td><td><code>src/sandbox/network/manager.rs</code></td><td>Process-wide slot bitmap, warm pool, global host iptables, proxy registry, shutdown</td></tr>
+<tr><td><code>Slot</code></td><td><code>src/sandbox/network/slot.rs</code></td><td>One namespace, veth/TAP setup, address plan, namespace iptables, policy application, cleanup</td></tr>
+<tr><td>Address plan</td><td><code>src/sandbox/network/address_plan.rs</code></td><td>Slot-derived host interaction, veth, and VM-link addresses and internal deny ranges</td></tr>
+<tr><td>Policy</td><td><code>src/sandbox/network/policy.rs</code></td><td>API-normalized base/allow/deny semantics, absolute deny checks, proxy interception ports</td></tr>
+<tr><td>Egress proxy</td><td><code>src/sandbox/network/egress_proxy.rs</code></td><td>Namespace-local listener, original-destination inspection, Host/SNI parsing, relay, staged policy state</td></tr>
+<tr><td>Host resolver</td><td><code>src/sandbox/network/resolver.rs</code></td><td>Process-wide long-lived host-netns DNS worker used for trusted domain resolution</td></tr>
+<tr><td>Firecracker backend</td><td><code>src/sandbox/firecracker/sandbox.rs</code></td><td>Allocates/releases slots and applies the launch or updated policy at VM lifecycle boundaries</td></tr>
+<tr><td>Orchestrator/API</td><td><code>src/orchestrator/</code>, <code>src/api/impls/sandbox.rs</code></td><td>Validates requests, persists policy, and replaces the running sandbox policy</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="address-plan"><a class="header" href="#address-plan">Address Plan</a></h2>
+<p><code>NetworkAddressPlan</code> derives addresses from <code>[network.internal]</code> and allocates them from the slot index:</p>
 <ul>
-<li><code>ANY /proxy</code> forwards to <code>/</code> inside the sandbox</li>
-<li><code>ANY /proxy/{path}</code> forwards to <code>/{path}</code> inside the sandbox</li>
-<li>Header-routed requests on otherwise unmatched paths forward the original path
-unchanged. This lets clients use the same base URL for API and sandbox data
-traffic when they send routing headers.</li>
-<li>When sandbox proxy domains are configured, host-based URLs shaped like
-<code>{port}-{sandboxID}.{domain}</code> forward the original path without routing
-headers.</li>
+<li><code>host_interaction_ip</code>: one address per slot from <code>host_interaction_cidr</code>. Host routes use this address to reach the VM through the namespace.</li>
+<li><code>veth_host_ip</code> and <code>veth_vm_ip</code>: the two endpoints of the slot’s <code>/31</code> veth link. The host endpoint is assigned to <code>veth-{slot}</code> and the namespace endpoint is assigned to <code>vpeer</code>.</li>
+<li><code>vm_ip</code> and <code>tap_ip</code>: fixed endpoints of the VM link on <code>vm_link_cidr</code>. The VM receives <code>vm_ip</code>; the namespace TAP interface receives <code>tap_ip</code>.</li>
 </ul>
-<p>Query strings are forwarded unchanged.</p>
-<h2 id="required-headers"><a class="header" href="#required-headers">Required Headers</a></h2>
-<p>Each proxied request must identify the target sandbox and port:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Header</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>x-agentenv-sandbox-id</code></td><td>Sandbox UUID to route to</td></tr>
-<tr><td><code>x-agentenv-target-port</code></td><td>Port of the service inside the sandbox</td></tr>
-</tbody>
-</table>
-</div>
-<p>E2B-compatible aliases are also accepted:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Header</th><th>Alias for</th></tr>
-</thead>
-<tbody>
-<tr><td><code>e2b-sandbox-id</code></td><td><code>x-agentenv-sandbox-id</code></td></tr>
-<tr><td><code>e2b-sandbox-port</code></td><td><code>x-agentenv-target-port</code></td></tr>
-</tbody>
-</table>
-</div>
-<p>These routing headers are stripped before the request is forwarded to the sandbox.</p>
-<p>Host-based proxy requests derive both values from <code>Host</code>, for example
-<code>http://8080-&lt;sandbox-uuid&gt;.sandbox.example.com/health</code> targets port <code>8080</code>.
-The configured domain must route to the AgentENV server in single-node mode or
-to the gateway in multi-node mode. Host-based proxy traffic is always treated as
-data-plane traffic; lifecycle and other control-plane APIs should use the base
-API host.</p>
+<p>The namespace adds a default route through <code>veth_host_ip</code>. Firecracker receives an <code>ip=</code> boot argument containing the VM address, TAP link, netmask, and the guest DNS server selected from the host resolver configuration.</p>
+<p>Cold boots also append <code>sysctl.net.ipv4.conf.all.arp_notify=1</code>. The guest NIC has no configured MAC, and guest userspace may change it after boot (for example systemd-udevd’s <code>MACAddressPolicy=persistent</code> rewrites the random boot MAC). With <code>arp_notify</code> the guest kernel sends a gratuitous ARP on each change, so the namespace’s <code>tap0</code> neighbour entry for <code>vm_ip</code> follows the new MAC instead of going stale. The argument is appended in code, so it also applies when <code>firecracker.boot_args</code> is overridden.</p>
+<p>The complete internal pools are denied before user egress rules. This prevents a sandbox from reaching another slot’s host-interaction address, veth link, or VM link even when a user policy otherwise allows the destination.</p>
+<h2 id="namespace-setup"><a class="header" href="#namespace-setup">Namespace Setup</a></h2>
+<p><code>Slot::create_network()</code> performs namespace setup on a dedicated thread because network namespace membership is thread-local:</p>
+<ol>
+<li>Create and bind-mount a persistent namespace file under the configured runtime <code>netns</code> directory.</li>
+<li>Unshare <code>CLONE_NEWNET</code>, set strict reverse-path filtering (<code>rp_filter=1</code> for <code>all</code> and <code>default</code>) instead of the host’s inherited value, and create the veth pair.</li>
+<li>Move the host endpoint to the process’s baseline host namespace.</li>
+<li>Configure <code>lo</code>, <code>vpeer</code>, <code>tap0</code>, addresses, link state, and the namespace default route.</li>
+<li>Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.</li>
+<li>Configure the host veth address and a host route for the slot’s <code>host_interaction_ip</code>.</li>
+</ol>
+<p>The baseline namespace rules are installed once during setup. Per-sandbox user rules and proxy redirects are replaced later by <code>set_egress_policy()</code>.</p>
+<h2 id="packet-paths"><a class="header" href="#packet-paths">Packet Paths</a></h2>
+<pre class="mermaid">flowchart TB
+    vm["Firecracker VM"] --&gt; tap["tap0"]
+    tap --&gt; prerouting["namespace nat/PREROUTING"]
+    prerouting -. "TCP 80/443 REDIRECT" .-&gt; proxy["Namespace-local\nEgressProxy"]
+    prerouting --&gt; forward["namespace filter/FORWARD\nAGENTENV-EGRESS"]
+    proxy --&gt; upstream_proxy["Proxy upstream connection"]
+    forward --&gt; nsnat["namespace POSTROUTING\nSNAT to host_interaction_ip"]
+    upstream_proxy --&gt; nsnat
+    nsnat --&gt; vpeer["vpeer / veth"]
+    vpeer --&gt; host["Host FORWARD + POSTROUTING\nMASQUERADE"]
+    host --&gt; internet["External destination"]
+    internet -. "return traffic" .-&gt; host
+    host -. "ESTABLISHED,RELATED" .-&gt; vpeer
+    vpeer -. "return traffic" .-&gt; tap
+    tap -. "return traffic" .-&gt; vm
+</pre>
+
+<h3 id="sandbox-originated-internet-traffic"><a class="header" href="#sandbox-originated-internet-traffic">Sandbox-originated internet traffic</a></h3>
+<ol>
+<li>The VM sends a packet through <code>eth0</code> to <code>tap0</code>.</li>
+<li>The namespace NAT <code>PREROUTING</code> chain may redirect TCP ports 80 and 443 to the namespace-local proxy.</li>
+<li>Packets that continue as routed traffic traverse <code>filter/FORWARD</code> from <code>tap0</code> to <code>vpeer</code>, entering <code>AGENTENV-EGRESS</code>.</li>
+<li>The namespace <code>POSTROUTING</code> chain SNATs VM-originated traffic to the slot’s <code>host_interaction_ip</code>. Proxy-originated upstream connections are SNATed from the namespace <code>vpeer</code> address to the same slot identity.</li>
+<li>The host <code>FORWARD</code> and <code>POSTROUTING</code> rules accept the slot source range and MASQUERADE it for the external route.</li>
+</ol>
+<h3 id="return-traffic"><a class="header" href="#return-traffic">Return traffic</a></h3>
+<p>Return packets are classified as <code>ESTABLISHED,RELATED</code> and are accepted before the user egress chain in the namespace. The host also accepts established traffic returning to <code>veth-{slot}</code>. This preserves host/envd/proxy responses and existing outbound flows while policy rules are replaced.</p>
+<h3 id="host-to-vm-traffic"><a class="header" href="#host-to-vm-traffic">Host-to-VM traffic</a></h3>
+<p>Host-side proxy and envd traffic targets the slot’s <code>host_interaction_ip</code>. Namespace <code>PREROUTING</code> on <code>vpeer</code> DNATs that address to the VM’s fixed <code>vm_ip</code>. The corresponding return path is accepted by the established/related rules.</p>
+<h2 id="host-firewall"><a class="header" href="#host-firewall">Host Firewall</a></h2>
+<p><code>NetworkManager</code> installs one process-wide set of host rules for the configured host interaction CIDR. The rules are inserted/appended symmetrically and removed during manager shutdown:</p>
+<pre><code class="language-text">INPUT      -i veth-+ -s &lt;host_interaction_cidr&gt; -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+INPUT      -i veth-+ -s &lt;host_interaction_cidr&gt; -j REJECT
+FORWARD    -i veth-+ -s &lt;host_interaction_cidr&gt; -j ACCEPT
+FORWARD    -o veth-+ -d &lt;host_interaction_cidr&gt; --state ESTABLISHED,RELATED -j ACCEPT
+POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
+</code></pre>
+<p>The <code>INPUT</code> pair prevents guest-originated new connections from reaching arbitrary host services while preserving established host-originated traffic. The <code>FORWARD</code> and <code>MASQUERADE</code> rules handle namespace-to-internet forwarding after namespace SNAT.</p>
+<h2 id="namespace-firewall"><a class="header" href="#namespace-firewall">Namespace Firewall</a></h2>
+<p>Guest packets on <code>tap0</code> whose source is not the VM’s assigned address are dropped in <code>raw/PREROUTING</code>, before routing or NAT. Without this, a spoofed source would bypass the namespace SNAT and leave the node unchanged; strict reverse-path filtering is a second layer for the same check.</p>
+<p>Each namespace has three managed chains:</p>
+<ul>
+<li><code>AGENTENV-EGRESS</code> is the static chain reached from <code>FORWARD</code> for guest traffic.</li>
+<li><code>AGENTENV-USER-EGRESS</code> contains the replaceable user policy.</li>
+<li><code>AGENTENV-EGRESS-PROXY</code> is the replaceable NAT chain reached from <code>nat/PREROUTING</code> for proxy-backed traffic.</li>
+</ul>
+<p>The static filter chain is ordered as follows:</p>
+<ol>
+<li>Accept <code>ESTABLISHED,RELATED</code> traffic from <code>tap0</code> to <code>vpeer</code>.</li>
+<li>Allow UDP/TCP DNS traffic to the configured guest DNS address on port 53.</li>
+<li>Reject the complete internal address pools and configured <code>always_denied_cidrs</code>.</li>
+<li>Jump to <code>AGENTENV-USER-EGRESS</code>.</li>
+</ol>
+<p>The user chain is rendered in this order:</p>
+<ol>
+<li>Explicit <code>allowOut</code> CIDR/IP rules (<code>ACCEPT</code>).</li>
+<li>Explicit <code>denyOut</code> CIDR/IP rules (<code>REJECT</code>).</li>
+<li>A <code>0.0.0.0/0</code> reject when the base policy is <code>Deny</code>.</li>
+</ol>
+<p>This ordering gives user allow rules precedence over overlapping user denies, while static internal/platform denies remain non-overridable.</p>
+<h2 id="egress-proxy"><a class="header" href="#egress-proxy">Egress Proxy</a></h2>
+<p>The egress proxy is namespace-local and transparent. It does not terminate TLS or rewrite HTTP. A policy that requires proxy mediation redirects only TCP ports 80 and 443 to <code>0.0.0.0:15000</code> inside that namespace.</p>
+<h3 id="connection-flow"><a class="header" href="#connection-flow">Connection flow</a></h3>
+<ol>
+<li><code>EgressProxy::ensure_listener()</code> enters the target namespace with <code>setns</code>, binds the listener, and starts a nonblocking accept loop.</li>
+<li>The listener accepts a connection and copies the active policy for that connection.</li>
+<li>The connection handler reads <code>SO_ORIGINAL_DST</code> to recover the destination altered by <code>REDIRECT</code>.</li>
+<li>It buffers the initial request/handshake up to 64 KiB and extracts HTTP <code>Host</code> or TLS ClientHello SNI. TLS handshake bytes are accumulated across record boundaries.</li>
+<li>A domain match is sent to the process-wide resolver worker, which remains in the host network namespace. Each candidate IPv4 address is checked by <code>SandboxNetworkPolicy::is_domain_allowed</code>, including absolute platform and internal-range denies, before it is selected.</li>
+<li>A domain connection is dialed to the selected trusted address. An IP/CIDR connection uses the original destination after <code>is_ip_allowed</code>.</li>
+<li>The buffered preface is written to the upstream and both directions are relayed with half-close handling.</li>
+</ol>
+<p>An empty or unrecognized hostname cannot fall back to the base allow policy when a domain allowlist is present. This keeps domain policies fail-closed. Domain allow rules require the API request to include an explicit <code>denyOut: ["0.0.0.0/0"]</code>.</p>
+<h3 id="policy-replacement"><a class="header" href="#policy-replacement">Policy replacement</a></h3>
+<p>The running policy update is a replacement operation:</p>
+<ol>
+<li>Stage the new policy in the proxy’s <code>pending</code> map.</li>
+<li>Ensure the namespace listener exists when proxy mediation is required.</li>
+<li>Apply the filter and NAT chain replacement as one <code>iptables-restore</code> batch.</li>
+<li>When an active proxy policy already exists, activate the pending policy only after the namespace batch succeeds.</li>
+<li>When proxy mediation is being enabled for a namespace with no active proxy policy, activate the prepared policy before installing the redirect. This preserves the namespace’s previous default-allow behavior until the atomic iptables batch has completed; no connection can reach the listener through <code>REDIRECT</code> before that batch succeeds.</li>
+<li>If an update fails while an active proxy policy exists, discard the pending policy and retain the previous active policy.</li>
+</ol>
+<p>Each accepted connection holds a copy of the active policy selected at accept time. Therefore updates primarily affect new connections; existing relays are not proactively terminated. Removing a policy or a slot closes tracked handler sockets and joins their threads before namespace resources are removed.</p>
+<h3 id="namespace-ownership"><a class="header" href="#namespace-ownership">Namespace ownership</a></h3>
+<p>The process-global registry is keyed by <code>host_interaction_ip</code>, but listeners are not shared between namespaces. Every namespace has its own listener thread and socket. When a policy no longer requires proxy mediation, the listener and active/pending policy are removed. Full slot cleanup stops the listener before deleting the veth and unmounting the namespace.</p>
+<h2 id="lifecycle-and-warm-pool"><a class="header" href="#lifecycle-and-warm-pool">Lifecycle and Warm Pool</a></h2>
+<p><code>NetworkManager::allocate_any()</code> first acquires a warm <code>Slot</code>. If none is available it allocates a new slot index and creates the namespace/veth/TAP resources. The Firecracker backend then applies the launch policy before boot or resume continues.</p>
+<p>On stop, a slot may return to the warm pool. The namespace and baseline networking remain available for reuse; <code>user_egress_rules_present</code> tracks whether the next tenant needs a user-chain replacement. The next policy application clears or replaces stale user rules and removes stale proxy policy as appropriate. Slots drained from the pool are fully cleaned up.</p>
+<p>On shutdown, the manager stops pool maintenance, drains warm slots, stops all proxy listeners, removes global host rules, and removes namespace/veth state. An <code>atexit</code> hook and <code>Drop</code> path provide best-effort cleanup for abnormal exits.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../concepts/custom-extension.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../internals/architecture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../api/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../internals/sandbox-testing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -246,11 +368,11 @@ API host.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../concepts/custom-extension.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../internals/architecture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../api/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../internals/sandbox-testing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

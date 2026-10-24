@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -193,11 +193,12 @@
 <tr><td><code>home_path</code></td><td><code>/var/lib/aenv</code></td><td><code>src/cfg.rs</code></td><td>Base for paths containing the literal <code>$AENV_HOME</code> placeholder. <code>AENV_HOME_PATH</code> overrides it before placeholder expansion.</td></tr>
 <tr><td><code>runtime_path</code></td><td><code>/run/aenv</code></td><td><code>src/cfg.rs</code>, <code>src/sandbox/network/*</code></td><td>Base for transient namespace mount points and daemon sockets. <code>AENV_RUNTIME_PATH</code> overrides it.</td></tr>
 <tr><td><code>deps_path</code></td><td><code>$AENV_HOME/deps</code></td><td><code>src/cfg.rs</code>, <code>src/setup/*</code></td><td>Base for downloaded runtime dependencies. <code>AENV_DEPS_PATH</code> can place these rebuildable assets outside <code>home_path</code>.</td></tr>
+<tr><td>Managed sandbox access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td><code>src/sandbox/access.rs</code></td><td>Node-local secret used to derive envd and traffic tokens when <code>[sandbox].access_token_hash_seed</code> is unset. It must be preserved with persisted secure or private-ingress sandboxes.</td></tr>
 <tr><td>Firecracker sandbox work dirs</td><td><code>$AENV_HOME/firecracker-work</code> with <code>agentenv-fc-</code> children</td><td><code>src/sandbox/firecracker/*</code></td><td>Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code>, <code>overlaybd/upper.index</code>). An explicit <code>[firecracker].work_dir</code> overrides the root.</td></tr>
 <tr><td><code>firecracker.serial_dir</code></td><td><code>$AENV_HOME/logs/serial</code></td><td><code>src/sandbox/firecracker/*</code></td><td>Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit <code>[firecracker].serial_dir</code> overrides the root.</td></tr>
 <tr><td><code>managed_snapshot_root</code></td><td><code>&lt;firecracker-work-base&gt;/managed-snapshots</code></td><td><code>src/sandbox/firecracker/*</code></td><td>In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop.</td></tr>
 <tr><td><code>persisted_sandbox_store_path</code></td><td><code>$AENV_HOME/persisted-sandboxes</code></td><td><code>src/orchestrator/persistence/*</code></td><td>Durable paused sandbox records and artifacts.</td></tr>
-<tr><td><code>snapshot_store</code></td><td><code>$AENV_HOME/snapshot-store</code></td><td><code>src/snapshot/repository/*</code></td><td>Durable committed snapshot repository root. The configured backend uses <code>&lt;snapshot_store&gt;/repository</code>. Relative explicit paths are resolved against the config file directory.</td></tr>
+<tr><td><code>snapshot_store</code></td><td><code>$AENV_HOME/snapshot-store</code></td><td><code>src/repository/*</code></td><td>Durable committed snapshot repository root. The configured backend uses <code>&lt;snapshot_store&gt;/repository</code>. Relative explicit paths are resolved against the config file directory.</td></tr>
 <tr><td><code>snapshot.local_cache_path</code></td><td><code>$AENV_HOME/snapshot-local-cache</code></td><td><code>src/snapshot/artifact_cache.rs</code>, runtime resolvers</td><td>Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory.</td></tr>
 <tr><td><code>image.cache.root_dir</code></td><td><code>$AENV_HOME/image-cache</code></td><td><code>src/image/*</code>, overlaybd runtime</td><td>Node-local image cache root. Contains <code>configs/</code>, <code>indexes/</code>, <code>commits/</code>, and <code>remote-blocks/</code>. The offline C++ tools own isolated sibling cache roots: <code>convert-blocks/</code> (<code>overlaybd-apply</code>) and <code>resize-blocks/</code> (<code>overlaybd-resize</code>).</td></tr>
 <tr><td><code>p2p.store_dir</code></td><td><code>$AENV_HOME/p2p/store</code></td><td><code>src/p2p/*</code>, <code>src/cfg.rs</code></td><td>Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory.</td></tr>
@@ -224,6 +225,7 @@
 <tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Temporary downloaded package archives</td><td>Setup staging for overlaybd release packages</td><td>Removed after a successful install.</td></tr>
 <tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/convert-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/resize-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (<code>overlaybd-apply</code>, <code>overlaybd-resize</code>), which get dedicated configs with isolated cacheDirs (<code>convert-blocks</code>, <code>resize-blocks</code>) and download disabled</td><td>Rewritten during setup/startup.</td></tr>
 <tr><td>Overlaybd runtime log</td><td><code>$AENV_HOME/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
+<tr><td>Managed sandbox access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td>32 random bytes encoded as lowercase hexadecimal</td><td>Derives stable per-sandbox envd and traffic access tokens when no explicit seed is configured</td><td>Atomically created with mode <code>0600</code> during normal startup and reused thereafter. Must not be deleted while secure or private-ingress sandboxes are persisted.</td></tr>
 </tbody>
 </table>
 </div>
@@ -245,7 +247,7 @@
 <tr><td>Inherited runtime layers</td><td>snapshot artifact dir <code>rootfs/inherited-layers/{index}/{source-file}</code></td><td>Snapshot-owned hard links or copies of inherited runtime-created lower suffixes</td><td>Removes dependence on previous managed snapshot or persisted sandbox artifact roots</td><td>Created during pause when inherited lowers come from the managed snapshot root or another sandbox/generation under the same persisted <code>artifacts</code> root.</td><td>No.</td></tr>
 <tr><td>Attached-drive snapshot dirs</td><td>snapshot artifact dir <code>drives/{drive_id}/...</code></td><td>Per-drive image config and snapshot layer</td><td>Captures writable attached-drive state</td><td>Created alongside rootfs snapshot for each drive.</td><td>No.</td></tr>
 <tr><td>Firecracker work dir</td><td>configured work root, or consumed pool tempfile dir</td><td>API socket, symlinks, runtime dirs, local logs</td><td>Firecracker CWD for a sandbox</td><td>Created when sandbox handle is built, or moved from a warm pool entry; removed by owning <code>TempDir</code>.</td><td>Yes, except live state.</td></tr>
-<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended. Warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
+<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended only when <code>firecracker.log_level</code> is non-empty or an explicit Rust capture destination is set. Enabled warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
 <tr><td>Firecracker logger output</td><td><code>firecracker.log</code> in the same per-sandbox log directory as the serial logs</td><td>Firecracker internal logger (<code>PUT /logger</code>)</td><td>Debugging</td><td>Only created when <code>firecracker.log_level</code> is set to a non-empty level. Written by Firecracker itself; not automatically GC’d.</td><td>No, but disposable.</td></tr>
 </tbody>
 </table>
@@ -259,7 +261,7 @@
 </thead>
 <tbody>
 <tr><td>Warm pool work dir</td><td>system tempfile dir</td><td>Firecracker socket and warm process logs</td><td>Pre-spawned Firecracker process CWD</td><td>Created by pool maintenance as a <code>TempDir</code>. Removed when warm entry is cleaned up, or moved into the consuming sandbox and later dropped there.</td></tr>
-<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
+<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn only when <code>firecracker.log_level</code> is non-empty. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
 </tbody>
 </table>
 </div>
@@ -277,6 +279,32 @@
 </tbody>
 </table>
 </div>
+<h2 id="snapshot-storage-model"><a class="header" href="#snapshot-storage-model">Snapshot Storage Model</a></h2>
+<p>Snapshot data passes through three storage layers with different ownership and
+lifetime rules:</p>
+<ol>
+<li><strong>Builder staging</strong> is a manager-owned temporary workspace under
+<code>&lt;snapshot.local_cache_path&gt;/snapshots/&lt;id&gt;/</code>. It holds local rootfs,
+memory, VM-state, and attached-drive artifacts while a build or capture is
+in progress. It is not the durable snapshot record.</li>
+<li><strong>The committed snapshot repository</strong> stores the snapshot catalog,
+aliases, <code>snapshot.json</code>, <code>firecracker-manifest.json</code>, <code>vm_state.bin</code>, and
+referenced managed layers. This is the durable source of truth exposed by
+the template and snapshot APIs.</li>
+<li><strong>The node-local runtime cache</strong> materializes runnable rootfs, memory, and
+drive <code>image.json</code> files under
+<code>&lt;snapshot.local_cache_path&gt;/runtime/&lt;id&gt;/</code> before launch. These files are
+derived runtime inputs and can be rebuilt from committed state.</li>
+</ol>
+<p>The committed <code>snapshot.json</code> records the captured runtime context, startup
+configuration, and rootfs, drive, and memory layer references. The Firecracker
+manifest records launch metadata such as virtual sizes and attached-drive
+configuration. Temporary upper files and generated <code>image.json</code> files are not
+committed snapshot truth.</p>
+<p>During runtime resolution, AgentENV converts the committed layer references
+into node-local rootfs, memory, and attached-drive configs, hydrates the
+Firecracker manifest with node-local paths, and resolves the committed
+<code>vm_state.bin</code> into a runnable path.</p>
 <h2 id="image-resolver"><a class="header" href="#image-resolver">Image Resolver</a></h2>
 <p>Owned by <code>src/image/*</code>.</p>
 <div class="table-wrapper">
@@ -289,23 +317,26 @@
 <tr><td>Image metadata sidecar</td><td><code>&lt;image.cache.root_dir&gt;/configs/*.metadata.json</code></td><td>Base env/workdir metadata from OCI image config</td><td>Preserves image launch context beside cached image config</td><td>Written after image config. Rebuilt if missing while image config is usable.</td></tr>
 <tr><td>Overlaybd commit cache</td><td><code>&lt;image.cache.root_dir&gt;/commits/{digest-slug}/overlaybd.commit</code></td><td>Content-addressed overlaybd commit layers from standard OCI conversion, and target dirs for remote overlaybd-native layers</td><td>Node-local reusable layer store for user image layers</td><td>Standard OCI conversion writes commits. Remote overlaybd-native configs point <code>dir</code> here for runtime population. No unified GC today.</td></tr>
 <tr><td>OCI conversion index</td><td><code>&lt;image.cache.root_dir&gt;/indexes/{source-digest}/...json</code></td><td>Mapping from OCI source layer/context to overlaybd commit digest and size</td><td>Skips repeated layer conversion when converted commits exist</td><td>Written after successful standard OCI conversion. No unified GC today.</td></tr>
+<tr><td>Converted OCI layer P2P artifact</td><td>P2P catalog key <code>oci-layer/v1/{context-hash}</code></td><td>A completed OverlayBD commit plus its conversion context and output digest/size</td><td>Lets another node reuse a compatible standard-OCI conversion</td><td>Published as a Reference after the local commit is durable; ownership is persisted on the hard-commit record and removed by image-cache GC.</td></tr>
 <tr><td>Temporary OCI pull/conversion work</td><td>process temp dir</td><td>OCI layout and per-layer conversion workspace</td><td>Intermediate input for standard OCI conversion</td><td>Owned by <code>TempDir</code>; removed after conversion scope exits.</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="snapshot-repository"><a class="header" href="#snapshot-repository">Snapshot Repository</a></h2>
-<p>Owned by <code>src/snapshot/repository/*</code> and <code>src/snapshot/types/*</code>.</p>
+<p>Owned by <code>src/repository/*</code> and <code>src/snapshot/types/*</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th><th>Rebuildable</th></tr>
 </thead>
 <tbody>
-<tr><td>Snapshot records</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/catalog/records/{id}.json</code>; OSS: <code>catalog/records/{id}.json</code></td><td>Snapshot ID, alias, source, resources, build status, committed logical metadata</td><td>Durable user-visible snapshot/template metadata</td><td>Created before template build or at publish. Updated when committed or errored. Deleted by snapshot delete.</td><td>No.</td></tr>
-<tr><td>Snapshot aliases</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/catalog/aliases/{alias}</code>; OSS: <code>catalog/aliases/{alias}.json</code></td><td>Alias-to-snapshot binding</td><td>Name lookup for templates/snapshots</td><td>Bound during create/publish with conflict checks. Deleted with record cleanup.</td><td>Partially, from records if aliases are still recorded.</td></tr>
+<tr><td>Snapshot records</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/catalog/records/{id}.json</code>; OSS: <code>catalog/records/{id}.json</code></td><td>Snapshot ID, alias, source, resources, build status, committed logical metadata</td><td>Durable user-visible snapshot/template metadata</td><td>Shared documents written by <code>src/snapshot/catalog.rs</code>. Created before template build or at publish. Updated when committed or errored. Snapshot delete marks it <code>deleting</code> first, so no startup manifest is attached afterwards, and deletes it last.</td><td>No.</td></tr>
+<tr><td>Snapshot aliases</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/catalog/aliases/{alias}</code>; OSS: <code>catalog/aliases/{alias}.json</code></td><td>Alias-to-snapshot binding</td><td>Name lookup for templates/snapshots</td><td>Shared documents. Claimed after the record is written; released before the record is deleted. A binding whose record is gone is stale and is removed by the next lookup or claim.</td><td>Partially, from records if aliases are still recorded.</td></tr>
+<tr><td>Shared documents (snapshot records and aliases, volume records and names, build logs, build-cache state)</td><td>Paths named in <code>src/repository/layout.rs</code>. POSIX: one file each, updated under a lock file. OSS: one <code>{name}.json</code> object each. S3 stores replace it only if its ETag is unchanged. Alibaba OSS cannot, so every write holds a lease on the appendable lock object <code>locks/{path}</code> (see <code>src/repository/backends/oss/lease.rs</code>).</td><td>Volume state, reservations, and name bindings; template build logs; the shared build-cache seed</td><td>Updated atomically by the snapshot and volume catalogs and the template builder on every node</td><td>A released lease deletes its lock object. A holder that dies leaves it until a contender takes it over 30 seconds later.</td><td>No.</td></tr>
 <tr><td>Firecracker manifest</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/snapshots/{id}/firecracker-manifest.json</code>; OSS: <code>artifacts/{id}/firecracker-manifest.json</code></td><td>Firecracker snapshot shape, virtual sizes, attached-drive metadata; path fields are hydrated at runtime</td><td>Runtime manifest template for launching committed snapshots</td><td>Persisted during publish. Removed with per-snapshot artifacts.</td><td>Partially, but kept as durable artifact.</td></tr>
 <tr><td>VM state</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/snapshots/{id}/vm_state.bin</code>; OSS: <code>artifacts/{id}/vm_state.bin</code></td><td>Firecracker VM state snapshot</td><td>Required to resume committed snapshots</td><td>Copied/uploaded during publish. Removed with per-snapshot artifacts.</td><td>No.</td></tr>
 <tr><td>Managed snapshot layers</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/managed-layers/{digest}.overlaybd.commit</code>; OSS: <code>managed-layers/{digest}</code></td><td>Content-addressed rootfs, attached-drive, and memory overlaybd commit layers</td><td>Shared immutable layer storage for committed snapshots</td><td>Imported during publish by descriptor or by hashing local descriptor-less layers. Usually not removed with a single snapshot.</td><td>Not from metadata alone; can be re-fetched only if source still exists.</td></tr>
+<tr><td>Staging files</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/staging/*</code>; OSS: process temp dir</td><td>Dense-exported and recontainerized layers prepared for storage</td><td>On POSIX, the same filesystem as <code>managed-layers/</code>, so a prepared layer is hard-linked in without a copy</td><td>Temporary files, removed once the publish that made them is done. A process that crashes mid-publish leaves its files behind.</td><td>Yes.</td></tr>
 <tr><td>Source-registry publications</td><td><code>SnapshotRecord.committed.disk_publications</code> plus remote OCI registry objects</td><td>Published rootfs/attached-drive image refs and manifest digests</td><td>Lets compatible snapshot deltas live in their source registry</td><td>Created during OSS publish when image publishing is enabled. Rolled back on failure or delete when possible.</td><td>Registry-owned; record is required to locate.</td></tr>
 </tbody>
 </table>
@@ -399,7 +430,7 @@
 <li>Snapshot repository artifacts are durable user-visible state. Do not delete them from node-local GC code.</li>
 <li>Paused sandbox artifacts are durable only for the paused sandbox that owns them. Do not treat them as committed snapshots.</li>
 <li>Runtime <code>image.json</code> files under snapshot local cache or ublk runtime dirs are derived artifacts. They should be rebuildable from committed metadata or source image configs.</li>
-<li>Node-local <code>image-cache</code> artifacts are disposable cache, but content-addressed commits may be expensive to regenerate. The metadata-backed GC only reclaims commits no longer rooted by on-disk source configs, held by image-cache leases, or referenced by the in-process running set. Committed snapshots are durable SnapshotRepository state and do not pin ImageCache commits. See <code>[image.cache.gc]</code> in the configuration reference for scheduling.</li>
+<li>Node-local <code>image-cache</code> artifacts are disposable cache, but content-addressed commits may be expensive to regenerate. The metadata-backed GC only reclaims commits no longer rooted by on-disk source configs, held by image-cache leases, or referenced by the in-process running set. Committed snapshots are durable repository state and do not pin ImageCache commits. See <code>[image.cache.gc]</code> in the configuration reference for scheduling.</li>
 <li>P2P store contents are node-local and optional. Unpublish removes the local catalog entry and related blobs; clearing the store only affects peer-to-peer sharing and may require republishing or refetching artifacts.</li>
 <li>Logs and dependency downloads are operational artifacts. They are not part of sandbox or snapshot correctness, but may require separate retention policy outside image-cache GC.</li>
 </ul>
@@ -408,7 +439,7 @@
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../internals/template-builder-testing.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../internals/buildkit-template-builds.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -422,7 +453,7 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../internals/template-builder-testing.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../internals/buildkit-template-builds.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
