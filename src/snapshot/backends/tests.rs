@@ -91,6 +91,7 @@ fn gcs_config(dir: &Path, prefix: Option<&str>) -> AppConfig {
         credential_path: None,
         endpoint: Some("http://127.0.0.1:1".to_owned()),
         allow_anonymous: true,
+        allow_application_default_credentials: false,
         cache_max_size_gb: None,
     });
     config.snapshot.local_cache_path = dir.join("cache");

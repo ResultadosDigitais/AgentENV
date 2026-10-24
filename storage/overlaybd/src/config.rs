@@ -234,6 +234,10 @@ pub struct GcsConfig {
     pub credential_path: String,
     /// Send unauthenticated requests: emulators and public buckets only.
     pub allow_anonymous: bool,
+    /// Resolve Application Default Credentials, the metadata server included.
+    /// Must be set deliberately: with neither this nor `credentialPath` nor
+    /// `allowAnonymous`, the config is rejected.
+    pub allow_application_default_credentials: bool,
 }
 
 impl Default for OssConfig {
@@ -659,9 +663,18 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
         .as_ref()
         .filter(|_| cfg.oss_config.enable)
     {
+        let has_file = !gcs.credential_path.trim().is_empty();
+        let chosen = usize::from(has_file)
+            + usize::from(gcs.allow_anonymous)
+            + usize::from(gcs.allow_application_default_credentials);
         ensure!(
-            gcs.credential_path.trim().is_empty() || !gcs.allow_anonymous,
-            "ossConfig.gcs.credentialPath cannot be combined with ossConfig.gcs.allowAnonymous"
+            chosen != 0,
+            "ossConfig.gcs needs credentialPath, allowAnonymous or allowApplicationDefaultCredentials"
+        );
+        ensure!(
+            chosen == 1,
+            "ossConfig.gcs.credentialPath, allowAnonymous and allowApplicationDefaultCredentials \
+             cannot be combined"
         );
     } else if cfg.oss_config.enable {
         ensure!(
@@ -966,6 +979,29 @@ mod tests {
         cfg.normalize_compat_fields();
         let err = validate_global_config(&cfg).expect_err("should fail");
         assert!(err.to_string().contains("allowAnonymous"));
+    }
+
+    #[test]
+    fn test_gcs_config_refuses_application_default_credentials_unless_asked() {
+        let raw = |gcs: &str| {
+            format!(
+                r#"{{"registryFsVersion": "v2", "ioEngine": 0,
+                   "ossConfig": {{"enable": true, "gcs": {gcs}}}}}"#
+            )
+        };
+        let parse = |gcs: &str| {
+            let mut cfg: GlobalConfig = serde_json::from_str(&raw(gcs)).expect("parse");
+            cfg.normalize_compat_fields();
+            validate_global_config(&cfg)
+        };
+
+        let err = parse("{}").expect_err("no credential choice must fail");
+        assert!(err
+            .to_string()
+            .contains("allowApplicationDefaultCredentials"));
+        parse(r#"{"allowApplicationDefaultCredentials": true}"#).expect("explicit opt-in");
+        parse(r#"{"credentialPath": "/k.json", "allowApplicationDefaultCredentials": true}"#)
+            .expect_err("file and ADC conflict");
     }
 
     #[test]

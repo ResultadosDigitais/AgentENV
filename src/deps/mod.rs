@@ -873,10 +873,10 @@ fn overlaybd_credential_fields(credential_path: Option<&Path>) -> (String, serde
 /// which needs neither an endpoint nor a region.
 fn overlaybd_runtime_gcs_config(gcs: &GcsBackendConfig) -> Result<serde_json::Value> {
     let normalized = NormalizedGcsConfig::new(gcs)?;
-    let (credential_path, allow_anonymous) = match normalized.auth() {
-        GcsAuth::ApplicationDefault => ("", false),
-        GcsAuth::CredentialFile(path) => (path.as_str(), false),
-        GcsAuth::Anonymous => ("", true),
+    let (credential_path, allow_anonymous, allow_adc) = match normalized.auth() {
+        GcsAuth::ApplicationDefault => ("", false, true),
+        GcsAuth::CredentialFile(path) => (path.as_str(), false, false),
+        GcsAuth::Anonymous => ("", true, false),
     };
     Ok(serde_json::json!({
         "enable": true,
@@ -884,6 +884,7 @@ fn overlaybd_runtime_gcs_config(gcs: &GcsBackendConfig) -> Result<serde_json::Va
             "endpoint": normalized.endpoint(),
             "credentialPath": credential_path,
             "allowAnonymous": allow_anonymous,
+            "allowApplicationDefaultCredentials": allow_adc,
         },
     }))
 }
@@ -1044,13 +1045,14 @@ mod tests {
     }
 
     #[test]
-    fn overlaybd_runtime_gcs_config_defaults_to_application_default_credentials() {
+    fn overlaybd_runtime_gcs_config_forwards_an_explicit_application_default_opt_in() {
         let config = overlaybd_runtime_gcs_config(&GcsBackendConfig {
             bucket: "snapshots".to_string(),
             prefix: None,
             credential_path: None,
             endpoint: None,
             allow_anonymous: false,
+            allow_application_default_credentials: true,
             cache_max_size_gb: None,
         })
         .expect("derive overlaybd gcs config");
@@ -1058,8 +1060,26 @@ mod tests {
         assert_eq!(config["enable"], true);
         assert_eq!(config["gcs"]["credentialPath"], "");
         assert_eq!(config["gcs"]["allowAnonymous"], false);
+        assert_eq!(config["gcs"]["allowApplicationDefaultCredentials"], true);
         assert_eq!(config["gcs"]["endpoint"], "");
         assert!(config.get("accessKeyId").is_none());
+    }
+
+    #[test]
+    fn overlaybd_runtime_gcs_config_refuses_application_default_credentials_by_default() {
+        let err = overlaybd_runtime_gcs_config(&GcsBackendConfig {
+            bucket: "snapshots".to_string(),
+            prefix: None,
+            credential_path: None,
+            endpoint: None,
+            allow_anonymous: false,
+            allow_application_default_credentials: false,
+            cache_max_size_gb: None,
+        })
+        .expect_err("no credentials must fail");
+        assert!(err
+            .to_string()
+            .contains("allow_application_default_credentials"));
     }
 
     #[test]
@@ -1070,11 +1090,13 @@ mod tests {
             credential_path: Some("/etc/gcp/key.json".to_string()),
             endpoint: Some("http://127.0.0.1:4443".to_string()),
             allow_anonymous: false,
+            allow_application_default_credentials: false,
             cache_max_size_gb: None,
         })
         .expect("derive overlaybd gcs config");
 
         assert_eq!(config["gcs"]["credentialPath"], "/etc/gcp/key.json");
+        assert_eq!(config["gcs"]["allowApplicationDefaultCredentials"], false);
         assert_eq!(config["gcs"]["endpoint"], "http://127.0.0.1:4443");
     }
 

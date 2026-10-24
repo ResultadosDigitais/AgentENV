@@ -287,15 +287,18 @@ workers = 1
 # security_token = "..."
 # cache_max_size_gb = 10              # 10 GiB node-local artifact cache
 
-# Google Cloud Storage requires a bucket. Credentials default to Application
-# Default Credentials (GKE Workload Identity, GOOGLE_APPLICATION_CREDENTIALS,
-# or the metadata server); no static key is needed.
+# Google Cloud Storage requires a bucket and exactly one way to authenticate.
+# credential_path is recommended: a service-account key or an external_account
+# (Workload Identity Federation) JSON file, the only source consulted. The
+# metadata server is never used unless allow_application_default_credentials
+# is set, because guests that share the host's network can reach it too.
 # [backend.gcs]
 # bucket = "your-snapshot-bucket"
 # prefix = "snapshots/"
-# credential_path = "/etc/gcp/key.json"  # optional service-account key file
-# endpoint = "http://127.0.0.1:4443"     # emulators only
+# credential_path = "/etc/agentenv/gcp/credential.json"
+# allow_application_default_credentials = false  # opt in to ADC/metadata server
 # allow_anonymous = false                # emulators and public buckets only
+# endpoint = "http://127.0.0.1:4443"     # emulators only
 # cache_max_size_gb = 10                 # 10 GiB node-local artifact cache
 
 [ublk]

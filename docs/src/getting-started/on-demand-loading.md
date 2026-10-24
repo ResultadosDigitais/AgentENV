@@ -75,9 +75,8 @@ deployment — also set `addressing_style = "virtual"`; see the
 
 ### Option C: GCS
 
-Enable the GCS backend and name the bucket. Credentials are Application Default
-Credentials, so on GKE with Workload Identity (or a VM with an attached service
-account) no key is configured:
+Enable the GCS backend, name the bucket and point `credential_path` at a
+service-account key or a Workload Identity Federation `external_account` file:
 
 ```toml
 [snapshot]
@@ -86,15 +85,18 @@ repository_backend = "gcs"
 [backend.gcs]
 bucket = "YOUR_BUCKET"
 prefix = "YOUR_PREFIX"
+credential_path = "/etc/agentenv/gcp/credential.json"
 cache_max_size_gb = 100
 
 [image.cache.remote_blocks]
 max_size_gb = 100
 ```
 
-Set `credential_path` to a service-account key file when Application Default
-Credentials are not available; see the
-[configuration reference](../configuration/reference.md#backendgcs) for details.
+On Kubernetes, follow the
+[Kubernetes setup](../configuration/reference.md#kubernetes-setup) so that
+sandboxes cannot reach the credentials. See the
+[configuration reference](../configuration/reference.md#backendgcs) for all
+options.
 
 ## 3. Apply the configuration
 

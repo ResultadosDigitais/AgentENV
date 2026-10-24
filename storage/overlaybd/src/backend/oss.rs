@@ -56,19 +56,27 @@ struct GcsRuntime {
 }
 
 impl GcsRuntime {
-    fn from_config(config: &GcsConfig) -> Self {
+    /// Fails unless exactly one credential source was chosen, so a config that
+    /// skipped validation cannot fall back to the metadata server.
+    fn from_config(config: &GcsConfig) -> Result<Self> {
         let credential_path = config.credential_path.trim();
-        let auth = if !credential_path.is_empty() {
-            GcsAuth::CredentialFile(credential_path.to_string())
-        } else if config.allow_anonymous {
-            GcsAuth::Anonymous
-        } else {
-            GcsAuth::ApplicationDefault
+        let auth = match (
+            credential_path.is_empty(),
+            config.allow_anonymous,
+            config.allow_application_default_credentials,
+        ) {
+            (false, false, false) => GcsAuth::CredentialFile(credential_path.to_string()),
+            (true, true, false) => GcsAuth::Anonymous,
+            (true, false, true) => GcsAuth::ApplicationDefault,
+            _ => bail!(
+                "ossConfig.gcs needs exactly one of credentialPath, allowAnonymous and \
+                 allowApplicationDefaultCredentials"
+            ),
         };
-        Self {
+        Ok(Self {
             endpoint: config.endpoint.trim().trim_end_matches('/').to_string(),
             auth,
-        }
+        })
     }
 }
 
@@ -102,6 +110,11 @@ struct OperatorCacheKey {
 
 impl OssBackend {
     pub fn new(config: &OssConfig) -> Result<Self> {
+        let gcs = config
+            .gcs
+            .as_ref()
+            .map(GcsRuntime::from_config)
+            .transpose()?;
         let credential_source = credential_source_from_config(config)?;
         let addressing_override = parse_addressing_style(&config.default_addressing_style)?;
         let timeout = if config.timeout_secs == 0 {
@@ -121,7 +134,7 @@ impl OssBackend {
                 default_region: config.default_region.clone(),
                 default_endpoint: config.default_endpoint.clone(),
                 addressing_override,
-                gcs: config.gcs.as_ref().map(GcsRuntime::from_config),
+                gcs,
                 timeout,
                 retry_count,
                 cached_operators: RwLock::new(HashMap::new()),
@@ -771,7 +784,22 @@ mod tests {
     }
 
     fn gcs_runtime() -> GcsRuntime {
-        GcsRuntime::from_config(&GcsConfig::default())
+        GcsRuntime::from_config(&GcsConfig {
+            allow_application_default_credentials: true,
+            ..GcsConfig::default()
+        })
+        .expect("explicit application default credentials")
+    }
+
+    #[test]
+    fn test_gcs_runtime_refuses_an_unchosen_credential_source() {
+        GcsRuntime::from_config(&GcsConfig::default()).expect_err("no credential choice must fail");
+        GcsRuntime::from_config(&GcsConfig {
+            credential_path: "/k.json".to_string(),
+            allow_application_default_credentials: true,
+            ..GcsConfig::default()
+        })
+        .expect_err("file and ADC conflict");
     }
 
     #[test]
@@ -809,7 +837,8 @@ mod tests {
         let key_file = GcsRuntime::from_config(&GcsConfig {
             credential_path: " /etc/gcp/key.json ".to_string(),
             ..GcsConfig::default()
-        });
+        })
+        .unwrap();
         assert_eq!(
             key_file.auth,
             GcsAuth::CredentialFile("/etc/gcp/key.json".to_string())
@@ -819,7 +848,8 @@ mod tests {
             endpoint: "http://127.0.0.1:4443/".to_string(),
             allow_anonymous: true,
             ..GcsConfig::default()
-        });
+        })
+        .unwrap();
         assert_eq!(emulator.auth, GcsAuth::Anonymous);
         assert_eq!(emulator.endpoint, "http://127.0.0.1:4443");
     }

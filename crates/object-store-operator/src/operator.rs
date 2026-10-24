@@ -40,16 +40,24 @@ pub enum ObjectStoreService {
 /// How a [`ObjectStoreService::Gcs`] operator authenticates.
 ///
 /// Google Cloud Storage does not use the access-key credentials of the other
-/// services. By default the operator resolves Application Default Credentials
-/// (`GOOGLE_APPLICATION_CREDENTIALS`, the gcloud well-known file, then the
-/// metadata server), which is what makes GKE Workload Identity work without
-/// any static key. The token is refreshed by the operator itself.
+/// services. Tokens are obtained and refreshed by the operator itself.
+///
+/// Application Default Credentials include the metadata server, whose identity
+/// is available to every process that can reach it, guests of a shared host
+/// included, so callers choose it deliberately; see [`GcsAuth::CredentialFile`]
+/// for the alternative.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GcsAuth {
-    /// Application Default Credentials.
+    /// Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the
+    /// gcloud well-known file, then the metadata server.
     #[default]
     ApplicationDefault,
-    /// A service-account or authorized-user JSON file.
+    /// A credential JSON file: a service-account key or an `external_account`
+    /// configuration (for example a projected Kubernetes token exchanged
+    /// through Workload Identity Federation). Nothing else is consulted: the
+    /// environment, the well-known file and the metadata server are all off,
+    /// so a missing or unparsable file fails requests with "no valid
+    /// credential found" instead of falling back to another identity.
     CredentialFile(String),
     /// Unauthenticated requests: public buckets and emulators.
     Anonymous,
@@ -196,7 +204,10 @@ fn gcs_builder(config: &ObjectStoreOperatorConfig) -> Gcs {
     }
     match &config.gcs_auth {
         GcsAuth::ApplicationDefault => builder,
-        GcsAuth::CredentialFile(path) => builder.credential_path(path),
+        GcsAuth::CredentialFile(path) => builder
+            .credential_path(path)
+            .disable_config_load()
+            .disable_vm_metadata(),
         // Skip token discovery too, or an emulator run would wait on the
         // metadata server.
         GcsAuth::Anonymous => builder

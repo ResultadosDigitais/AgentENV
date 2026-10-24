@@ -35,13 +35,27 @@ impl NormalizedGcsConfig {
             .trim_end_matches('/')
             .to_string();
         let credential_path = normalized_credential(config.credential_path.as_deref());
-        let auth = match (credential_path, config.allow_anonymous) {
-            (Some(_), true) => anyhow::bail!(
+        let adc = config.allow_application_default_credentials;
+        let auth = match (credential_path, config.allow_anonymous, adc) {
+            (Some(_), true, _) => anyhow::bail!(
                 "backend.gcs.credential_path cannot be combined with backend.gcs.allow_anonymous"
             ),
-            (Some(path), false) => GcsAuth::CredentialFile(path.to_string()),
-            (None, true) => GcsAuth::Anonymous,
-            (None, false) => GcsAuth::ApplicationDefault,
+            (Some(_), _, true) => anyhow::bail!(
+                "backend.gcs.credential_path cannot be combined with \
+                 backend.gcs.allow_application_default_credentials"
+            ),
+            (None, true, true) => anyhow::bail!(
+                "backend.gcs.allow_anonymous cannot be combined with \
+                 backend.gcs.allow_application_default_credentials"
+            ),
+            (Some(path), false, false) => GcsAuth::CredentialFile(path.to_string()),
+            (None, true, false) => GcsAuth::Anonymous,
+            (None, false, true) => GcsAuth::ApplicationDefault,
+            (None, false, false) => anyhow::bail!(
+                "backend.gcs needs credentials: set backend.gcs.credential_path (recommended), \
+                 or explicitly backend.gcs.allow_application_default_credentials = true, \
+                 or backend.gcs.allow_anonymous = true for emulators"
+            ),
         };
         Ok(Self {
             bucket,
@@ -176,40 +190,73 @@ mod tests {
         GcsBackendConfig {
             bucket: " snapshots ".to_string(),
             prefix: Some(" /agentenv/prod/ ".to_string()),
-            credential_path: None,
+            credential_path: Some("/etc/gcp/credential.json".to_string()),
             endpoint: None,
             allow_anonymous: false,
+            allow_application_default_credentials: false,
             cache_max_size_gb: None,
         }
     }
 
     #[test]
-    fn gcs_config_trims_and_defaults_to_application_default_credentials() {
-        let normalized = NormalizedGcsConfig::new(&gcs_config()).expect("normalize");
-
-        assert_eq!(normalized.bucket, "snapshots");
-        assert_eq!(normalized.prefix, "agentenv/prod");
-        assert_eq!(normalized.endpoint(), "");
-        assert_eq!(normalized.auth(), &GcsAuth::ApplicationDefault);
-    }
-
-    #[test]
-    fn gcs_config_selects_the_credential_file_and_the_emulator_endpoint() {
+    fn gcs_config_trims_and_selects_the_credential_file() {
         let mut config = gcs_config();
         config.credential_path = Some(" /etc/gcp/key.json ".to_string());
         config.endpoint = Some(" http://127.0.0.1:4443/ ".to_string());
 
         let normalized = NormalizedGcsConfig::new(&config).expect("normalize");
+        assert_eq!(normalized.bucket, "snapshots");
+        assert_eq!(normalized.prefix, "agentenv/prod");
+        assert_eq!(normalized.endpoint(), "http://127.0.0.1:4443");
         assert_eq!(
             normalized.auth(),
             &GcsAuth::CredentialFile("/etc/gcp/key.json".to_string())
         );
-        assert_eq!(normalized.endpoint(), "http://127.0.0.1:4443");
+    }
+
+    #[test]
+    fn gcs_config_refuses_application_default_credentials_by_default() {
+        let mut config = gcs_config();
+        config.credential_path = None;
+
+        let err = NormalizedGcsConfig::new(&config).expect_err("no credentials must fail");
+        let message = err.to_string();
+        assert!(message.contains("credential_path"), "{message}");
+        assert!(
+            message.contains("allow_application_default_credentials"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn gcs_config_allows_application_default_credentials_only_when_asked() {
+        let mut config = gcs_config();
+        config.credential_path = None;
+        config.allow_application_default_credentials = true;
+
+        let normalized = NormalizedGcsConfig::new(&config).expect("explicit opt-in");
+        assert_eq!(normalized.auth(), &GcsAuth::ApplicationDefault);
+    }
+
+    #[test]
+    fn gcs_config_rejects_conflicting_credential_choices() {
+        let mut config = gcs_config();
+        config.allow_application_default_credentials = true;
+        let err = NormalizedGcsConfig::new(&config).expect_err("file and ADC");
+        assert!(err.to_string().contains("cannot be combined"));
+
+        let mut config = gcs_config();
+        config.credential_path = None;
+        config.allow_anonymous = true;
+        config.allow_application_default_credentials = true;
+        let err = NormalizedGcsConfig::new(&config).expect_err("anonymous and ADC");
+        assert!(err.to_string().contains("cannot be combined"));
     }
 
     #[test]
     fn gcs_config_allows_anonymous_requests_only_without_a_credential_file() {
         let mut config = gcs_config();
+        config.credential_path = None;
         config.allow_anonymous = true;
         assert_eq!(
             NormalizedGcsConfig::new(&config).expect("anonymous").auth(),

@@ -162,6 +162,60 @@ async fn a_create_only_write_refuses_an_existing_object() {
     assert_eq!(fake.requests_matching("ifGenerationMatch=0"), 2);
 }
 
+fn client_with_auth(fake: &FakeGcs, auth: GcsAuth) -> OssClient {
+    OssClient::new_gcs(
+        BUCKET.to_owned(),
+        fake.endpoint.clone(),
+        String::new(),
+        auth,
+    )
+}
+
+/// The credential file is the only identity: when it cannot be used, the
+/// request fails before it is sent, and no other source (environment,
+/// well-known file, metadata server) is consulted.
+#[tokio::test]
+async fn a_missing_credential_file_fails_the_first_request_closed() {
+    let fake = FakeGcs::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = client_with_auth(
+        &fake,
+        GcsAuth::CredentialFile(dir.path().join("absent.json").display().to_string()),
+    );
+
+    let error = client.get_bytes("catalog/a.json").await.unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("no valid credential"),
+        "{error:#}"
+    );
+    assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+}
+
+#[tokio::test]
+async fn an_unparsable_credential_file_fails_the_first_request_closed() {
+    let fake = FakeGcs::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("credential.json");
+    std::fs::write(&file, "this is not json").unwrap();
+    let client = client_with_auth(&fake, GcsAuth::CredentialFile(file.display().to_string()));
+
+    let error = client
+        .put_bytes(
+            "catalog/a.json",
+            b"x".to_vec(),
+            OssUploadArtifact::CatalogRecord,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("no valid credential"),
+        "{error:#}"
+    );
+    assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+}
+
 #[tokio::test]
 async fn gcs_clients_lock_documents_with_create_only_leases() {
     let fake = FakeGcs::start().await;
