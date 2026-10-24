@@ -8,9 +8,10 @@ pub use auth::{
     CREDENTIAL_REFRESH_BUFFER,
 };
 pub use operator::{
-    build_object_store_operator, run_with_refresh, AddressingStyle, ObjectStoreOperatorConfig,
-    ObjectStoreOperatorError, ObjectStoreOperatorResult, ObjectStoreService,
-    OperatorWithCredential, DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT,
+    build_object_store_operator, gcs_object_key, gcs_object_key_decode, run_with_refresh,
+    AddressingStyle, GcsAuth, ObjectStoreOperatorConfig, ObjectStoreOperatorError,
+    ObjectStoreOperatorResult, ObjectStoreService, OperatorWithCredential, DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
 };
 
 pub use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};

@@ -430,7 +430,7 @@ Snapshot storage/build configuration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `local_cache_path` | string | `"$AENV_HOME/snapshot-local-cache"` | Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory. |
-| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"` and `"oss"` |
+| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"`, `"oss"` and `"gcs"` |
 | `p2p_enabled` | boolean | `true` | When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend. |
 
 Environment variable overrides:
@@ -471,7 +471,7 @@ looked up by consumers.
 ## `[snapshot.memory_startup_pack]`
 
 Optional startup-memory trace recording and best-effort prefetch for both
-`oss` and `posix_fs` repositories. It is disabled by default. Publishing never
+`oss`, `gcs` and `posix_fs` repositories. It is disabled by default. Publishing never
 waits for recording: a completed trace is encoded as a SHA-256-verified
 manifest and attached to the already committed snapshot. Snapshots without a
 descriptor, with a missing/corrupt manifest, or with a failed prefetch always
@@ -550,6 +550,47 @@ endpoint = "https://t3.storage.dev"
 bucket = "agentenv-snapshots"
 region = "auto"
 addressing_style = "virtual"
+```
+
+## `[backend.gcs]`
+
+Google Cloud Storage snapshot repository configuration. This section is required when `snapshot.repository_backend = "gcs"`.
+
+The backend talks to Google Cloud Storage through its native JSON and XML APIs rather than the S3 interoperability API, so it needs no HMAC keys and has no endpoint or region. Credentials are Application Default Credentials unless configured otherwise, which makes GKE Workload Identity, a node's attached service account and `gcloud auth application-default login` work without any static key in the configuration.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `bucket` | string | none | Bucket name used for committed snapshot state |
+| `prefix` | string | empty | Optional object name prefix under the bucket |
+| `credential_path` | string | unset | Service-account or authorized-user JSON key file. When unset, Application Default Credentials are used: `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud well-known credentials file, then the metadata server (Workload Identity). Cannot be combined with `allow_anonymous` |
+| `endpoint` | string | `https://storage.googleapis.com` | API endpoint override for emulators such as `fake-gcs-server`. Leave unset for Google Cloud Storage |
+| `allow_anonymous` | boolean | `false` | Send unauthenticated requests. For emulators and public buckets only |
+| `cache_max_size_gb` | integer | `10` | Maximum size of the node-local artifact cache in GiB |
+
+Notes:
+
+- The service account needs `storage.objects.create`, `get`, `list` and `delete` on the bucket, for example through `roles/storage.objectAdmin`. The AgentENV server and the overlaybd runtime resolve credentials independently, so both processes must see them (the same environment variable, file or metadata server).
+- Both the snapshot repository client and the overlaybd runtime (`ossConfig.gcs` in the generated global config) read the bucket, so layers are loaded on demand directly from `gs://` objects.
+- Object names are kept to ASCII letters, digits, `-`, `_`, `.` and `/`; any other byte, such as the `:` of a `sha256:` digest, is stored as `~` and two uppercase hex digits (`sha256~3A...`). The mapping is applied and reversed by AgentENV, so it is visible only when browsing the bucket.
+- Google Cloud Storage cannot replace or delete an object only if it is unchanged, so writers of one shared document (catalog records, aliases, the build cache head) take a lease built from create-only objects under `locks/` instead of an ETag compare-and-swap. A holder that dies releases nothing; another node takes the lock over after 30 seconds. Each node measures the 30 seconds on its own monotonic clock, so nodes need no clock agreement.
+- Large layers, such as the memory layers of a snapshot, upload through the XML multipart API in 64 MiB parts, at most 8 at a time, which allows objects of about 625 GiB.
+
+```toml
+[snapshot]
+repository_backend = "gcs"
+
+[backend.gcs]
+bucket = "agentenv-snapshots"
+prefix = "prod/"
+```
+
+For a local emulator:
+
+```toml
+[backend.gcs]
+bucket = "agentenv-snapshots"
+endpoint = "http://127.0.0.1:4443"
+allow_anonymous = true
 ```
 
 Other path override:

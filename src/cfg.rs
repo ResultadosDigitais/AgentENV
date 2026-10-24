@@ -147,6 +147,7 @@ pub struct AppConfig {
 pub struct BackendConfig {
     pub posix_fs: Option<PosixFsBackendConfig>,
     pub oss: Option<OssBackendConfig>,
+    pub gcs: Option<GcsBackendConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -452,6 +453,26 @@ pub struct OssBackendConfig {
     pub cache_max_size_gb: Option<u64>,
 }
 
+/// Google Cloud Storage snapshot repository. Authenticates with Application
+/// Default Credentials unless `credential_path` or `allow_anonymous` says
+/// otherwise.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GcsBackendConfig {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    /// Service-account or authorized-user JSON file. Unset selects Application
+    /// Default Credentials.
+    #[serde(alias = "credentialPath", alias = "credential-path")]
+    pub credential_path: Option<String>,
+    /// API endpoint override for emulators such as fake-gcs-server. Unset
+    /// selects `https://storage.googleapis.com`.
+    pub endpoint: Option<String>,
+    /// Send unauthenticated requests: emulators and public buckets only.
+    #[serde(default, alias = "allowAnonymous", alias = "allow-anonymous")]
+    pub allow_anonymous: bool,
+    pub cache_max_size_gb: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotImageStoragePolicy {
@@ -465,6 +486,7 @@ pub enum SnapshotImageStoragePolicy {
 pub enum SnapshotRepositoryBackendKind {
     PosixFs,
     Oss,
+    Gcs,
 }
 
 #[derive(Debug, Config, Clone)]

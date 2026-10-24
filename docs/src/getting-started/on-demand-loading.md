@@ -26,8 +26,9 @@ vim config.toml
 
 ## 2. Configure shared storage
 
-AgentENV supports two shared storage backends: POSIXFS and OSS. Choose one of
-the following options.
+AgentENV supports three shared storage backends: POSIXFS, OSS (S3-compatible
+object storage) and GCS (Google Cloud Storage). Choose one of the following
+options.
 
 ### Option A: POSIXFS
 
@@ -71,6 +72,29 @@ If your provider requires or prefers virtual-host bucket addressing — for
 example [Tigris](https://www.tigrisdata.com/docs/) or a Cloudflare R2
 deployment — also set `addressing_style = "virtual"`; see the
 [configuration reference](../configuration/reference.md#backendoss) for details.
+
+### Option C: GCS
+
+Enable the GCS backend and name the bucket. Credentials are Application Default
+Credentials, so on GKE with Workload Identity (or a VM with an attached service
+account) no key is configured:
+
+```toml
+[snapshot]
+repository_backend = "gcs"
+
+[backend.gcs]
+bucket = "YOUR_BUCKET"
+prefix = "YOUR_PREFIX"
+cache_max_size_gb = 100
+
+[image.cache.remote_blocks]
+max_size_gb = 100
+```
+
+Set `credential_path` to a service-account key file when Application Default
+Credentials are not available; see the
+[configuration reference](../configuration/reference.md#backendgcs) for details.
 
 ## 3. Apply the configuration
 

@@ -22,6 +22,7 @@ fn backend(fixture: &MinioFixture) -> OssBackend {
         default_addressing_style: String::new(),
         timeout_secs: 30,
         retry_count: 3,
+        gcs: None,
     };
     OssBackend::new(&config).expect("create oss backend")
 }
@@ -38,6 +39,7 @@ fn backend_with_bad_credentials(fixture: &MinioFixture) -> OssBackend {
         default_addressing_style: String::new(),
         timeout_secs: 10,
         retry_count: 0,
+        gcs: None,
     };
     OssBackend::new(&config).expect("create bad backend")
 }
