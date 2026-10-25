@@ -117,6 +117,7 @@ mod tests {
             cpu_count: 8,
             memory_mib: 16384,
             disk_size_mib: 20480,
+            memory_request_mib: None,
         };
         assert_eq!(shape.limited_by(None), shape);
         assert_eq!(
@@ -128,6 +129,7 @@ mod tests {
                 cpu_count: 2,
                 memory_mib: 4096,
                 disk_size_mib: 20480,
+                memory_request_mib: None,
             }
         );
         assert_eq!(shape.limited_by(Some(ResourceLimits::whole(shape))), shape);

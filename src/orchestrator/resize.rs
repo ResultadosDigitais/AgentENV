@@ -230,6 +230,7 @@ mod tests {
             cpu_count,
             memory_mib,
             disk_size_mib: 10240,
+            memory_request_mib: None,
         }
     }
 

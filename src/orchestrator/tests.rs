@@ -6014,6 +6014,7 @@ fn shaped_snapshot(cpu_count: u32, memory_mib: u32) -> RunnableSnapshot {
         cpu_count,
         memory_mib,
         disk_size_mib: 1024,
+        memory_request_mib: None,
     };
     RunnableSnapshot::from_test_manifest(record, Vec::new())
 }
