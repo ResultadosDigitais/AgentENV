@@ -6,9 +6,12 @@ use async_trait::async_trait;
 use anyhow::Result;
 
 use super::client::{OssClient, OssUploadArtifact};
-use super::config::NormalizedOssConfig;
+use super::config::{NormalizedGcsConfig, NormalizedOssConfig};
 use super::documents;
-use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
+use crate::cfg::{
+    GcsBackendConfig, OssBackendConfig, SnapshotImageStoragePolicy,
+    SnapshotPublishCompressionConfig,
+};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
     BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
@@ -44,6 +47,22 @@ impl OssRepository {
         Ok(Self::new(
             client,
             config.snapshot_image_storage(),
+            publish_compression,
+        ))
+    }
+
+    /// Connects to the Google Cloud Storage bucket and prefix that `config`
+    /// names. No request is made until the first operation, so credentials
+    /// are first resolved there.
+    pub(crate) fn from_gcs_config(
+        config: &GcsBackendConfig,
+        snapshot_image_storage: SnapshotImageStoragePolicy,
+        publish_compression: &SnapshotPublishCompressionConfig,
+    ) -> Result<Self> {
+        let client = Arc::new(NormalizedGcsConfig::new(config)?.client());
+        Ok(Self::new(
+            client,
+            snapshot_image_storage,
             publish_compression,
         ))
     }

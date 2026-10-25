@@ -243,6 +243,7 @@ auto_resume_min_sandbox_timeout_secs = 300
 # Durable repository backend:
 # - "posix_fs" stores snapshots on a local or shared filesystem.
 # - "oss" stores snapshots in S3-compatible object storage.
+# - "gcs" stores snapshots in Google Cloud Storage.
 repository_backend = "posix_fs"
 
 # EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
@@ -308,6 +309,20 @@ workers = 1
 # access_key_secret = "..."
 # security_token = "..."
 # cache_max_size_gb = 10              # 10 GiB node-local artifact cache
+
+# Google Cloud Storage requires a bucket and exactly one way to authenticate.
+# credential_path is recommended: a service-account key or an external_account
+# (Workload Identity Federation) JSON file, the only source consulted. The
+# metadata server is never used unless allow_application_default_credentials
+# is set, because guests that share the host's network can reach it too.
+# [backend.gcs]
+# bucket = "your-snapshot-bucket"
+# prefix = "snapshots/"
+# credential_path = "/etc/agentenv/gcp/credential.json"
+# allow_application_default_credentials = false  # opt in to ADC/metadata server
+# allow_anonymous = false                # emulators and public buckets only
+# endpoint = "http://127.0.0.1:4443"     # emulators only
+# cache_max_size_gb = 10                 # 10 GiB node-local artifact cache
 
 [ublk]
 # Explicit daemon executable. The default is under $AENV_HOME/ublk.

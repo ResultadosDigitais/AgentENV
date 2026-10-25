@@ -150,6 +150,7 @@ pub struct AppConfig {
 pub struct BackendConfig {
     pub posix_fs: Option<PosixFsBackendConfig>,
     pub oss: Option<OssBackendConfig>,
+    pub gcs: Option<GcsBackendConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -504,6 +505,37 @@ pub struct OssBackendConfig {
     pub cache_max_size_gb: Option<u64>,
 }
 
+/// Google Cloud Storage snapshot repository. Exactly one way to authenticate
+/// must be chosen: `credential_path`, `allow_anonymous`, or the explicit
+/// opt-in `allow_application_default_credentials`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GcsBackendConfig {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    /// Credential JSON file: a service-account key, or an `external_account`
+    /// (Workload Identity Federation) configuration. A file that is missing or
+    /// unparsable fails requests; it never falls back to another source.
+    #[serde(alias = "credentialPath", alias = "credential-path")]
+    pub credential_path: Option<String>,
+    /// API endpoint override for emulators such as fake-gcs-server. Unset
+    /// selects `https://storage.googleapis.com`.
+    pub endpoint: Option<String>,
+    /// Send unauthenticated requests: emulators and public buckets only.
+    #[serde(default, alias = "allowAnonymous", alias = "allow-anonymous")]
+    pub allow_anonymous: bool,
+    /// Resolve Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`,
+    /// the gcloud well-known file, then the metadata server. Off by default
+    /// because the metadata server hands its identity to everything that
+    /// shares the host's or pod's network.
+    #[serde(
+        default,
+        alias = "allowApplicationDefaultCredentials",
+        alias = "allow-application-default-credentials"
+    )]
+    pub allow_application_default_credentials: bool,
+    pub cache_max_size_gb: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotImageStoragePolicy {
@@ -517,6 +549,7 @@ pub enum SnapshotImageStoragePolicy {
 pub enum SnapshotRepositoryBackendKind {
     PosixFs,
     Oss,
+    Gcs,
 }
 
 #[derive(Debug, Config, Clone)]

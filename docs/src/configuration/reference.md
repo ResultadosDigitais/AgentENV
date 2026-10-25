@@ -452,7 +452,7 @@ Snapshot storage/build configuration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `local_cache_path` | string | `"$AENV_HOME/snapshot-local-cache"` | Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory. |
-| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"` and `"oss"` |
+| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"`, `"oss"` and `"gcs"` |
 | `p2p_enabled` | boolean | `true` | When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend. |
 
 Environment variable overrides:
@@ -493,7 +493,7 @@ looked up by consumers.
 ## `[snapshot.memory_startup_pack]`
 
 Optional startup-memory trace recording and best-effort prefetch for both
-`oss` and `posix_fs` repositories. It is disabled by default. Publishing never
+`oss`, `gcs` and `posix_fs` repositories. It is disabled by default. Publishing never
 waits for recording: a completed trace is encoded as a SHA-256-verified
 manifest and attached to the already committed snapshot. Snapshots without a
 descriptor, with a missing/corrupt manifest, or with a failed prefetch always
@@ -573,6 +573,87 @@ bucket = "agentenv-snapshots"
 region = "auto"
 addressing_style = "virtual"
 ```
+
+## `[backend.gcs]`
+
+Google Cloud Storage snapshot repository configuration. This section is required when `snapshot.repository_backend = "gcs"`.
+
+The backend talks to Google Cloud Storage through its native JSON and XML APIs rather than the S3 interoperability API, so it needs no HMAC keys and has no endpoint or region. Exactly one way to authenticate must be chosen: `credential_path` (recommended), `allow_application_default_credentials = true`, or `allow_anonymous = true`. With none of them the backend refuses to start; it never picks an identity on its own.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `bucket` | string | none | Bucket name used for committed snapshot state |
+| `prefix` | string | empty | Optional object name prefix under the bucket |
+| `credential_path` | string | unset | Credential JSON file: a service-account key, or an `external_account` configuration for Workload Identity Federation (see [Kubernetes setup](#kubernetes-setup)). This is the only credential source consulted: the environment, the gcloud well-known file and the metadata server are all disabled, so a missing or unparsable file makes requests fail with `no valid credential found` instead of falling back to another identity. Cannot be combined with the other two options |
+| `allow_application_default_credentials` | boolean | `false` | Opt in to Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud well-known file, then the metadata server. Suitable for a single-tenant VM or a developer workstation. Do not use it where untrusted code can reach the metadata server (see below). Cannot be combined with the other two options |
+| `endpoint` | string | `https://storage.googleapis.com` | API endpoint override for emulators such as `fake-gcs-server`. Leave unset for Google Cloud Storage |
+| `allow_anonymous` | boolean | `false` | Send unauthenticated requests. For emulators and public buckets only. Cannot be combined with the other two options |
+| `cache_max_size_gb` | integer | `10` | Maximum size of the node-local artifact cache in GiB |
+
+Notes:
+
+- The service account needs `storage.objects.create`, `get`, `list` and `delete` on the bucket, for example through `roles/storage.objectAdmin`. The AgentENV server and the overlaybd runtime (which runs in the `uvm-ublk-daemon` process) obtain tokens independently, so both must be able to read the file at `credential_path` and everything it references. In a pod they are in the same container, so one file serves both; each refreshes its own tokens.
+- Both the snapshot repository client and the overlaybd runtime (`ossConfig.gcs` in the generated global config) read the bucket, so layers are loaded on demand directly from `gs://` objects.
+- Object names are kept to ASCII letters, digits, `-`, `_`, `.` and `/`; any other byte, such as the `:` of a `sha256:` digest, is stored as `~` and two uppercase hex digits (`sha256~3A...`). The mapping is applied and reversed by AgentENV, so it is visible only when browsing the bucket.
+- Google Cloud Storage cannot replace or delete an object only if it is unchanged, so writers of one shared document (catalog records, aliases, the build cache head) take a lease built from create-only objects under `locks/` instead of an ETag compare-and-swap. A holder that dies releases nothing; another node takes the lock over after 30 seconds. Each node measures the 30 seconds on its own monotonic clock, so nodes need no clock agreement.
+- Large layers, such as the memory layers of a snapshot, upload through the XML multipart API in 64 MiB parts, at most 8 at a time, which allows objects of about 625 GiB.
+
+```toml
+[snapshot]
+repository_backend = "gcs"
+
+[backend.gcs]
+bucket = "agentenv-snapshots"
+prefix = "prod/"
+credential_path = "/etc/agentenv/gcp/credential.json"
+```
+
+For a local emulator:
+
+```toml
+[backend.gcs]
+bucket = "agentenv-snapshots"
+endpoint = "http://127.0.0.1:4443"
+allow_anonymous = true
+```
+
+### Kubernetes setup
+
+Sandboxes are Firecracker guests that run in the same pod as the AgentENV server and share its network. Anything the pod can obtain from the GKE metadata server, including the identity that Workload Identity binds to the pod's Kubernetes service account, is therefore also reachable from guest code unless guest egress to the metadata server is blocked. A token with write access to the snapshot bucket must not be reachable that way, so do not use Application Default Credentials, node-attached service accounts or a Workload Identity annotation for this backend in a multi-tenant deployment.
+
+Instead, hand the pod a credential as a **file**, which a guest cannot read, using Workload Identity Federation with a projected service-account token:
+
+1. Create a workload identity pool and an OIDC provider for the cluster's issuer. Create a dedicated Google service account with `roles/storage.objectAdmin` on the snapshot bucket only, and allow the pool's principal to impersonate it (`roles/iam.workloadIdentityUser`).
+2. Project a token with an explicit audience (the provider's full resource name) into the pod, and mount it read-only:
+
+   ```yaml
+   volumes:
+     - name: gcp-token
+       projected:
+         sources:
+           - serviceAccountToken:
+               audience: //iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER
+               expirationSeconds: 3600
+               path: token
+   ```
+
+   mounted at `/var/run/secrets/gcp`. The kubelet rotates the file; AgentENV re-reads it on every token refresh.
+3. Mount a credential configuration (a ConfigMap is enough, it holds no secret) at `/etc/agentenv/gcp/credential.json`:
+
+   ```json
+   {
+     "type": "external_account",
+     "audience": "//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER",
+     "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+     "token_url": "https://sts.googleapis.com/v1/token",
+     "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/SNAPSHOTS_SA@PROJECT_ID.iam.gserviceaccount.com:generateAccessToken",
+     "credential_source": { "file": "/var/run/secrets/gcp/token" }
+   }
+   ```
+
+4. Set `credential_path = "/etc/agentenv/gcp/credential.json"`.
+
+The pod must be able to reach `sts.googleapis.com` and `iamcredentials.googleapis.com` as well as `storage.googleapis.com`. Keep the mounts out of the guests' reach (they are not part of any guest filesystem), and still restrict guest egress where you can.
 
 Other path override:
 

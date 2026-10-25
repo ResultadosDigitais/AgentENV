@@ -569,7 +569,7 @@ impl ImageService {
 
     fn is_oss_url(url: &str) -> bool {
         match reqwest::Url::parse(url) {
-            Ok(parsed) => matches!(parsed.scheme(), "s3" | "oss"),
+            Ok(parsed) => matches!(parsed.scheme(), "s3" | "oss" | "gs"),
             Err(_) => false,
         }
     }
@@ -621,7 +621,7 @@ impl ImageService {
         dest_url: &str,
     ) -> Result<()> {
         if !Self::is_oss_url(dest_url) {
-            bail!("destination url must use oss:// or s3://");
+            bail!("destination url must use oss://, s3:// or gs://");
         }
         let remote_runtime = self.remote_runtime().await?;
         let oss = remote_runtime
