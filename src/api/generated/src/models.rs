@@ -3894,6 +3894,12 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u32>,
 
+    /// Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= memoryMB. Defaults to memoryMB. Does not change VM size.
+    #[serde(rename = "memoryRequestMB")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_request_mb: Option<u32>,
+
     /// Disk size for the sandbox in MiB
     #[serde(rename = "diskSizeMB")]
     #[validate(range(min = 0u32))]
@@ -3930,6 +3936,7 @@ impl NewColdSandbox {
             volume_mounts: None,
             cpu_count: None,
             memory_mb: None,
+            memory_request_mb: None,
             disk_size_mb: None,
             attached_drives: None,
             extra_boot_args: None,
@@ -3980,6 +3987,13 @@ impl std::fmt::Display for NewColdSandbox {
             self.memory_mb
                 .as_ref()
                 .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+            self.memory_request_mb.as_ref().map(|memory_request_mb| {
+                [
+                    "memoryRequestMB".to_string(),
+                    memory_request_mb.to_string(),
+                ]
+                .join(",")
+            }),
             self.disk_size_mb
                 .as_ref()
                 .map(|disk_size_mb| ["diskSizeMB".to_string(), disk_size_mb.to_string()].join(",")),
@@ -4022,6 +4036,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
+            pub memory_request_mb: Vec<u32>,
             pub disk_size_mb: Vec<u32>,
             pub attached_drives: Vec<Vec<models::AttachedDrive>>,
             pub extra_boot_args: Vec<String>,
@@ -4109,6 +4124,10 @@ impl std::str::FromStr for NewColdSandbox {
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
+                    "memoryRequestMB" => intermediate_rep.memory_request_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
                     "diskSizeMB" => intermediate_rep.disk_size_mb.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
@@ -4153,6 +4172,7 @@ impl std::str::FromStr for NewColdSandbox {
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),
             memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+            memory_request_mb: intermediate_rep.memory_request_mb.into_iter().next(),
             disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
             attached_drives: intermediate_rep.attached_drives.into_iter().next(),
             extra_boot_args: intermediate_rep.extra_boot_args.into_iter().next(),

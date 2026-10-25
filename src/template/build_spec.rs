@@ -222,6 +222,7 @@ impl TemplateBuildSpec {
             cpu_count,
             memory_mib,
             disk_size_mib: 0, // disk size is determined after build.
+            memory_request_mib: None,
         });
         self
     }

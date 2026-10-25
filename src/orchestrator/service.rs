@@ -3363,6 +3363,7 @@ fn default_fresh_sandbox_resources() -> SandboxResources {
         memory_mib: config.machine.mem_size_mib,
         // Filled from backend runtime info after the rootfs device is created.
         disk_size_mib: 0,
+        memory_request_mib: None,
     }
 }
 
