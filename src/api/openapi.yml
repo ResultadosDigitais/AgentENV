@@ -176,6 +176,102 @@ components:
       minimum: 0
       description: Disk size for the sandbox in MiB
 
+    MaxCPUCount:
+      type: integer
+      format: int32
+      minimum: 1
+      description: >-
+        vCPUs of the sandbox's VM, fixed when the VM first booted (by its
+        template or cold start). cpuCount can be resized up to this value.
+
+    MaxMemoryMB:
+      type: integer
+      format: int32
+      minimum: 128
+      description: >-
+        Guest memory in MiB of the sandbox's VM, fixed when the VM first
+        booted (by its template or cold start). memoryMB can be resized up to
+        this value.
+
+    SandboxResourcesUpdate:
+      type: object
+      description: >-
+        New effective CPU and memory for a running sandbox, inside its VM
+        shape (maxCpuCount / maxMemoryMB). An omitted field keeps its current
+        value; at least one field is required.
+      properties:
+        cpuCount:
+          allOf:
+            - $ref: "#/components/schemas/CPUCount"
+          description: vCPUs of CPU time the sandbox may use, from 1 to maxCpuCount.
+        memoryMB:
+          allOf:
+            - $ref: "#/components/schemas/MemoryMB"
+          description: Guest memory in MiB, from the node's minimum ([resize].min_memory_mib) to maxMemoryMB.
+
+    SandboxMemoryLimitState:
+      type: string
+      description: >-
+        Whether the guest has reached memoryMB. converged: the balloon holds
+        its target (or was deflated to zero). converging: the guest is still
+        inflating or deflating the balloon, or cannot give up memory it is
+        using. unobservable: the sandbox is not running, or its VM's balloon
+        was booted without statistics ([machine.balloon].stats_polling_interval_s).
+      enum:
+        - converged
+        - converging
+        - unobservable
+
+    SandboxResourceStatus:
+      type: object
+      required:
+        - cpuCount
+        - memoryMB
+        - maxCpuCount
+        - maxMemoryMB
+        - memoryState
+      properties:
+        cpuCount:
+          allOf:
+            - $ref: "#/components/schemas/CPUCount"
+          description: vCPUs of CPU time the sandbox may use.
+        memoryMB:
+          allOf:
+            - $ref: "#/components/schemas/MemoryMB"
+          description: Guest memory in MiB the sandbox may use.
+        maxCpuCount:
+          $ref: "#/components/schemas/MaxCPUCount"
+        maxMemoryMB:
+          $ref: "#/components/schemas/MaxMemoryMB"
+        cpuQuota:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          description: >-
+            vCPUs of CPU time the VMM process is capped at through cgroup v2
+            cpu.max. Null when the VMM may use every vCPU or the sandbox is
+            not running.
+        balloonTargetMB:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          description: >-
+            Guest memory in MiB the balloon is asked to hold (maxMemoryMB -
+            memoryMB). Null when the sandbox is not running or its VM has no
+            balloon device.
+        balloonActualMB:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          description: >-
+            Guest memory in MiB the balloon holds. Null when the sandbox is
+            not running or its VM's balloon reports no statistics.
+        memoryState:
+          $ref: "#/components/schemas/SandboxMemoryLimitState"
+
     EnvdVersion:
       type: string
       description: Version of the envd running in the sandbox
@@ -570,6 +666,10 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+        maxCpuCount:
+          $ref: "#/components/schemas/MaxCPUCount"
+        maxMemoryMB:
+          $ref: "#/components/schemas/MaxMemoryMB"
         diskSizeMB:
           $ref: "#/components/schemas/DiskSizeMB"
         metadata:
@@ -623,6 +723,10 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+        maxCpuCount:
+          $ref: "#/components/schemas/MaxCPUCount"
+        maxMemoryMB:
+          $ref: "#/components/schemas/MaxMemoryMB"
         diskSizeMB:
           $ref: "#/components/schemas/DiskSizeMB"
         metadata:
@@ -692,6 +796,21 @@ components:
             Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        cpuCount:
+          allOf:
+            - $ref: "#/components/schemas/CPUCount"
+          description: >-
+            vCPUs of CPU time for this sandbox, up to the template's
+            cpuCount. Defaults to the template's. A lower value needs
+            [resize].enabled and the CPU quota on the node; vCPUs cannot be
+            added beyond the template's VM.
+        memoryMB:
+          allOf:
+            - $ref: "#/components/schemas/MemoryMB"
+          description: >-
+            Guest memory in MiB for this sandbox, up to the template's
+            memoryMB. Defaults to the template's. A lower value needs
+            [resize].enabled on the node.
 
     NewSandboxV2:
       description: >-
@@ -738,6 +857,21 @@ components:
             Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        cpuCount:
+          allOf:
+            - $ref: "#/components/schemas/CPUCount"
+          description: >-
+            vCPUs of CPU time for this sandbox, up to the template's
+            cpuCount. Defaults to the template's. A lower value needs
+            [resize].enabled and the CPU quota on the node; vCPUs cannot be
+            added beyond the template's VM.
+        memoryMB:
+          allOf:
+            - $ref: "#/components/schemas/MemoryMB"
+          description: >-
+            Guest memory in MiB for this sandbox, up to the template's
+            memoryMB. Defaults to the template's. A lower value needs
+            [resize].enabled on the node.
 
     ResumedSandbox:
       properties:
@@ -2415,6 +2549,81 @@ paths:
       responses:
         "204":
           description: Successfully updated the sandbox network configuration
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/resources:
+    get:
+      summary: Sandbox resources
+      description: >-
+        Get the sandbox's VM shape (maxCpuCount / maxMemoryMB), its effective
+        CPU and memory, and, while it runs, how the VMM enforces them. Poll
+        this after a resize to follow the guest's balloon.
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      tags: [sandboxes]
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "200":
+          description: Successfully returned the sandbox resources
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxResourceStatus"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+    patch:
+      summary: Resize sandbox
+      description: >-
+        Change the effective CPU and memory of a running sandbox, live, inside
+        its VM shape. Firecracker cannot add vCPUs or guest memory to a VM, so
+        maxCpuCount / maxMemoryMB are the ceiling: CPU is enforced as a cgroup
+        v2 quota on the VMM process and memory through the VM's
+        virtio-balloon. The call returns once the VMM enforces the new
+        limits; the guest then inflates or deflates the balloon, which
+        memoryState reports. 400 means the request can never succeed for this
+        sandbox on this node (invalid value, beyond the VM shape, or a missing
+        node capability); 409 means the sandbox is not running, another
+        operation is in progress, or the node lacks capacity for the growth.
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      tags: [sandboxes]
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxResourcesUpdate"
+      responses:
+        "200":
+          description: The new limits are enforced by the VMM
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxResourceStatus"
         "400":
           $ref: "#/components/responses/400"
         "401":

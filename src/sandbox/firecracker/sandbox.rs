@@ -33,9 +33,11 @@ use crate::cfg::ConfigManager;
 use crate::overlaybd::OverlaybdCompactOutput;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxCaptureError,
-    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxState, ResourceLimitPlan, ResourceLimitStatus,
+    SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
+use crate::sandbox::cpu_quota::{CpuQuota, SandboxCpuCgroup};
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
 use crate::sandbox::guest_volumes;
@@ -194,6 +196,9 @@ pub struct FirecrackerSandbox {
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Holds the VMM process once its CPU time is capped below the VM's vCPU
+    /// count. Removed after the process exits.
+    cpu_cgroup: Option<SandboxCpuCgroup>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -600,6 +605,42 @@ impl SandboxBackend for FirecrackerSandbox {
 
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
         self.current_custom_extension_params = params;
+    }
+
+    async fn apply_resource_limits(&mut self, plan: &ResourceLimitPlan) -> Result<()> {
+        self.apply_cpu_quota(plan.cpu_quota())?;
+        let balloon_target_mib = plan.balloon_target_mib();
+        if let Err(error) = self
+            .fc_instance
+            .set_balloon_target(balloon_target_mib)
+            .await
+        {
+            if balloon_target_mib > 0 {
+                return Err(
+                    error.context("memory below the VM shape needs the VM's virtio-balloon device")
+                );
+            }
+            // A VM without a balloon already has its whole memory.
+            debug!(error = %format_args!("{error:#}"), "no balloon to deflate");
+        }
+        Ok(())
+    }
+
+    async fn resource_limit_status(&self) -> Result<ResourceLimitStatus> {
+        let balloon_target_mib = self.fc_instance.balloon_target_mib().await.ok();
+        let balloon_actual_mib = match balloon_target_mib {
+            Some(_) => self.fc_instance.balloon_actual_mib().await.ok(),
+            None => None,
+        };
+        let cpu_quota = match self.cpu_cgroup.as_ref() {
+            Some(cgroup) => cgroup.cpu_limit()?,
+            None => None,
+        };
+        Ok(ResourceLimitStatus {
+            balloon_target_mib,
+            balloon_actual_mib,
+            cpu_quota,
+        })
     }
 }
 
@@ -1211,6 +1252,8 @@ impl FirecrackerSandbox {
             envd.invalidate();
         }
         self.frozen_volume_mounts.clear();
+        // The VMM has exited, so its CPU cgroup is empty and can go.
+        self.cpu_cgroup = None;
 
         self.resources.release(timeout).await?;
 
@@ -1473,7 +1516,28 @@ impl FirecrackerSandbox {
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
             live_snapshot_root: None,
+            cpu_cgroup: None,
         })
+    }
+
+    /// Cap the VMM at `cpus` vCPUs of CPU time, or lift the cap. The VMM moves
+    /// into its own cgroup the first time it is capped.
+    fn apply_cpu_quota(&mut self, cpus: Option<u32>) -> Result<()> {
+        if let Some(cgroup) = self.cpu_cgroup.as_ref() {
+            return cgroup.set_cpu_limit(cpus);
+        }
+        let Some(cpus) = cpus else {
+            return Ok(());
+        };
+        let quota = CpuQuota::global().context(
+            "CPU limits below the VM's vCPU count need the cgroup v2 CPU quota ([resize].cpu_quota), which is unavailable on this node",
+        )?;
+        let pid = self.fc_instance.pid()?;
+        let cgroup = quota.create(self.id)?;
+        cgroup.attach(pid.as_raw().unsigned_abs())?;
+        cgroup.set_cpu_limit(Some(cpus))?;
+        self.cpu_cgroup = Some(cgroup);
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, config))]
@@ -2228,7 +2292,8 @@ impl FirecrackerSandbox {
         // Paired with DAMON reclaim (kernel boot args): DAMON reclaims cold
         // pagecache pages inside the guest, and the balloon device reports the
         // resulting free pages to the host VMM so it can release physical memory.
-        self.fc_instance.set_balloon().await?;
+        // The same device later holds memory limits below the VM shape.
+        self.fc_instance.set_balloon(&config.balloon).await?;
 
         Ok(())
     }

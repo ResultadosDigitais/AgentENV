@@ -107,6 +107,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub machine: MachineConfig,
     #[config(nested)]
+    pub resize: ResizeConfig,
+    #[config(nested)]
     pub backend: BackendConfig,
     #[config(nested)]
     pub envd: EnvdConfig,
@@ -322,6 +324,49 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     #[config(nested)]
     pub disk_rate_limit: DiskRateLimitConfig,
+    #[config(nested)]
+    pub balloon: BalloonConfig,
+}
+
+/// The virtio-balloon device a VM gets when it first boots (cold starts and
+/// template builds). A VM restored from a snapshot keeps the device the
+/// snapshot was taken with, so changes here reach existing templates only
+/// after they are rebuilt.
+#[derive(Debug, Config, Clone)]
+pub struct BalloonConfig {
+    /// Let the guest take balloon memory back under memory pressure. `true`
+    /// makes a memory limit below the VM shape advisory; `false` enforces it,
+    /// so a guest that outgrows the limit OOM-kills inside it.
+    #[config(default = true)]
+    pub deflate_on_oom: bool,
+    /// Balloon statistics polling interval in seconds; `0` disables them.
+    /// Without statistics the resources API cannot report how much memory
+    /// the balloon actually holds.
+    #[config(default = 0u32)]
+    pub stats_polling_interval_s: u32,
+}
+
+/// Per-sandbox resources inside the VM shape: `cpuCount`/`memoryMB` on
+/// snapshot-based creates and live resize through
+/// `PATCH /sandboxes/{sandboxID}/resources`.
+#[derive(Debug, Config, Clone)]
+pub struct ResizeConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Enforce CPU limits below the VM shape with a cgroup v2 `cpu.max` quota
+    /// on each VMM process. Needs a writable, delegated cgroup v2 hierarchy
+    /// with the `cpu` controller; without one, only memory can be resized.
+    #[config(default = true)]
+    pub cpu_quota: bool,
+    /// Smallest effective guest memory in MiB a sandbox may be given.
+    #[config(default = 512u32)]
+    pub min_memory_mib: u32,
+    /// Reject a resize that grows a sandbox when the CPUs allocated to the
+    /// node's running sandboxes would exceed this percentage of its CPUs.
+    pub max_cpu_allocated_percent: Option<u32>,
+    /// Reject a resize that grows a sandbox when the memory allocated to the
+    /// node's running sandboxes would exceed this percentage of its memory.
+    pub max_memory_allocated_percent: Option<u32>,
 }
 
 #[derive(Debug, Config, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -734,6 +779,8 @@ impl_config_default!(
     SandboxConfig,
     VolumeConfig,
     MachineConfig,
+    BalloonConfig,
+    ResizeConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
     SnapshotPublishCompressionConfig,

@@ -44,6 +44,9 @@ pub struct CreateSandboxRequest {
     pub custom_extension_params: Option<CustomExtensionParams>,
     /// Volume mounts requested for this sandbox, keyed by guest path.
     pub volume_mounts: HashMap<String, String>,
+    /// Effective CPU/memory inside the snapshot's VM shape. Ignored for image
+    /// launches, whose resources define the VM shape itself.
+    pub resources: super::ResourceRequest,
 }
 
 #[derive(Clone, Debug, Default)]

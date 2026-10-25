@@ -278,6 +278,27 @@ Per-sandbox disk I/O limits, applied through Firecracker's virtio-blk rate limit
 | `iops` | integer | `0` | Sustained IOPS limit; `0` means unlimited |
 | `iops_burst` | integer | `0` | One-time IOPS burst, granted once when the VM starts. Consumed before the sustained bucket and never replenished. Requires `iops` |
 
+## `[machine.balloon]`
+
+The virtio-balloon device a VM gets when it first boots (cold starts and template builds). A VM restored from a snapshot keeps the device its snapshot was taken with, so a change reaches existing templates only after they are rebuilt. See [Sandbox Resources](../concepts/sandboxes/resources.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `deflate_on_oom` | boolean | `true` | Let the guest take balloon memory back under memory pressure. `true` makes a memory limit below the VM shape advisory; `false` enforces it, so a guest that outgrows the limit OOM-kills inside it |
+| `stats_polling_interval_s` | integer | `0` | Balloon statistics polling interval in seconds; `0` disables them. Without statistics the resources API reports the balloon target but not how much memory the balloon actually holds |
+
+## `[resize]`
+
+Per-sandbox CPU and memory inside the VM shape: `cpuCount`/`memoryMB` on snapshot-based creates and live resize through `PATCH /sandboxes/{sandboxID}/resources`. See [Sandbox Resources](../concepts/sandboxes/resources.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Accept per-sandbox resources below the VM shape and live resize |
+| `cpu_quota` | boolean | `true` | Enforce CPU limits below the VM shape with a cgroup v2 `cpu.max` quota on each VMM process. Needs a writable, delegated cgroup v2 hierarchy with the `cpu` controller; when setup fails at startup only memory can be resized |
+| `min_memory_mib` | integer | `512` | Smallest effective guest memory in MiB |
+| `max_cpu_allocated_percent` | integer | unset | Reject a resize that grows a sandbox when the CPUs allocated to running sandboxes would exceed this percentage of the node's CPUs |
+| `max_memory_allocated_percent` | integer | unset | Reject a resize that grows a sandbox when the memory allocated to running sandboxes would exceed this percentage of the node's memory |
+
 ## `[envd]`
 
 In-guest `envd` daemon settings.

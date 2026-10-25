@@ -10,8 +10,8 @@ use firecracker_client::models::instance_action_info::ActionType;
 use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
-    Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
-    MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
+    Balloon, BalloonStats, BalloonUpdate, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo,
+    Logger, MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
     SnapshotCreateParams, SnapshotLoadParams, Vm,
 };
 use hyper::Method;
@@ -24,6 +24,7 @@ use tracing::{debug, trace, warn};
 
 use super::mmds::MmdsMetadata;
 use super::socket::UnixSocketClient;
+use crate::cfg::BalloonConfig;
 
 /// Maximum size (in bytes) of the MMDS data store. The Firecracker default is
 /// 51200 (50 KiB); we raise it to 1 MiB to accommodate raw image configs
@@ -438,15 +439,18 @@ impl FirecrackerInstance {
 
     /// Configures the virtio-balloon device with free page reporting enabled.
     ///
-    /// Pre-boot only. Sets `amount_mib = 0` (no target inflation) and
-    /// `deflate_on_oom = true` as a safety net. The primary purpose is to
-    /// enable free page reporting so the guest kernel can return unused pages
-    /// to the host via `MADV_DONTNEED`, reducing host memory pressure.
-    pub async fn set_balloon(&self) -> Result<()> {
+    /// Pre-boot only. Sets `amount_mib = 0` (no target inflation). Free page
+    /// reporting lets the guest kernel return unused pages to the host via
+    /// `MADV_DONTNEED`, reducing host memory pressure; the same device later
+    /// enforces memory limits below the VM shape (see
+    /// [`set_balloon_target`][Self::set_balloon_target]). The device features
+    /// chosen here are fixed for the VM's life, including every restore.
+    pub async fn set_balloon(&self, config: &BalloonConfig) -> Result<()> {
         let balloon = Balloon {
             amount_mib: 0,
-            deflate_on_oom: true,
-            stats_polling_interval_s: None,
+            deflate_on_oom: config.deflate_on_oom,
+            stats_polling_interval_s: (config.stats_polling_interval_s > 0)
+                .then(|| i32::try_from(config.stats_polling_interval_s).unwrap_or(i32::MAX)),
             free_page_hinting: None,
             free_page_reporting: Some(true),
         };
@@ -454,6 +458,41 @@ impl FirecrackerInstance {
             .request_no_content(Method::PUT, "/balloon", Some(&balloon))
             .await
             .context("Failed to set balloon configuration")
+    }
+
+    /// Sets how much guest memory the balloon should hold. Works on a running
+    /// or restored VM whose balloon device was configured at first boot.
+    pub async fn set_balloon_target(&self, amount_mib: u32) -> Result<()> {
+        let amount_mib = i32::try_from(amount_mib).context("balloon target exceeds i32 MiB")?;
+        self.client
+            .request_no_content(
+                Method::PATCH,
+                "/balloon",
+                Some(&BalloonUpdate::new(amount_mib)),
+            )
+            .await
+            .context("Failed to update balloon target")
+    }
+
+    /// Returns the balloon target in MiB. Fails when the VM has no balloon.
+    pub async fn balloon_target_mib(&self) -> Result<u32> {
+        let balloon: Balloon = self
+            .client
+            .request::<(), Balloon>(Method::GET, "/balloon", None)
+            .await
+            .context("Failed to read balloon configuration")?;
+        u32::try_from(balloon.amount_mib).context("negative balloon target")
+    }
+
+    /// Returns the memory the balloon holds in MiB. Fails when the balloon was
+    /// booted without statistics.
+    pub async fn balloon_actual_mib(&self) -> Result<u32> {
+        let stats: BalloonStats = self
+            .client
+            .request::<(), BalloonStats>(Method::GET, "/balloon/statistics", None)
+            .await
+            .context("Failed to read balloon statistics")?;
+        u32::try_from(stats.actual_mib).context("negative balloon size")
     }
 
     /// Starts the microVM.
@@ -791,6 +830,119 @@ mod tests {
             PathBuf::from("/tmp/vm_state.bin")
         );
 
+        Ok(())
+    }
+
+    type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    /// Serves the balloon endpoints like a VM whose balloon holds a 3072 MiB
+    /// target and was booted without statistics, recording every request.
+    fn serve_balloon_api(socket_path: &Path) -> Result<RecordedRequests> {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Response, StatusCode};
+        use hyper_util::rt::TokioIo;
+
+        let listener = tokio::net::UnixListener::bind(socket_path)?;
+        let requests = RecordedRequests::default();
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let recorded = recorded.clone();
+                        async move {
+                            let method = req.method().to_string();
+                            let path = req.uri().path().to_string();
+                            let body = req.collect().await?.to_bytes();
+                            recorded.lock().unwrap().push((
+                                method.clone(),
+                                path.clone(),
+                                String::from_utf8_lossy(&body).into_owned(),
+                            ));
+                            let (status, body): (StatusCode, &'static str) =
+                                match (method.as_str(), path.as_str()) {
+                                    ("GET", "/balloon") => (
+                                        StatusCode::OK,
+                                        r#"{"amount_mib":3072,"deflate_on_oom":false}"#,
+                                    ),
+                                    ("GET", "/balloon/statistics") => (
+                                        StatusCode::BAD_REQUEST,
+                                        r#"{"fault_message":"Statistics are not enabled."}"#,
+                                    ),
+                                    _ => (StatusCode::NO_CONTENT, ""),
+                                };
+                            Ok::<_, hyper::Error>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                    .expect("build response"),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Ok(requests)
+    }
+
+    #[tokio::test]
+    async fn balloon_requests_follow_the_firecracker_api() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let requests = serve_balloon_api(&temp.path().join("firecracker.socket"))?;
+
+        instance
+            .set_balloon(&BalloonConfig {
+                deflate_on_oom: false,
+                stats_polling_interval_s: 5,
+            })
+            .await?;
+        instance.set_balloon_target(3072).await?;
+        assert_eq!(instance.balloon_target_mib().await?, 3072);
+        let error = instance.balloon_actual_mib().await.unwrap_err();
+        assert!(format!("{error:#}").contains("400"), "{error:#}");
+
+        let requests = requests.lock().unwrap().clone();
+        let (method, path, body) = &requests[0];
+        assert_eq!((method.as_str(), path.as_str()), ("PUT", "/balloon"));
+        let body: serde_json::Value = serde_json::from_str(body)?;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "amount_mib": 0,
+                "deflate_on_oom": false,
+                "stats_polling_interval_s": 5,
+                "free_page_reporting": true,
+            })
+        );
+        let (method, path, body) = &requests[1];
+        assert_eq!((method.as_str(), path.as_str()), ("PATCH", "/balloon"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body)?,
+            serde_json::json!({ "amount_mib": 3072 })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn balloon_statistics_stay_off_by_default() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let requests = serve_balloon_api(&temp.path().join("firecracker.socket"))?;
+
+        instance.set_balloon(&BalloonConfig::default()).await?;
+
+        let requests = requests.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&requests[0].2)?;
+        assert_eq!(body["deflate_on_oom"], serde_json::json!(true));
+        assert!(body.get("stats_polling_interval_s").is_none(), "{body}");
         Ok(())
     }
 }

@@ -183,6 +183,7 @@ impl ApiImpl {
                     secure: true,
                     custom_extension_params: None,
                     volume_mounts: mounts,
+                    resources: Default::default(),
                 },
             )
             .await?;
