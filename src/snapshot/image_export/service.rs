@@ -40,6 +40,11 @@ enum ManagedLayerLocator {
     Oss { client: Arc<oss::OssClient> },
 }
 
+/// Whether `url` names an object-storage object rather than a registry blob.
+pub(super) fn is_object_storage_url(url: &str) -> bool {
+    url.starts_with("s3://") || url.starts_with("gs://")
+}
+
 fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
     match layer {
         OverlaybdLayerRef::External(external) => (&external.digest, external.size),
@@ -92,6 +97,25 @@ impl SnapshotImageService {
                     let repository = Arc::new(oss::OssRepository::new(
                         Arc::clone(&client),
                         config.snapshot_image_storage(),
+                        publish_compression,
+                    ));
+                    (repository, ManagedLayerLocator::Oss { client })
+                }
+                SnapshotRepositoryBackendKind::Gcs => {
+                    let gcs_config =
+                        config.backend.gcs.as_ref().context(
+                            "backend.gcs config is required when repository_backend = gcs",
+                        )?;
+                    let policy = if config.snapshot.image_publish.enabled {
+                        SnapshotImageStoragePolicy::SourceRegistry
+                    } else {
+                        SnapshotImageStoragePolicy::ObjectStorage
+                    };
+                    let publish_compression = &config.snapshot.publish_compression;
+                    let client = Arc::new(oss::NormalizedGcsConfig::new(gcs_config)?.client());
+                    let repository = Arc::new(oss::OssRepository::new(
+                        Arc::clone(&client),
+                        policy,
                         publish_compression,
                     ));
                     (repository, ManagedLayerLocator::Oss { client })
@@ -260,7 +284,7 @@ impl SnapshotImageService {
                 // local file as external refs carrying the synthetic
                 // managed-layers s3 URL; their bytes live in the
                 // managed-layer store, addressed by digest.
-                if external.repo_blob_url.starts_with("s3://") {
+                if is_object_storage_url(&external.repo_blob_url) {
                     let managed = ManagedLayer {
                         digest: external.digest.clone(),
                         size: external.size,

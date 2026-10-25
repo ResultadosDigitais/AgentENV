@@ -50,6 +50,14 @@ fn builder_snapshot_config(config: &AppConfig) -> AppConfig {
             format!("{prefix}/{namespace}")
         });
     }
+    if let Some(gcs) = config.backend.gcs.as_mut() {
+        let prefix = gcs.prefix.as_deref().unwrap_or("").trim().trim_matches('/');
+        gcs.prefix = Some(if prefix.is_empty() {
+            namespace.to_owned()
+        } else {
+            format!("{prefix}/{namespace}")
+        });
+    }
     config.snapshot.local_cache_path = config.snapshot.local_cache_path.join(namespace);
     config
 }
@@ -98,6 +106,33 @@ fn build_snapshot_backend_from_config(
                 oss_config,
                 snapshot_image_storage,
                 &config.snapshot.publish_compression,
+                cache,
+                shared_cache_root.join("runtime"),
+                overlaybd_layers,
+                p2p_transport,
+            )?
+            .into_parts())
+        }
+        SnapshotRepositoryBackendKind::Gcs => {
+            let gcs_config = config
+                .backend
+                .gcs
+                .as_ref()
+                .context("backend.gcs config is required when repository_backend = gcs")?;
+            let snapshot_image_storage = if config.snapshot.image_publish.enabled {
+                SnapshotImageStoragePolicy::SourceRegistry
+            } else {
+                SnapshotImageStoragePolicy::ObjectStorage
+            };
+            let cache =
+                LocalArtifactCache::new(shared_cache_root.clone(), gcs_config.cache_max_size_gb)?;
+            let repository: Arc<dyn Repository> = Arc::new(OssRepository::from_gcs_config(
+                gcs_config,
+                snapshot_image_storage,
+                &config.snapshot.publish_compression,
+            )?);
+            Ok(OssBackend::with_repository(
+                repository,
                 cache,
                 shared_cache_root.join("runtime"),
                 overlaybd_layers,
@@ -260,7 +295,19 @@ impl OssBackend {
             snapshot_image_storage,
             publish_compression,
         )?);
+        Self::with_repository(repository, cache, runtime_root, store, p2p_transport)
+    }
 
+    /// Wraps an object-storage repository with the node-local runtime
+    /// resolver. Shared by every object-storage backend, Google Cloud Storage
+    /// included.
+    pub(crate) fn with_repository(
+        repository: Arc<dyn Repository>,
+        cache: Arc<LocalArtifactCache>,
+        runtime_root: PathBuf,
+        store: Arc<dyn OverlaybdLayerStore>,
+        p2p_transport: Option<Arc<dyn P2pTransport>>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&runtime_root)
             .with_context(|| format!("create oss runtime root '{}'", runtime_root.display()))?;
         let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> =

@@ -1,13 +1,14 @@
-use crate::config::OssConfig;
+use crate::config::{GcsConfig, OssConfig};
 use crate::io::virtual_file::VirtualFile;
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store_operator::{
-    build_object_store_operator, credential_source_from_fields, run_with_refresh, AddressingStyle,
-    CachedCredentialSource, CredentialFields, CredentialSource, CredentialSourceOptions,
-    ObjectStoreOperatorConfig, ObjectStoreOperatorError, ObjectStoreService, OpenDalError,
-    OpenDalErrorKind, OpenDalResult, Operator, OperatorWithCredential, ResolvedCredential,
+    build_object_store_operator, credential_source_from_fields, gcs_object_key, run_with_refresh,
+    AddressingStyle, CachedCredentialSource, CredentialFields, CredentialSource,
+    CredentialSourceOptions, GcsAuth, ObjectStoreOperatorConfig, ObjectStoreOperatorError,
+    ObjectStoreService, OpenDalError, OpenDalErrorKind, OpenDalResult, Operator,
+    OperatorWithCredential, ResolvedCredential,
 };
 use reqwest::Url;
 use std::cmp::min;
@@ -40,18 +41,54 @@ struct OssBackendInner {
     default_region: String,
     default_endpoint: String,
     addressing_override: Option<AddressingStyle>,
+    /// Where `gs://` URLs are read from; `None` rejects them.
+    gcs: Option<GcsRuntime>,
     timeout: Duration,
     retry_count: u32,
     cached_operators: RwLock<HashMap<OperatorCacheKey, OperatorWithCredential>>,
 }
 
+/// How `gs://` URLs are reached, from [`GcsConfig`].
+#[derive(Debug, Clone)]
+struct GcsRuntime {
+    endpoint: String,
+    auth: GcsAuth,
+}
+
+impl GcsRuntime {
+    /// Fails unless exactly one credential source was chosen, so a config that
+    /// skipped validation cannot fall back to the metadata server.
+    fn from_config(config: &GcsConfig) -> Result<Self> {
+        let credential_path = config.credential_path.trim();
+        let auth = match (
+            credential_path.is_empty(),
+            config.allow_anonymous,
+            config.allow_application_default_credentials,
+        ) {
+            (false, false, false) => GcsAuth::CredentialFile(credential_path.to_string()),
+            (true, true, false) => GcsAuth::Anonymous,
+            (true, false, true) => GcsAuth::ApplicationDefault,
+            _ => bail!(
+                "ossConfig.gcs needs exactly one of credentialPath, allowAnonymous and \
+                 allowApplicationDefaultCredentials"
+            ),
+        };
+        Ok(Self {
+            endpoint: config.endpoint.trim().trim_end_matches('/').to_string(),
+            auth,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParsedOssUrl {
+    service: ObjectStoreService,
     bucket: String,
     key: String,
     region: String,
     endpoint: String,
     addressing_style: AddressingStyle,
+    gcs_auth: GcsAuth,
 }
 
 #[derive(Debug)]
@@ -63,6 +100,8 @@ pub struct OssFile {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct OperatorCacheKey {
+    service: ObjectStoreService,
+    gcs_auth: GcsAuth,
     bucket: String,
     region: String,
     endpoint: String,
@@ -71,6 +110,11 @@ struct OperatorCacheKey {
 
 impl OssBackend {
     pub fn new(config: &OssConfig) -> Result<Self> {
+        let gcs = config
+            .gcs
+            .as_ref()
+            .map(GcsRuntime::from_config)
+            .transpose()?;
         let credential_source = credential_source_from_config(config)?;
         let addressing_override = parse_addressing_style(&config.default_addressing_style)?;
         let timeout = if config.timeout_secs == 0 {
@@ -90,6 +134,7 @@ impl OssBackend {
                 default_region: config.default_region.clone(),
                 default_endpoint: config.default_endpoint.clone(),
                 addressing_override,
+                gcs,
                 timeout,
                 retry_count,
                 cached_operators: RwLock::new(HashMap::new()),
@@ -107,6 +152,7 @@ impl OssBackend {
             &self.inner.default_endpoint,
             &self.inner.default_region,
             self.inner.addressing_override,
+            self.inner.gcs.as_ref(),
         )?;
 
         Ok(Arc::new(OssFile {
@@ -152,6 +198,7 @@ impl OssBackend {
             &self.inner.default_endpoint,
             &self.inner.default_region,
             self.inner.addressing_override,
+            self.inner.gcs.as_ref(),
         )?;
         let key = location.key.clone();
         let path = path.as_ref().to_path_buf();
@@ -192,6 +239,7 @@ impl OssBackend {
             &self.inner.default_endpoint,
             &self.inner.default_region,
             self.inner.addressing_override,
+            self.inner.gcs.as_ref(),
         )?;
         let key = location.key.clone();
 
@@ -216,6 +264,7 @@ impl OssBackend {
             &self.inner.default_endpoint,
             &self.inner.default_region,
             self.inner.addressing_override,
+            self.inner.gcs.as_ref(),
         )?;
         let key = location.key.clone();
 
@@ -239,10 +288,11 @@ impl ParsedOssUrl {
         default_endpoint: &str,
         default_region: &str,
         addressing_override: Option<AddressingStyle>,
+        gcs: Option<&GcsRuntime>,
     ) -> Result<Self> {
         let url = Url::parse(raw).context(format!("invalid oss url {raw}"))?;
         ensure!(
-            matches!(url.scheme(), "s3" | "oss"),
+            matches!(url.scheme(), "s3" | "oss" | "gs"),
             "unsupported oss url scheme {}",
             url.scheme()
         );
@@ -254,6 +304,22 @@ impl ParsedOssUrl {
             .to_string();
         let key = url.path().trim_start_matches('/').to_string();
         ensure!(!key.is_empty(), "oss url object key is missing");
+
+        if url.scheme() == "gs" {
+            let gcs = gcs.ok_or_else(|| {
+                anyhow::anyhow!("gs:// url {raw} needs ossConfig.gcs to be configured")
+            })?;
+            return Ok(Self {
+                service: ObjectStoreService::Gcs,
+                bucket,
+                // The repository stores the object under this spelling.
+                key: gcs_object_key(&key),
+                region: String::new(),
+                endpoint: gcs.endpoint.clone(),
+                addressing_style: AddressingStyle::Path,
+                gcs_auth: gcs.auth.clone(),
+            });
+        }
 
         let mut endpoint = None;
         let mut region = None;
@@ -289,16 +355,20 @@ impl ParsedOssUrl {
         let addressing_style = addressing_override.unwrap_or(detected_style);
 
         Ok(Self {
+            service: ObjectStoreService::S3,
             bucket,
             key,
             region,
             endpoint,
             addressing_style,
+            gcs_auth: GcsAuth::default(),
         })
     }
 
     fn cache_key(&self) -> OperatorCacheKey {
         OperatorCacheKey {
+            service: self.service,
+            gcs_auth: self.gcs_auth.clone(),
             bucket: self.bucket.clone(),
             region: self.region.clone(),
             endpoint: self.endpoint.clone(),
@@ -308,11 +378,12 @@ impl ParsedOssUrl {
 
     fn operator_config(&self, timeout: Duration, retry_count: u32) -> ObjectStoreOperatorConfig {
         ObjectStoreOperatorConfig {
-            service: ObjectStoreService::S3,
+            service: self.service,
             bucket: self.bucket.clone(),
             endpoint: self.endpoint.clone(),
             region: self.region.clone(),
             addressing_style: self.addressing_style,
+            gcs_auth: self.gcs_auth.clone(),
             timeout: Some(timeout),
             max_retries: Some(retry_count as usize),
         }
@@ -344,7 +415,13 @@ impl OssBackendInner {
         &self,
         location: &ParsedOssUrl,
     ) -> Result<OperatorWithCredential> {
-        let credential = self.credentials.current().await?;
+        // Google Cloud Storage resolves and refreshes its own tokens.
+        let credential = match location.service {
+            ObjectStoreService::Gcs => None,
+            ObjectStoreService::S3 | ObjectStoreService::AliyunOss => {
+                self.credentials.current().await?
+            }
+        };
         let cache_key = location.cache_key();
 
         {
@@ -699,10 +776,89 @@ mod tests {
             default_addressing_style: String::new(),
             timeout_secs: 30,
             retry_count: 3,
+            gcs: None,
         };
 
         let err = credential_source_from_config(&config).expect_err("mixed source should fail");
         assert!(err.to_string().contains("credential_process"));
+    }
+
+    fn gcs_runtime() -> GcsRuntime {
+        GcsRuntime::from_config(&GcsConfig {
+            allow_application_default_credentials: true,
+            ..GcsConfig::default()
+        })
+        .expect("explicit application default credentials")
+    }
+
+    #[test]
+    fn test_gcs_runtime_refuses_an_unchosen_credential_source() {
+        GcsRuntime::from_config(&GcsConfig::default()).expect_err("no credential choice must fail");
+        GcsRuntime::from_config(&GcsConfig {
+            credential_path: "/k.json".to_string(),
+            allow_application_default_credentials: true,
+            ..GcsConfig::default()
+        })
+        .expect_err("file and ADC conflict");
+    }
+
+    #[test]
+    fn test_gs_url_parses_without_endpoint_or_region() {
+        let gcs = gcs_runtime();
+        let parsed = ParsedOssUrl::parse(
+            "gs://snapshots/prefix/managed-layers/sha256:aa",
+            "",
+            "",
+            None,
+            Some(&gcs),
+        )
+        .expect("parse gs url");
+
+        assert_eq!(parsed.service, ObjectStoreService::Gcs);
+        assert_eq!(parsed.bucket, "snapshots");
+        // `:` is not a character GCS object names may keep; see `gcs_object_key`.
+        assert_eq!(parsed.key, "prefix/managed-layers/sha256~3Aaa");
+        assert_eq!(parsed.gcs_auth, GcsAuth::ApplicationDefault);
+        assert_eq!(
+            parsed.operator_config(Duration::from_secs(5), 2).service,
+            ObjectStoreService::Gcs
+        );
+    }
+
+    #[test]
+    fn test_gs_url_needs_gcs_config() {
+        let err = ParsedOssUrl::parse("gs://snapshots/key", "", "", None, None)
+            .expect_err("gs url without gcs config must fail");
+        assert!(err.to_string().contains("ossConfig.gcs"));
+    }
+
+    #[test]
+    fn test_gcs_runtime_picks_the_credential_source() {
+        let key_file = GcsRuntime::from_config(&GcsConfig {
+            credential_path: " /etc/gcp/key.json ".to_string(),
+            ..GcsConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            key_file.auth,
+            GcsAuth::CredentialFile("/etc/gcp/key.json".to_string())
+        );
+
+        let emulator = GcsRuntime::from_config(&GcsConfig {
+            endpoint: "http://127.0.0.1:4443/".to_string(),
+            allow_anonymous: true,
+            ..GcsConfig::default()
+        })
+        .unwrap();
+        assert_eq!(emulator.auth, GcsAuth::Anonymous);
+        assert_eq!(emulator.endpoint, "http://127.0.0.1:4443");
+    }
+
+    #[test]
+    fn test_s3_urls_still_need_an_endpoint_and_region() {
+        let gcs = gcs_runtime();
+        ParsedOssUrl::parse("s3://bucket/key", "", "", None, Some(&gcs))
+            .expect_err("s3 url without endpoint must fail");
     }
 
     #[test]
