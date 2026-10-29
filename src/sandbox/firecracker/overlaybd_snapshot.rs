@@ -180,20 +180,38 @@ fn local_layer_config_with_descriptor(
     }
 }
 
-fn canonicalized_runtime_owned_roots() -> &'static [PathBuf] {
-    static RUNTIME_OWNED_ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    RUNTIME_OWNED_ROOTS
-        .get_or_init(|| {
-            let config = ConfigManager::global_config();
-            [
-                managed_snapshot_base(),
-                config.orchestrator.persisted_sandbox_store_path.clone(),
-            ]
-            .into_iter()
-            .map(|root| fs::canonicalize(&root).unwrap_or(root))
-            .collect::<Vec<_>>()
-        })
-        .as_slice()
+/// Resolve the directories whose layers this process creates at runtime.
+///
+/// The pause path needs them to tell its own lowers from the immutable stable
+/// prefix. They are resolved once per sandbox, at build time, from the only
+/// production sources (`firecracker.work_dir` for managed snapshots and
+/// `orchestrator.persisted_sandbox_store_path`), and passed down explicitly so
+/// a test can inject its own roots instead of mutating process-wide config.
+pub(super) fn runtime_owned_roots() -> Vec<PathBuf> {
+    let config = ConfigManager::global_config();
+    [
+        managed_snapshot_base(),
+        config.orchestrator.persisted_sandbox_store_path.clone(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Whether `path` lives under one of `roots`, compared in canonical form.
+///
+/// A root captured before its directory exists cannot be canonicalized (the
+/// directory is created on the first pause), so canonicalization has to happen
+/// here, at comparison time, for the root as well. Comparing a raw root against
+/// a canonicalized lower silently never matches under a symlinked or relative
+/// prefix: every pause-created lower then looks like immutable stable prefix,
+/// compaction only re-commits the newest generation, and the byte ceiling
+/// eventually rejects the pause outright.
+fn is_runtime_owned(path: &Path, runtime_owned_roots: &[PathBuf]) -> bool {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    runtime_owned_roots.iter().any(|root| {
+        let root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        canonical.starts_with(&root)
+    })
 }
 
 /// Split a list of overlaybd lowers into two parts: the prefix of stable lowers and the suffix of runtime-owned lowers.
@@ -206,25 +224,18 @@ fn split_runtime_suffix(
     mut lowers: Vec<LayerConfig>,
     runtime_owned_roots: &[PathBuf],
 ) -> (Vec<LayerConfig>, Vec<LayerConfig>) {
-    let Some(first_runtime_owned_index) = lowers.iter().position(|lower| {
-        let lower_path =
-            fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
-        runtime_owned_roots
-            .iter()
-            .any(|root| lower_path.starts_with(root))
-    }) else {
+    let Some(first_runtime_owned_index) = lowers
+        .iter()
+        .position(|lower| is_runtime_owned(Path::new(&lower.file), runtime_owned_roots))
+    else {
         return (lowers, Vec::new());
     };
 
     let runtime_owned_suffix = lowers.split_off(first_runtime_owned_index);
 
-    debug_assert!(lowers.iter().all(|lower| {
-        let lower_path =
-            fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
-        runtime_owned_roots
-            .iter()
-            .all(|root| !lower_path.starts_with(root))
-    }));
+    debug_assert!(lowers
+        .iter()
+        .all(|lower| !is_runtime_owned(Path::new(&lower.file), runtime_owned_roots)));
 
     (lowers, runtime_owned_suffix)
 }
@@ -433,6 +444,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,
     chain_bytes_ceiling: u64,
+    runtime_owned_roots: &[PathBuf],
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -467,11 +479,12 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         None
     };
 
-    let rewritten_lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let rewritten_lowers = rewrite_lowers_with_runtime_roots(
         image_config.lowers,
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        runtime_owned_roots,
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
@@ -487,26 +500,6 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         .context("serialize overlaybd rootfs image config with inherited runtime layers")?;
     write_bytes_atomically(&output_path, &bytes, "overlaybd rootfs image config")?;
     Ok(output_path)
-}
-
-async fn rewrite_lowers_with_owned_runtime_suffix(
-    existing_lowers: Vec<LayerConfig>,
-    output_dir: &Path,
-    appended_layer: Option<LayerConfig>,
-    compaction_output_name: &'static str,
-    compaction_output: OverlaybdCompactOutput,
-    chain_bytes_ceiling: u64,
-) -> Result<Vec<LayerConfig>> {
-    rewrite_lowers_with_runtime_roots(
-        existing_lowers,
-        output_dir,
-        appended_layer,
-        compaction_output_name,
-        canonicalized_runtime_owned_roots(),
-        compaction_output,
-        chain_bytes_ceiling,
-    )
-    .await
 }
 
 async fn rewrite_lowers_with_runtime_roots(
@@ -730,15 +723,17 @@ pub(super) async fn build_mem_snapshot_image_config(
     output_dir: &Path,
     memory_output: OverlaybdCompactOutput,
     chain_bytes_ceiling: u64,
+    runtime_owned_roots: &[PathBuf],
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
     let new_layer = local_layer_config(new_layer_path);
-    let lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let lowers = rewrite_lowers_with_runtime_roots(
         inherited_image_config.lowers,
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
+        runtime_owned_roots,
         memory_output,
         chain_bytes_ceiling,
     )
@@ -765,6 +760,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     snapshot_layer_file_name: &str,
     kind: &'static str,
     chain_bytes_ceiling: u64,
+    runtime_owned_roots: &[PathBuf],
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -785,6 +781,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         output_dir,
         live_snapshot.snapshot_layer_path(),
         chain_bytes_ceiling,
+        runtime_owned_roots,
     )
     .await;
 
@@ -797,6 +794,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     live_runtime_image_config_path: &Path,
     snapshot_root: &Path,
     chain_bytes_ceiling: u64,
+    runtime_owned_roots: &[PathBuf],
 ) -> Result<PathBuf> {
     restack_snapshot_overlaybd_device(
         ublk_device,
@@ -806,6 +804,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         "snapshot.commit",
         "rootfs",
         chain_bytes_ceiling,
+        runtime_owned_roots,
     )
     .await
 }
@@ -1093,8 +1092,7 @@ mod tests {
             local_layer_config(&managed_base_lower),
         ];
 
-        let (preserved, managed) =
-            split_runtime_suffix(lowers, canonicalized_runtime_owned_roots());
+        let (preserved, managed) = split_runtime_suffix(lowers, &runtime_owned_roots());
 
         assert_eq!(preserved.len(), 2);
         assert_eq!(preserved[0].file, "");
@@ -1624,6 +1622,7 @@ mod tests {
             &output_dir,
             Some(&snapshot_lower),
             0,
+            &[],
         )
         .await
         .expect("stage snapshot");
@@ -1671,6 +1670,7 @@ mod tests {
             temp.path(),
             OverlaybdCompactOutput::Raw,
             0,
+            &[],
         )
         .await
         .expect("build memory image config");

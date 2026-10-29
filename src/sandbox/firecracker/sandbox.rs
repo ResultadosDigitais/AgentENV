@@ -201,6 +201,11 @@ pub struct FirecrackerSandbox {
     /// stays in one place and a test can drive the pause path with its own
     /// ceiling without mutating process-wide configuration.
     chain_bytes_ceiling: u64,
+    /// Directories whose overlaybd layers this sandbox creates at runtime,
+    /// resolved once when the sandbox is built. The pause path compares each
+    /// lower against these (in canonical form) to keep its own layers in the
+    /// runtime-owned suffix, which is the only part compaction may rewrite.
+    runtime_owned_roots: Vec<PathBuf>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -715,6 +720,19 @@ impl FirecrackerSandbox {
         self
     }
 
+    /// Override the directories whose layers this sandbox creates at runtime.
+    ///
+    /// Production never calls this: [`FirecrackerSandbox::build`] resolves them
+    /// once from `firecracker.work_dir` (managed snapshots) and
+    /// `orchestrator.persisted_sandbox_store_path`. The pause path needs them to
+    /// keep its own lowers in the runtime-owned suffix; a root that does not
+    /// match leaves every pause-created layer looking immutable, which is what
+    /// let a chain grow past the byte ceiling until the pause was rejected.
+    pub fn with_runtime_owned_roots(mut self, runtime_owned_roots: Vec<PathBuf>) -> Self {
+        self.runtime_owned_roots = runtime_owned_roots;
+        self
+    }
+
     /// The dedicated pack-recording memory device's id, when this sandbox was
     /// started with `pack_recording = true`.
     pub(crate) fn dedicated_mem_device_id(&self) -> Option<u32> {
@@ -1040,6 +1058,7 @@ impl FirecrackerSandbox {
             snapshot_dir,
             OverlaybdCompactOutput::Raw,
             self.chain_bytes_ceiling,
+            &self.runtime_owned_roots,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -1083,6 +1102,7 @@ impl FirecrackerSandbox {
                 &rootfs_runtime.image_config_path,
                 snapshot_dir,
                 self.chain_bytes_ceiling,
+                &self.runtime_owned_roots,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
@@ -1498,6 +1518,7 @@ impl FirecrackerSandbox {
             chain_bytes_ceiling: ConfigManager::global_config()
                 .orchestrator
                 .chain_bytes_ceiling,
+            runtime_owned_roots: super::overlaybd_snapshot::runtime_owned_roots(),
         })
     }
 
@@ -2391,6 +2412,7 @@ impl FirecrackerSandbox {
                 &snapshot_layer_file_name,
                 "drive",
                 self.chain_bytes_ceiling,
+                &self.runtime_owned_roots,
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -2440,6 +2462,7 @@ impl FirecrackerSandbox {
                 &snapshot_layer_file_name,
                 "volume",
                 self.chain_bytes_ceiling,
+                &self.runtime_owned_roots,
             )
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
