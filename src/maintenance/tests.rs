@@ -238,6 +238,28 @@ macro_rules! behavior_table {
                 (repository, temp)
             }
 
+            /// Makes the layer `digest` old enough to be collected.
+            ///
+            /// A backend whose storage this test cannot reach through the
+            /// filesystem ages nothing and asks for a zero grace instead, so
+            /// "older than the grace" still holds for anything written before
+            /// the pass started.
+            fn age_or_shrink_grace(
+                temp: &tempfile::TempDir,
+                digest: &str,
+                mode: ManagedLayerCollectMode,
+            ) -> ManagedLayerCollectRequest {
+                if $age {
+                    age_layer(&$root(temp), digest);
+                    request(mode)
+                } else {
+                    ManagedLayerCollectRequest {
+                        mode,
+                        grace: Duration::ZERO,
+                    }
+                }
+            }
+
             #[tokio::test]
             async fn a_layer_cited_by_any_record_never_leaves() {
                 let (repository, temp) = repository().await;
@@ -250,11 +272,14 @@ macro_rules! behavior_table {
                     .await
                     .expect("store orphan layer");
                 store_snapshot_record(repository.as_ref(), &[&cited]).await;
+                // Past the grace, so the uncited layer counts as an orphan
+                // rather than as a layer a publish in flight may still cite.
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Report);
 
                 let report = collect_managed_layers(
                     repository.as_ref(),
                     &NoLiveSandboxesUnderTest,
-                    &request(ManagedLayerCollectMode::Report),
+                    &pass,
                 )
                 .await
                 .expect("collect");
@@ -268,7 +293,6 @@ macro_rules! behavior_table {
                 assert!(stored_layer_keys(repository.as_ref())
                     .await
                     .contains(&cited));
-                drop(temp);
             }
 
             #[tokio::test]
@@ -278,33 +302,12 @@ macro_rules! behavior_table {
                 store_layer(repository.as_ref(), &orphan, 256)
                     .await
                     .expect("store orphan");
-                if $age {
-                    let posix = $root(&temp);
-                    age_layer(&posix, &orphan);
-                } else {
-                    // Backends that keep their own clock use a zero grace, so
-                    // "older than the grace" holds for anything written before
-                    // the pass started.
-                    let report = collect_managed_layers(
-                        repository.as_ref(),
-                        &NoLiveSandboxesUnderTest,
-                        &ManagedLayerCollectRequest {
-                            mode: ManagedLayerCollectMode::Enforce,
-                            grace: Duration::ZERO,
-                        },
-                    )
-                    .await
-                    .expect("collect");
-                    assert_eq!(report.deleted_layers, 1);
-                    assert_eq!(report.reclaimed_bytes, 256);
-                    assert!(stored_layer_keys(repository.as_ref()).await.is_empty());
-                    return;
-                }
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
 
                 let report = collect_managed_layers(
                     repository.as_ref(),
                     &NoLiveSandboxesUnderTest,
-                    &request(ManagedLayerCollectMode::Enforce),
+                    &pass,
                 )
                 .await
                 .expect("collect");
@@ -345,15 +348,12 @@ macro_rules! behavior_table {
                 store_layer(repository.as_ref(), &stale, 1024)
                     .await
                     .expect("store orphan");
-                if $age {
-                    let posix = $root(&temp);
-                    age_layer(&posix, &stale);
-                }
+                let pass = age_or_shrink_grace(&temp, &stale, ManagedLayerCollectMode::Report);
 
                 let report = collect_managed_layers(
                     repository.as_ref(),
                     &NoLiveSandboxesUnderTest,
-                    &request(ManagedLayerCollectMode::Report),
+                    &pass,
                 )
                 .await
                 .expect("collect");
@@ -374,15 +374,12 @@ macro_rules! behavior_table {
                     .await
                     .expect("store image layer");
                 store_image(repository.as_ref(), &[&image_layer]).await;
-                if $age {
-                    let posix = $root(&temp);
-                    age_layer(&posix, &image_layer);
-                }
+                let pass = age_or_shrink_grace(&temp, &image_layer, ManagedLayerCollectMode::Enforce);
 
                 let report = collect_managed_layers(
                     repository.as_ref(),
                     &NoLiveSandboxesUnderTest,
-                    &request(ManagedLayerCollectMode::Enforce),
+                    &pass,
                 )
                 .await
                 .expect("collect");
@@ -402,15 +399,13 @@ macro_rules! behavior_table {
                     .await
                     .expect("store volume layer");
                 store_volume_record(repository.as_ref(), &[&volume_layer]).await;
-                if $age {
-                    let posix = $root(&temp);
-                    age_layer(&posix, &volume_layer);
-                }
+                let pass =
+                    age_or_shrink_grace(&temp, &volume_layer, ManagedLayerCollectMode::Enforce);
 
                 let report = collect_managed_layers(
                     repository.as_ref(),
                     &NoLiveSandboxesUnderTest,
-                    &request(ManagedLayerCollectMode::Enforce),
+                    &pass,
                 )
                 .await
                 .expect("collect");
@@ -500,16 +495,13 @@ macro_rules! behavior_table {
                 store_layer(repository.as_ref(), &orphan, 8192)
                     .await
                     .expect("store orphan");
-                if $age {
-                    let posix = $root(&temp);
-                    age_layer(&posix, &orphan);
-                }
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
                 let missing = crate::types::SnapshotId::generate().to_string();
 
                 let report = collect_managed_layers(
                     repository.as_ref(),
                     &LiveSandboxesUnderTest(vec![missing]),
-                    &request(ManagedLayerCollectMode::Enforce),
+                    &pass,
                 )
                 .await
                 .expect("collect");
@@ -530,10 +522,7 @@ macro_rules! behavior_table {
                     .await
                     .expect("store live layer");
                 store_snapshot_record(repository.as_ref(), &[&live_layer]).await;
-                if $age {
-                    let posix = $root(&temp);
-                    age_layer(&posix, &live_layer);
-                }
+                let pass = age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce);
                 let records = repository
                     .read_documents(crate::repository::DocumentCollection::SnapshotRecords)
                     .await
@@ -543,7 +532,7 @@ macro_rules! behavior_table {
                 let report = collect_managed_layers(
                     repository.as_ref(),
                     &LiveSandboxesUnderTest(vec![origin]),
-                    &request(ManagedLayerCollectMode::Enforce),
+                    &pass,
                 )
                 .await
                 .expect("collect");
