@@ -202,7 +202,7 @@ pub(super) fn persisted_sandbox_store_root() -> PathBuf {
 /// prefix: every pause-created lower then looks like immutable stable prefix,
 /// compaction only re-commits the newest generation, and the byte ceiling
 /// eventually rejects the pause outright.
-fn is_runtime_owned(path: &Path, runtime_owned_roots: &[PathBuf]) -> bool {
+pub(super) fn is_runtime_owned(path: &Path, runtime_owned_roots: &[PathBuf]) -> bool {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     runtime_owned_roots.iter().any(|root| {
         let root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());

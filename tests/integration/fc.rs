@@ -725,12 +725,43 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
             "chain ballast write failed: {}",
             write.stderr
         );
-        let snapshot = resumed.pause().await?;
+        // A rejected pause only reports the byte totals, which cannot tell a
+        // ceiling that was set too low from a chain whose runtime-owned lowers
+        // were misclassified as immutable stable prefix. Classify the chain the
+        // pause started from so a red CI run names the cause instead of only the
+        // byte counts.
+        let snapshot = match resumed.pause().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("CHAIN_BYTES_CEILING_EXCEEDED") {
+                    eprintln!(
+                        "pause {} was rejected by the chain ceiling: {message}\n\
+                         chain it tried to grow:\n{}",
+                        pause_index + 1,
+                        describe_chain(&resumed, &current)
+                    );
+                }
+                return Err(error);
+            }
+        };
 
         let lowers =
             lower_file_paths_from_image_config(&snapshot.mem_overlaybd_config.image_config_path)?;
         let footprint = allocated_bytes(&lowers);
         first_footprint.get_or_insert(footprint);
+        // Print the classification before asserting anything about compaction:
+        // when the ceiling is breached the byte totals alone cannot distinguish
+        // a too-small ceiling from lowers misclassified as stable prefix, and
+        // this report names which one it was.
+        eprintln!(
+            "pause {}: chain footprint {} bytes ({} lowers), ceiling {} bytes\n{}",
+            pause_index + 1,
+            footprint,
+            lowers.len(),
+            ceiling,
+            describe_chain(&resumed, &snapshot)
+        );
         // A compaction rewrote the runtime-owned suffix into one generation.
         if lowers
             .iter()
@@ -738,13 +769,6 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
         {
             compaction_seen = true;
         }
-        eprintln!(
-            "pause {}: chain footprint {} bytes ({} lowers), ceiling {} bytes",
-            pause_index + 1,
-            footprint,
-            lowers.len(),
-            ceiling
-        );
         assert!(
             footprint <= ceiling,
             "pause {} must leave the chain under the ceiling: {footprint} > {ceiling}",
@@ -772,6 +796,20 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
         "at least one pause must have compacted the runtime-owned suffix"
     );
     Ok(())
+}
+
+/// Report how `sandbox` classifies each lower of `snapshot`'s memory chain.
+///
+/// Used on the ceiling paths so a red run shows the classification (runtime-owned
+/// vs stable prefix) and the roots in force, not only the byte totals.
+fn describe_chain(sandbox: &FirecrackerSandbox, snapshot: &FirecrackerSnapshotConfig) -> String {
+    match sandbox.describe_chain_classification(&snapshot.mem_overlaybd_config.image_config_path) {
+        Ok(report) => report,
+        Err(error) => format!(
+            "<failed to classify {}: {error:#}>",
+            snapshot.mem_overlaybd_config.image_config_path.display()
+        ),
+    }
 }
 
 /// Allocated bytes of a set of layer paths, deduplicated by device and inode.

@@ -153,6 +153,12 @@ fn reconcile_disk_rate_limiter(
     Ok(Box::new(rl))
 }
 
+/// The managed-snapshot base the *process-wide* config resolves to.
+///
+/// Test-only: it is the value a pause must not use to classify its own lowers
+/// (see [`FirecrackerSandbox::managed_snapshot_base_path`]), kept so a test can
+/// prove the two differ.
+#[cfg(test)]
 pub(super) fn managed_snapshot_base() -> PathBuf {
     ConfigManager::global_config()
         .firecracker
@@ -735,6 +741,49 @@ impl FirecrackerSandbox {
     pub fn with_persisted_sandbox_store_root(mut self, root: PathBuf) -> Self {
         self.persisted_sandbox_store_root = root;
         self
+    }
+
+    /// Describe how this sandbox would classify each lower of a paused chain.
+    ///
+    /// Reports, per lower, whether the pause path treats it as runtime-owned
+    /// (therefore compactable) or as immutable stable prefix, together with the
+    /// roots in force. A byte ceiling that rejects a pause is otherwise
+    /// indistinguishable from one that simply had too little budget, and the
+    /// cause — a root that does not cover where the pause actually wrote — is
+    /// only visible in this classification.
+    pub fn describe_chain_classification(&self, image_config_path: &Path) -> Result<String> {
+        let image_config = overlaybd::config::load_image_config(image_config_path)
+            .with_context(|| format!("load image config {}", image_config_path.display()))?;
+        let pause_output_dir = image_config_path.parent().unwrap_or(image_config_path);
+        let roots = self.runtime_owned_roots(Some(pause_output_dir));
+        let mut out = format!(
+            "chain classification for {} ({} lowers), runtime-owned roots in force: {}\n",
+            image_config_path.display(),
+            image_config.lowers.len(),
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for (index, lower) in image_config.lowers.iter().enumerate() {
+            let path = Path::new(&lower.file);
+            let owned = super::overlaybd_snapshot::is_runtime_owned(path, &roots);
+            out.push_str(&format!(
+                "  lower[{index}] {} -> {}\n",
+                if lower.file.is_empty() {
+                    "<remote>".to_string()
+                } else {
+                    lower.file.clone()
+                },
+                if owned {
+                    "runtime-owned"
+                } else {
+                    "stable prefix"
+                }
+            ));
+        }
+        Ok(out)
     }
 
     /// The dedicated pack-recording memory device's id, when this sandbox was
