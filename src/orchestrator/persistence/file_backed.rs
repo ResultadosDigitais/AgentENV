@@ -24,30 +24,55 @@ const RECORD_DB_DIR: &str = "records.db";
 /// `sandbox::firecracker::overlaybd_snapshot`.
 const ALLOCATION_BLOCK_SIZE: u64 = 512;
 
-/// Set for the duration of a graceful shutdown.
+/// Graceful-shutdown state, handed to a persister instead of read from a
+/// process-wide static.
 ///
-/// Shutdown persists every running sandbox as `Paused`, and the machine is
-/// about to stop: reclaiming bytes there can only slow the shutdown down and
-/// risks deleting an artifact a not-yet-persisted sandbox still needs paths to.
-/// The next pause on a live node sweeps instead.
-static GRACEFUL_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// While it is set, `persist_paused` stops reclaiming bytes from stale
+/// generations: shutdown persists every running sandbox as `Paused` and the
+/// machine is about to stop, so reclaiming there can only slow the shutdown
+/// down and risks deleting an artifact a not-yet-persisted sandbox still needs
+/// paths to.
+///
+/// It is injected because a process-wide read makes one holder's shutdown
+/// silently change the behavior of every other persister in the process - and
+/// `cargo test` runs the tests of one binary in parallel threads. Production
+/// keeps exactly one handle for the process ([`process_shutdown_signal`],
+/// set by [`begin_graceful_shutdown`]); each test builds its own.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ShutdownSignal {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ShutdownSignal {
+    /// A signal that starts out not shut down.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enter graceful shutdown. Idempotent; a real shutdown never leaves it.
+    pub(crate) fn begin(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The one shutdown handle production shares: the orchestrator starts the
+/// shutdown and every persister built by [`FileBackedSandboxPersister::new`]
+/// observes it.
+static PROCESS_SHUTDOWN: std::sync::OnceLock<ShutdownSignal> = std::sync::OnceLock::new();
+
+fn process_shutdown_signal() -> ShutdownSignal {
+    PROCESS_SHUTDOWN.get_or_init(ShutdownSignal::new).clone()
+}
 
 /// Mark the process as being in graceful shutdown, so `persist_paused` stops
-/// reclaiming bytes from stale generations. Idempotent; call
-/// [`end_graceful_shutdown`] to resume sweeping.
+/// reclaiming bytes from stale generations.
 pub(crate) fn begin_graceful_shutdown() {
-    GRACEFUL_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
-}
-
-/// Leave graceful shutdown. Used by the tests that need the flag off again in
-/// the same process; a real shutdown never returns.
-#[cfg(test)]
-pub(crate) fn end_graceful_shutdown() {
-    GRACEFUL_SHUTDOWN.store(false, std::sync::atomic::Ordering::Release);
-}
-
-fn is_graceful_shutdown() -> bool {
-    GRACEFUL_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire)
+    process_shutdown_signal().begin();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -121,6 +146,10 @@ pub struct FileBackedSandboxPersister {
     /// Mirrors `orchestrator.chain_bytes_ceiling`: `0` disables both the ceiling
     /// and the stale-generation sweep, restoring the unbounded behavior.
     chain_bytes_ceiling: u64,
+    /// Whether a graceful shutdown is in progress. Injected rather than read
+    /// from a static so a shutdown in one persister cannot change the behavior
+    /// of another persister in the same process.
+    shutdown: ShutdownSignal,
     db: OnceCell<LocalKvStore>,
 }
 
@@ -133,13 +162,17 @@ impl FileBackedSandboxPersister {
             chain_bytes_ceiling: ConfigManager::global_config()
                 .orchestrator
                 .chain_bytes_ceiling,
+            shutdown: process_shutdown_signal(),
             db: OnceCell::new(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(root: PathBuf) -> Self {
-        Self::new(root, VirtualizationMode::Kvm)
+        // A test gets its own shutdown handle: the process-wide one would make
+        // one test's shutdown change every other test's behavior, since the
+        // tests of one binary run in parallel threads.
+        Self::new(root, VirtualizationMode::Kvm).with_shutdown_signal(ShutdownSignal::new())
     }
 
     pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
@@ -150,6 +183,12 @@ impl FileBackedSandboxPersister {
     #[cfg(test)]
     pub(crate) fn with_chain_bytes_ceiling(mut self, chain_bytes_ceiling: u64) -> Self {
         self.chain_bytes_ceiling = chain_bytes_ceiling;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_shutdown_signal(mut self, shutdown: ShutdownSignal) -> Self {
+        self.shutdown = shutdown;
         self
     }
 
@@ -168,7 +207,7 @@ impl FileBackedSandboxPersister {
         artifact_root: &Path,
         sandbox_id: &SandboxId,
     ) -> PersistenceResult<()> {
-        if self.chain_bytes_ceiling == 0 || is_graceful_shutdown() {
+        if self.chain_bytes_ceiling == 0 || self.shutdown.is_shutdown() {
             return Ok(());
         }
         let sandbox_root = self.sandbox_artifact_root(sandbox_id);
@@ -1054,7 +1093,10 @@ mod tests {
     #[tokio::test]
     async fn persist_paused_skips_the_sweep_during_graceful_shutdown() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let shutdown = ShutdownSignal::new();
+        let persister = test_persister(temp.path())
+            .with_chain_bytes_ceiling(48 << 30)
+            .with_shutdown_signal(shutdown.clone());
         let metadata = SandboxMetadata::default();
         let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
 
@@ -1074,7 +1116,7 @@ mod tests {
         }
 
         let before_shutdown = generation_dirs(&sandbox_root);
-        begin_graceful_shutdown();
+        shutdown.begin();
         let shutdown_root = persister
             .allocate_artifact_root(&metadata.id)
             .await?
@@ -1085,9 +1127,6 @@ mod tests {
         persister
             .persist_paused(&metadata, Some(&shutdown_root), paused_state.as_ref())
             .await?;
-        // Leaving shutdown here keeps the process-level flag from leaking into
-        // the other tests in this binary.
-        end_graceful_shutdown();
 
         let mut expected = before_shutdown.clone();
         expected.push(shutdown_root);
@@ -1102,6 +1141,81 @@ mod tests {
                 .iter()
                 .all(|root| root.exists() || !before_shutdown.contains(root)),
             "no generation present before shutdown may be removed by it"
+        );
+        Ok(())
+    }
+
+    /// Pause `count` generations of one sandbox, each with a private artifact
+    /// so the sweep has something unreferenced to reclaim.
+    async fn pause_generations(
+        persister: &FileBackedSandboxPersister,
+        metadata: &SandboxMetadata,
+        count: usize,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut roots = Vec::with_capacity(count);
+        for _ in 0..count {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("file-backed persister allocates an artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("private.commit"), vec![0xABu8; 4096])?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+        Ok(roots)
+    }
+
+    /// Two persisters in the same process: one in graceful shutdown, one live.
+    /// Only the shut-down one may skip the sweep - a process-wide shutdown read
+    /// made the live one silently skip it too, which is exactly how the
+    /// reclaim test went flaky when these tests ran in parallel.
+    #[tokio::test]
+    async fn shutdown_is_per_persister_so_a_live_one_keeps_sweeping() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let live_dir = temp.path().join("live");
+        let stopped_dir = temp.path().join("stopped");
+        std::fs::create_dir_all(&live_dir)?;
+        std::fs::create_dir_all(&stopped_dir)?;
+
+        let shutting_down = ShutdownSignal::new();
+        let live = test_persister(&live_dir).with_chain_bytes_ceiling(48 << 30);
+        let stopped = test_persister(&stopped_dir)
+            .with_chain_bytes_ceiling(48 << 30)
+            .with_shutdown_signal(shutting_down.clone());
+
+        let live_metadata = SandboxMetadata::default();
+        let stopped_metadata = SandboxMetadata::default();
+
+        // The stopped persister is already shutting down; the live one is not,
+        // and both are paused at the same time in this process.
+        shutting_down.begin();
+        let live_roots = pause_generations(&live, &live_metadata, 4).await?;
+        let stopped_roots = pause_generations(&stopped, &stopped_metadata, 4).await?;
+
+        let live_generations = generation_dirs(&live.sandbox_artifact_root(&live_metadata.id));
+        assert!(
+            live_generations.len() <= 2,
+            "the live persister must keep sweeping its stale generations: {live_generations:?}"
+        );
+        assert!(
+            !live_roots[0].exists(),
+            "the live persister must remove a stale generation its sweep emptied: {}",
+            live_roots[0].display()
+        );
+        assert!(
+            live_generations.contains(&live_roots[3]),
+            "the live persister keeps the generation the current record references: {}",
+            live_roots[3].display()
+        );
+
+        assert_eq!(
+            generation_dirs(&stopped.sandbox_artifact_root(&stopped_metadata.id)),
+            stopped_roots,
+            "the shut-down persister must reclaim nothing while the live one sweeps"
         );
         Ok(())
     }
