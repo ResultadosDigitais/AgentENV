@@ -39,7 +39,9 @@ pub(crate) fn begin_graceful_shutdown() {
     GRACEFUL_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
 }
 
-/// Leave graceful shutdown. Exposed for tests and for a shutdown that aborts.
+/// Leave graceful shutdown. Used by the tests that need the flag off again in
+/// the same process; a real shutdown never returns.
+#[cfg(test)]
 pub(crate) fn end_graceful_shutdown() {
     GRACEFUL_SHUTDOWN.store(false, std::sync::atomic::Ordering::Release);
 }

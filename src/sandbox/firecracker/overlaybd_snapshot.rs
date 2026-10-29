@@ -1409,6 +1409,82 @@ mod tests {
         );
     }
 
+    /// A `0` ceiling is the kill switch: it must reproduce the pre-ceiling
+    /// behavior byte for byte, adopting the runtime suffix instead of
+    /// compacting it, even when the chain is far above any usable ceiling.
+    #[tokio::test]
+    async fn rewrite_with_disabled_ceiling_adopts_the_suffix_like_before() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+
+        let mut layers = Vec::new();
+        for (index, byte) in [0xAAu8, 0xBB, 0xCC].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("gen-{index}"),
+                8192,
+                &[(0, byte), (4096, byte)],
+            )
+            .await;
+            layers.push(local_layer_config(&path));
+        }
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let mut results = Vec::new();
+        for name in ["disabled-a", "disabled-b"] {
+            let output_dir = temp.path().join(name);
+            std::fs::create_dir_all(&output_dir).expect("create output dir");
+            let rewritten = rewrite_lowers_with_runtime_roots(
+                layers.clone(),
+                &output_dir,
+                None,
+                MANAGED_BASE_LAYER_FILE,
+                &runtime_owned_roots,
+                OverlaybdCompactOutput::Raw,
+                0,
+            )
+            .await
+            .expect("rewrite with the ceiling disabled");
+            results.push(rewritten);
+        }
+
+        // Three runtime layers with a count budget of 32: adopted, one
+        // inherited-layers directory per layer, no compaction.
+        assert_eq!(results[0].len(), 3);
+        for (index, lower) in results[0].iter().enumerate() {
+            assert!(
+                PathBuf::from(&lower.file).starts_with(
+                    temp.path()
+                        .join("disabled-a")
+                        .join(INHERITED_LAYERS_DIR)
+                        .join(format!("{index:04}"))
+                ),
+                "a disabled ceiling must adopt layer {index} instead of compacting it"
+            );
+        }
+        let file_names = |rewritten: &[LayerConfig]| {
+            rewritten
+                .iter()
+                .map(|lower| {
+                    PathBuf::from(&lower.file)
+                        .file_name()
+                        .map(ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            file_names(&results[0]),
+            file_names(&results[1]),
+            "a disabled ceiling must be deterministic: same layers in the same order"
+        );
+        assert!(!temp
+            .path()
+            .join("disabled-a")
+            .join(MANAGED_BASE_LAYER_FILE)
+            .exists());
+    }
+
     #[tokio::test]
     async fn rewrite_shrinking_budget_compacts_runtime_suffix() {
         let temp = tempfile::tempdir().expect("tempdir");

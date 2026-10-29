@@ -36,6 +36,12 @@ spec:
                   optional: true
             - name: AENV_VIRTUALIZATION_MODE
               value: "kvm"
+            # Ceiling for one sandbox's paused artifact chain. 0 disables both
+            # the ceiling and the stale-generation sweep on this node, which is
+            # the rollback for a node whose chain growth has to be stopped
+            # without a code redeploy.
+            - name: AENV_CHAIN_BYTES_CEILING
+              value: "51539607552"
             - name: API_ADDR
               value: "0.0.0.0:8000"
             - name: AENV_UBLK_DAEMON_BINARY_PATH
