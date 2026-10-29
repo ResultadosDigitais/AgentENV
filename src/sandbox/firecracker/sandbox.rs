@@ -715,11 +715,6 @@ impl FirecrackerSandbox {
         self
     }
 
-    /// This sandbox's effective paused-chain byte ceiling (`0` = disabled).
-    pub fn chain_bytes_ceiling(&self) -> u64 {
-        self.chain_bytes_ceiling
-    }
-
     /// The dedicated pack-recording memory device's id, when this sandbox was
     /// started with `pack_recording = true`.
     pub(crate) fn dedicated_mem_device_id(&self) -> Option<u32> {
