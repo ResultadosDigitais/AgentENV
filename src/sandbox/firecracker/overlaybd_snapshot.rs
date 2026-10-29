@@ -432,6 +432,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,
+    chain_bytes_ceiling: u64,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -474,9 +475,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
-        ConfigManager::global_config()
-            .orchestrator
-            .chain_bytes_ceiling,
+        chain_bytes_ceiling,
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -730,6 +729,7 @@ pub(super) async fn build_mem_snapshot_image_config(
     new_layer_path: &Path,
     output_dir: &Path,
     memory_output: OverlaybdCompactOutput,
+    chain_bytes_ceiling: u64,
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
@@ -740,9 +740,7 @@ pub(super) async fn build_mem_snapshot_image_config(
         Some(new_layer),
         "mem_compacted.commit",
         memory_output,
-        ConfigManager::global_config()
-            .orchestrator
-            .chain_bytes_ceiling,
+        chain_bytes_ceiling,
     )
     .await?;
 
@@ -766,6 +764,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     output_dir: &Path,
     snapshot_layer_file_name: &str,
     kind: &'static str,
+    chain_bytes_ceiling: u64,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -785,6 +784,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         live_runtime_image_config_path,
         output_dir,
         live_snapshot.snapshot_layer_path(),
+        chain_bytes_ceiling,
     )
     .await;
 
@@ -796,6 +796,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     snapshot_root: &Path,
+    chain_bytes_ceiling: u64,
 ) -> Result<PathBuf> {
     restack_snapshot_overlaybd_device(
         ublk_device,
@@ -804,6 +805,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         &snapshot_root.join("rootfs"),
         "snapshot.commit",
         "rootfs",
+        chain_bytes_ceiling,
     )
     .await
 }
@@ -1562,6 +1564,7 @@ mod tests {
             &live_runtime_image_config_path,
             &output_dir,
             Some(&snapshot_lower),
+            0,
         )
         .await
         .expect("stage snapshot");
@@ -1608,6 +1611,7 @@ mod tests {
             &new_layer,
             temp.path(),
             OverlaybdCompactOutput::Raw,
+            0,
         )
         .await
         .expect("build memory image config");

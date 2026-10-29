@@ -630,6 +630,18 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
 /// gated integration target and is skipped with a clear message elsewhere. The
 /// printed footprint uses the same method as the staging measurement: allocated
 /// bytes deduplicated by device and inode.
+///
+/// The ceiling is injected into each sandbox handle instead of being read from
+/// the process-wide config: the pause path takes it from the sandbox, and only
+/// [`FirecrackerSandbox::build`] fills it from
+/// `orchestrator.chain_bytes_ceiling` in production. The pauses go through
+/// [`FirecrackerSandbox::pause`], whose managed snapshot root is a runtime-owned
+/// root, so the runtime suffix is actually owned and compactable; writing each
+/// generation into an arbitrary temp directory would leave the suffix
+/// unowned and nothing would ever compact.
+///
+/// The artifact-directory growth assertion lives with the file-backed persister
+/// unit test, which is the only place the stale-generation sweep runs.
 #[tokio::test]
 async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<()> {
     if !Path::new("/dev/kvm").exists() {
@@ -640,30 +652,69 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
         return Ok(());
     }
     common::setup().await;
-    // A small ceiling keeps the test cheap; the production default is 48 GiB.
-    let ceiling = agentenv::cfg::ConfigManager::global_config()
-        .orchestrator
-        .chain_bytes_ceiling
-        .min(4 << 30);
 
     let sandbox_config = common::default_sandbox_config()?;
+    let mem_size_mib = u64::from(sandbox_config.mem_size_mib);
+    let guest_memory = mem_size_mib * 1024 * 1024;
+    // Deterministic churn: the guest rewrites the same file every cycle. The
+    // stable path keeps the compacted footprint bounded — rewriting the same
+    // blocks holds the suffix at one generation's worth of pages no matter how
+    // many pauses ran — while each fresh generation still commits those pages,
+    // so the un-compacted chain grows every pause. Half of guest memory per
+    // cycle keeps the trigger deterministic: the chain crosses the 1.5x-memory
+    // budget within a few pauses, and one compacted generation fits it.
+    let ballast_mib = mem_size_mib / 2;
+    let ballast_path = "/tmp/aenv-chain-ballast";
+
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
     write_disk_marker(&mut sandbox).await?;
 
-    let artifacts_root = tempfile::tempdir()?;
-    let sandbox_root = artifacts_root.path().join("sandbox");
-    fs::create_dir_all(&sandbox_root)?;
+    // Establish the base chain before any ceiling is injected. A compaction can
+    // only merge the runtime-owned suffix, so the ceiling has to hold that base
+    // plus one compacted generation (at most a touched-page generation's worth
+    // of guest memory); deriving it from the measured base keeps the test
+    // independent of the image's layer sizes instead of guessing.
+    let mut current = sandbox.pause().await?;
     let pause_count = 10;
+    let base_footprint =
+        allocated_bytes(&lower_file_paths_from_image_config(
+            &current.mem_overlaybd_config.image_config_path,
+        )?);
+    let ceiling = (base_footprint + 2 * guest_memory).min(
+        agentenv::cfg::ConfigManager::global_config()
+            .orchestrator
+            .chain_bytes_ceiling,
+    );
+    assert!(
+        base_footprint <= ceiling,
+        "the ceiling must hold the measured base chain: {base_footprint} > {ceiling}"
+    );
+
     let mut compaction_seen = false;
     let mut first_footprint = None;
-
-    let mut current = sandbox.pause().await?;
     for pause_index in 0..pause_count {
-        let generation_dir = sandbox_root.join(format!("gen-{pause_index}"));
-        fs::create_dir_all(&generation_dir)?;
-        let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&current).await?;
-        let (snapshot, _) = resumed.pause_to_dir(&generation_dir).await?;
+        let mut resumed = FirecrackerSandbox::from_snapshot_config(&current)?
+            .with_chain_bytes_ceiling(ceiling);
+        resumed.start().await?;
+        let write = resumed
+            .run_command(
+                "dd",
+                &[
+                    "if=/dev/zero",
+                    &format!("of={ballast_path}"),
+                    "bs=1M",
+                    &format!("count={ballast_mib}"),
+                ],
+            )
+            .await
+            .with_context(|| format!("write chain ballast for pause {pause_index}"))?;
+        assert_eq!(
+            write.exit_code, 0,
+            "chain ballast write failed: {}",
+            write.stderr
+        );
+        let snapshot = resumed.pause().await?;
 
         let lowers =
             lower_file_paths_from_image_config(&snapshot.mem_overlaybd_config.image_config_path)?;
@@ -683,22 +734,22 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
             lowers.len(),
             ceiling
         );
+        assert!(
+            footprint <= ceiling,
+            "pause {} must leave the chain under the ceiling: {footprint} > {ceiling}",
+            pause_index + 1
+        );
         current = snapshot;
     }
 
     let final_lowers =
         lower_file_paths_from_image_config(&current.mem_overlaybd_config.image_config_path)?;
     let final_footprint = allocated_bytes(&final_lowers);
-    let generation_count = fs::read_dir(&sandbox_root)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .count();
     eprintln!(
-        "ten pauses: first footprint {} bytes, final footprint {} bytes, {} generation \
-         directories on disk",
+        "ten pauses: first footprint {} bytes, final footprint {} bytes, ceiling {} bytes",
         first_footprint.expect("at least one pause ran"),
         final_footprint,
-        generation_count
+        ceiling
     );
 
     assert!(
@@ -708,11 +759,6 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     assert!(
         compaction_seen,
         "at least one pause must have compacted the runtime-owned suffix"
-    );
-    assert!(
-        generation_count < pause_count,
-        "the artifact directory must not accumulate one generation per pause: {generation_count} \
-         for {pause_count} pauses"
     );
     Ok(())
 }

@@ -194,6 +194,13 @@ pub struct FirecrackerSandbox {
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Byte ceiling for this sandbox's paused artifact chain, resolved once when
+    /// the sandbox is built from `orchestrator.chain_bytes_ceiling` (`0`
+    /// disables the ceiling). The pause path takes it from here instead of
+    /// re-reading the global config at the leaf, so the single production value
+    /// stays in one place and a test can drive the pause path with its own
+    /// ceiling without mutating process-wide configuration.
+    chain_bytes_ceiling: u64,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -695,6 +702,24 @@ impl FirecrackerSandbox {
         )
     }
 
+    /// Override the paused-chain byte ceiling for this sandbox.
+    ///
+    /// Production never calls this: [`FirecrackerSandbox::build`] fills the
+    /// ceiling from `orchestrator.chain_bytes_ceiling`, which stays the single
+    /// source of the production value. This exists so a caller that needs a
+    /// different ceiling for one sandbox — an integration test exercising the
+    /// compaction path cheaply, or a probe — can inject it without mutating
+    /// process-wide configuration or racing other sandboxes in the same process.
+    pub fn with_chain_bytes_ceiling(mut self, chain_bytes_ceiling: u64) -> Self {
+        self.chain_bytes_ceiling = chain_bytes_ceiling;
+        self
+    }
+
+    /// This sandbox's effective paused-chain byte ceiling (`0` = disabled).
+    pub fn chain_bytes_ceiling(&self) -> u64 {
+        self.chain_bytes_ceiling
+    }
+
     /// The dedicated pack-recording memory device's id, when this sandbox was
     /// started with `pack_recording = true`.
     pub(crate) fn dedicated_mem_device_id(&self) -> Option<u32> {
@@ -1019,6 +1044,7 @@ impl FirecrackerSandbox {
             &mem_layer_path,
             snapshot_dir,
             OverlaybdCompactOutput::Raw,
+            self.chain_bytes_ceiling,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -1061,6 +1087,7 @@ impl FirecrackerSandbox {
                 overlaybd_source.read_only,
                 &rootfs_runtime.image_config_path,
                 snapshot_dir,
+                self.chain_bytes_ceiling,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
@@ -1473,6 +1500,9 @@ impl FirecrackerSandbox {
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
             live_snapshot_root: None,
+            chain_bytes_ceiling: ConfigManager::global_config()
+                .orchestrator
+                .chain_bytes_ceiling,
         })
     }
 
@@ -2365,6 +2395,7 @@ impl FirecrackerSandbox {
                 &output_dir,
                 &snapshot_layer_file_name,
                 "drive",
+                self.chain_bytes_ceiling,
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -2413,6 +2444,7 @@ impl FirecrackerSandbox {
                 output_dir,
                 &snapshot_layer_file_name,
                 "volume",
+                self.chain_bytes_ceiling,
             )
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
