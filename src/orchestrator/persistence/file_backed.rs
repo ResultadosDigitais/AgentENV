@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use crate::cfg::ConfigManager;
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
@@ -18,6 +19,9 @@ use crate::virtualization::VirtualizationMode;
 
 const RECORD_VERSION: u32 = 1;
 const RECORD_DB_DIR: &str = "records.db";
+/// Allocation unit reported by `st_blocks`, matching the chain measurement in
+/// `sandbox::firecracker::overlaybd_snapshot`.
+const ALLOCATION_BLOCK_SIZE: u64 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +91,9 @@ pub struct FileBackedSandboxPersister {
     root: PathBuf,
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
+    /// Mirrors `orchestrator.chain_bytes_ceiling`: `0` disables both the ceiling
+    /// and the stale-generation sweep, restoring the unbounded behavior.
+    chain_bytes_ceiling: u64,
     db: OnceCell<LocalKvStore>,
 }
 
@@ -96,6 +103,9 @@ impl FileBackedSandboxPersister {
             root,
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
+            chain_bytes_ceiling: ConfigManager::global_config()
+                .orchestrator
+                .chain_bytes_ceiling,
             db: OnceCell::new(),
         }
     }
@@ -108,6 +118,158 @@ impl FileBackedSandboxPersister {
     pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
         self.durability = durability;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_chain_bytes_ceiling(mut self, chain_bytes_ceiling: u64) -> Self {
+        self.chain_bytes_ceiling = chain_bytes_ceiling;
+        self
+    }
+
+    /// Remove only genuinely unreferenced bytes from generations older than the
+    /// record that just became durable.
+    ///
+    /// Each pause writes a new generation whose files are hardlinks of the
+    /// previous ones, so freeing an old generation's directory releases nothing
+    /// while a newer generation still links its files. What does accumulate is
+    /// the *unshared* part of every generation, and that is exactly what a link
+    /// count of 1 identifies: a file with more than one link is still reachable
+    /// from a newer generation, and may also be held open by a resumed VM or a
+    /// fork child. `artifact_root` itself is never touched.
+    async fn sweep_stale_generations(
+        &self,
+        artifact_root: &Path,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<()> {
+        if self.chain_bytes_ceiling == 0 {
+            return Ok(());
+        }
+        let sandbox_root = self.sandbox_artifact_root(sandbox_id);
+        let mut entries = match fs::read_dir(&sandbox_root).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "scan paused sandbox generations",
+                    &sandbox_root,
+                    source,
+                ));
+            }
+        };
+        let mut reclaimed_bytes = 0u64;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan paused sandbox generations", &sandbox_root, source)
+        })? {
+            let generation = entry.path();
+            if generation == artifact_root {
+                continue;
+            }
+            let file_type = entry.file_type().await.map_err(|source| {
+                SandboxPersistenceError::io(
+                    "inspect paused sandbox generation",
+                    &generation,
+                    source,
+                )
+            })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            reclaimed_bytes =
+                reclaimed_bytes.saturating_add(Self::sweep_unlinked_files(&generation).await?);
+        }
+        if reclaimed_bytes > 0 {
+            metrics::counter!("agentenv_paused_sandbox_chain_reclaimed_bytes_total")
+                .increment(reclaimed_bytes);
+            debug!(
+                sandbox_id = %sandbox_id,
+                reclaimed_bytes,
+                artifact_root = %artifact_root.display(),
+                "reclaimed unreferenced bytes from stale paused sandbox generations"
+            );
+        }
+        Ok(())
+    }
+
+    /// Delete regular files under `generation` whose link count is exactly 1,
+    /// then remove directories the deletions left empty. Returns freed bytes.
+    async fn sweep_unlinked_files(generation: &Path) -> PersistenceResult<u64> {
+        let mut reclaimed = 0u64;
+        let mut directories = vec![generation.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            let mut entries = match fs::read_dir(&directory).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "scan stale paused sandbox generation",
+                        &directory,
+                        source,
+                    ));
+                }
+            };
+            let mut remaining = 0usize;
+            while let Some(entry) = entries.next_entry().await.map_err(|source| {
+                SandboxPersistenceError::io(
+                    "scan stale paused sandbox generation",
+                    &directory,
+                    source,
+                )
+            })? {
+                let path = entry.path();
+                let metadata = match fs::symlink_metadata(&path).await {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(source) => {
+                        return Err(SandboxPersistenceError::io(
+                            "inspect stale paused sandbox artifact",
+                            &path,
+                            source,
+                        ));
+                    }
+                };
+                if metadata.is_dir() {
+                    directories.push(path);
+                    remaining += 1;
+                    continue;
+                }
+                // Only regular files with a single link are unreferenced. A
+                // symlink, socket or device may be something a live runtime
+                // still points at, so it is left alone as well.
+                if !metadata.is_file() || metadata.nlink() != 1 {
+                    remaining += 1;
+                    continue;
+                }
+                let allocated = metadata.blocks().saturating_mul(ALLOCATION_BLOCK_SIZE);
+                match fs::remove_file(&path).await {
+                    Ok(()) => reclaimed = reclaimed.saturating_add(allocated),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(SandboxPersistenceError::io(
+                            "remove unreferenced stale paused sandbox artifact",
+                            &path,
+                            source,
+                        ));
+                    }
+                }
+            }
+            if remaining == 0 && directory != generation {
+                match fs::remove_dir(&directory).await {
+                    Ok(()) => {}
+                    // A concurrent writer may have re-created an entry between
+                    // the scan and the removal; the next pause sweeps again.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(source) => {
+                        return Err(SandboxPersistenceError::io(
+                            "remove emptied stale paused sandbox generation",
+                            &directory,
+                            source,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(reclaimed)
     }
 
     fn records_db_path(&self) -> PathBuf {
@@ -367,8 +529,24 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let result = self.put_record(&record).await;
         if result.is_err() {
             let _ = Self::remove_artifact_root(artifact_root).await;
+            return result;
         }
-        result
+        // The sweep runs only after the new record is durable: until then the
+        // previous generation is the one a restart would resume from. A sweep
+        // failure must not fail the pause, which already succeeded durably, but
+        // it is reported as a warning with the sandbox id instead of being
+        // swallowed.
+        if let Err(error) = self
+            .sweep_stale_generations(artifact_root, &metadata.id)
+            .await
+        {
+            warn!(
+                sandbox_id = %metadata.id,
+                error = %error,
+                "failed to reclaim unreferenced bytes from stale paused sandbox generations"
+            );
+        }
+        Ok(())
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -689,6 +867,120 @@ mod tests {
 
         assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
         assert!(!snapshot_root.exists());
+        Ok(())
+    }
+
+    /// Number of generation directories retained under one sandbox's artifact
+    /// root, sorted so the assertion does not depend on directory order.
+    fn generation_dirs(sandbox_root: &Path) -> Vec<PathBuf> {
+        let mut generations: Vec<PathBuf> = std::fs::read_dir(sandbox_root)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.expect("read generation entry").path())
+                    .filter(|path| path.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        generations.sort();
+        generations
+    }
+
+    #[tokio::test]
+    async fn persist_paused_reclaims_unreferenced_bytes_from_stale_generations(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..10 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("file-backed persister allocates an artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            // A generation-private artifact, unreferenced by any other
+            // generation because it has a single link.
+            std::fs::write(artifact_root.join("mem.commit"), vec![0xABu8; 4096])?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        // The newest generation gains a hardlink to a file that still lives in
+        // an older generation: a resumed VM or a fork child can hold it, so the
+        // sweep must keep it even though the old directory is stale.
+        let shared = roots[0].join("mem.commit");
+        std::fs::hard_link(&shared, roots[9].join("shared-mem.commit"))
+            .expect("hardlink an older generation artifact into the newest one");
+
+        // One more pause so the sweep runs with the hardlink in place.
+        let artifact_root = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate artifact root");
+        std::fs::create_dir_all(&artifact_root)?;
+        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+        persister
+            .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+            .await?;
+
+        let generations = generation_dirs(&sandbox_root);
+        assert!(
+            generations.len() <= 2,
+            "ten pauses must not leave one generation each: {generations:?}"
+        );
+        assert!(
+            generations.contains(&artifact_root),
+            "the sweep must never remove the generation the current record references"
+        );
+        assert!(
+            artifact_root.join("mem.commit").exists(),
+            "the current generation keeps its artifacts"
+        );
+        assert!(
+            shared.exists(),
+            "a file with more than one link is still referenced and must survive"
+        );
+
+        // The record still loads and points at the surviving generation.
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, metadata.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_paused_keeps_every_generation_when_the_ceiling_is_disabled(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(0);
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..4 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("allocate artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("mem.commit"), b"generation")?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        assert_eq!(
+            generation_dirs(&sandbox_root),
+            roots,
+            "a 0 ceiling must keep today's behavior: no generation is swept"
+        );
         Ok(())
     }
 

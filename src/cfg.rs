@@ -654,6 +654,21 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
+
+    /// Ceiling, in bytes, for the paused artifact chain of a single sandbox.
+    ///
+    /// A pause whose runtime-owned overlaybd suffix would push the chain past
+    /// this value compacts that suffix into one complete generation (and
+    /// reclaims unreferenced files from stale generations). `0` disables both
+    /// the ceiling and the reclaim sweep, restoring the unbounded behavior.
+    ///
+    /// PROVISIONAL default: 48 GiB comes from the OPSAI-5494 staging
+    /// measurement of 29/10/2026 (each pause of a used productfactory-32g adds
+    /// 20-27 GB; chains ran 50-107 GB over 1-5 generations; a 40-50 GB ceiling
+    /// keeps a 488 GiB node under 85 percent). The node-by-node rollout
+    /// re-measures compaction wall clock and may adjust it.
+    #[config(default = 51539607552u64, env = "AENV_CHAIN_BYTES_CEILING")]
+    pub chain_bytes_ceiling: u64,
 }
 
 /// Custom extension service integration.

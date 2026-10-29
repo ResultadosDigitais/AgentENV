@@ -42,6 +42,112 @@ const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
 const FIRECRACKER_DIRTY_PAGE_SIZE: u64 = 4096;
 const OVERLAYBD_ALIGNMENT: u64 = 512;
 const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
+/// Allocation unit reported by `st_blocks` on every supported filesystem.
+const ALLOCATION_BLOCK_SIZE: u64 = 512;
+/// Named, recoverable failure code: the sandbox chain cannot be brought under
+/// `orchestrator.chain_bytes_ceiling` because its immutable stable prefix alone
+/// already exceeds it. The pause is rejected instead of being allowed to grow
+/// the chain, and the sandbox keeps its runtime state.
+pub(crate) const CHAIN_BYTES_CEILING_EXCEEDED: &str = "CHAIN_BYTES_CEILING_EXCEEDED";
+
+/// Ceiling rejection for one sandbox's paused artifact chain.
+///
+/// Kept as a concrete error so the pause path can classify it as recoverable
+/// through `context` layers, instead of matching on message text.
+#[derive(Debug)]
+pub(crate) struct ChainBytesCeilingExceeded {
+    pub observed_bytes: u64,
+    pub ceiling_bytes: u64,
+}
+
+impl std::fmt::Display for ChainBytesCeilingExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{CHAIN_BYTES_CEILING_EXCEEDED}: paused sandbox chain needs {} bytes with a stable \
+             prefix that already exceeds the {} byte ceiling",
+            self.observed_bytes, self.ceiling_bytes
+        )
+    }
+}
+
+impl std::error::Error for ChainBytesCeilingExceeded {}
+
+fn chain_ceiling_exceeded(observed_bytes: u64, ceiling_bytes: u64) -> anyhow::Error {
+    anyhow::Error::new(ChainBytesCeilingExceeded {
+        observed_bytes,
+        ceiling_bytes,
+    })
+}
+
+fn is_chain_ceiling_exceeded(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<ChainBytesCeilingExceeded>())
+}
+
+/// Allocated bytes of a layer chain, deduplicated by device and inode so a
+/// hardlinked generation is counted once instead of once per path.
+///
+/// Remote lowers have no local file and contribute no local bytes; a local
+/// layer that cannot be inspected is skipped with a warning rather than
+/// failing the pause, which can only under-report (never over-report) the
+/// chain and therefore never triggers a spurious compaction.
+/// Byte ceiling observability for the paused artifact chain.
+///
+/// Labels stay bounded: `kind` is one of `rootfs` / `memory`, never a sandbox
+/// id, so a node with thousands of sandboxes cannot explode cardinality.
+mod chain_metrics {
+    pub(super) const CHAIN_BYTES: &str = "agentenv_paused_sandbox_chain_bytes";
+    pub(super) const COMPACTIONS: &str = "agentenv_paused_sandbox_chain_compactions_total";
+    pub(super) const CEILING_EXCEEDED: &str =
+        "agentenv_paused_sandbox_chain_ceiling_exceeded_total";
+    pub(super) const RECLAIMED_BYTES: &str = "agentenv_paused_sandbox_chain_reclaimed_bytes_total";
+
+    pub(super) fn record_chain_bytes(kind: &'static str, bytes: u64, ceiling: u64) {
+        metrics::gauge!(CHAIN_BYTES, "kind" => kind).set(bytes as f64);
+        metrics::gauge!(CHAIN_BYTES, "kind" => "ceiling").set(ceiling as f64);
+    }
+
+    pub(super) fn record_compaction(kind: &'static str) {
+        metrics::counter!(COMPACTIONS, "kind" => kind).increment(1);
+    }
+
+    pub(super) fn record_ceiling_exceeded(kind: &'static str) {
+        metrics::counter!(CEILING_EXCEEDED, "kind" => kind).increment(1);
+    }
+
+    pub(super) fn record_reclaimed_bytes(kind: &'static str, bytes: u64) {
+        if bytes > 0 {
+            metrics::counter!(RECLAIMED_BYTES, "kind" => kind).increment(bytes);
+        }
+    }
+}
+
+fn chain_allocated_bytes<'a>(paths: impl IntoIterator<Item = &'a Path>) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "skipping unreadable overlaybd layer while measuring the paused chain"
+                );
+                continue;
+            }
+        };
+        if !seen.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        total = total.saturating_add(metadata.blocks().saturating_mul(ALLOCATION_BLOCK_SIZE));
+    }
+    total
+}
 
 enum LiveOverlaybdSnapshotState {
     ReadOnly,
@@ -380,6 +486,9 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
+        ConfigManager::global_config()
+            .orchestrator
+            .chain_bytes_ceiling,
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -399,6 +508,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     compaction_output: OverlaybdCompactOutput,
+    chain_bytes_ceiling: u64,
 ) -> Result<Vec<LayerConfig>> {
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
@@ -407,6 +517,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
         compaction_output_name,
         canonicalized_runtime_owned_roots(),
         compaction_output,
+        chain_bytes_ceiling,
     )
     .await
 }
@@ -418,6 +529,7 @@ async fn rewrite_lowers_with_runtime_roots(
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
+    chain_bytes_ceiling: u64,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
@@ -433,7 +545,25 @@ async fn rewrite_lowers_with_runtime_roots(
         .saturating_sub(lowers.len() / 4)
         .max(1);
     let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
-    if compactable_count > max_runtime_owned_layers {
+    // The byte ceiling is the stricter of the two triggers: a chain can stay
+    // inside the layer-count budget for many pauses and still fill the node's
+    // disk, because each generation rewrites far more bytes than it shares.
+    // Projected bytes are the stable prefix plus the runtime suffix plus the
+    // layer this pause appends (hardlinks deduplicated). A ceiling of 0 keeps
+    // the pre-ceiling behavior: no byte accounting, no compaction on bytes.
+    let projected_chain_bytes = if chain_bytes_ceiling == 0 {
+        0
+    } else {
+        let stable_prefix: Vec<&Path> = lowers.iter().map(|lower| Path::new(&lower.file)).collect();
+        let runtime_suffix: Vec<&Path> = runtime_owned_lowers
+            .iter()
+            .map(|lower| Path::new(&lower.file))
+            .chain(appended_layer.iter().map(|layer| Path::new(&layer.file)))
+            .collect();
+        chain_allocated_bytes(stable_prefix).saturating_add(chain_allocated_bytes(runtime_suffix))
+    };
+    let over_ceiling = chain_bytes_ceiling != 0 && projected_chain_bytes > chain_bytes_ceiling;
+    if compactable_count > max_runtime_owned_layers || over_ceiling {
         let mut runtime_suffix = runtime_owned_lowers;
         if let Some(layer) = appended_layer {
             runtime_suffix.push(layer);
@@ -441,14 +571,48 @@ async fn rewrite_lowers_with_runtime_roots(
         if runtime_suffix.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
         }
-        if let Some(compacted_path) = compact_layers(
+        let compacted_path = compact_layers(
             &runtime_suffix,
             &output_dir.join(compaction_output_name),
             compaction_output,
         )
-        .await?
-        {
-            lowers.push(local_layer_config(&compacted_path));
+        .await?;
+        if compacted_path.is_some() {
+            chain_metrics::record_compaction(compaction_output_name);
+        }
+        if let Some(compacted_path) = compacted_path.as_ref() {
+            lowers.push(local_layer_config(compacted_path));
+        }
+        if chain_bytes_ceiling != 0 {
+            // The stable prefix is immutable, so compaction cannot reclaim it.
+            // Re-measure the result and refuse the pause by name when even the
+            // compacted chain is still over the ceiling.
+            let chain_bytes =
+                chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)));
+            if chain_bytes > chain_bytes_ceiling {
+                // The pause is rejected, so this generation must not survive:
+                // leave the output directory exactly as the caller will clean
+                // it, without the compacted layer the failed rewrite produced.
+                if let Some(compacted_path) = compacted_path {
+                    if let Err(error) = tokio::fs::remove_file(&compacted_path).await {
+                        warn!(
+                            path = %compacted_path.display(),
+                            error = %error,
+                            "failed to remove compacted layer after a ceiling rejection"
+                        );
+                    }
+                }
+                // Classified by the caller: the rootfs restack already mutated
+                // the live runtime and stays terminal through `finish_staging`,
+                // while the memory-config path is still recoverable.
+                chain_metrics::record_chain_bytes(
+                    compaction_output_name,
+                    chain_bytes,
+                    chain_bytes_ceiling,
+                );
+                chain_metrics::record_ceiling_exceeded(compaction_output_name);
+                return Err(chain_ceiling_exceeded(chain_bytes, chain_bytes_ceiling));
+            }
         }
         return Ok(lowers);
     }
@@ -469,6 +633,10 @@ async fn rewrite_lowers_with_runtime_roots(
 
     if let Some(layer) = appended_layer {
         lowers.push(layer);
+    }
+    if chain_bytes_ceiling != 0 {
+        let chain_bytes = chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)));
+        chain_metrics::record_chain_bytes(compaction_output_name, chain_bytes, chain_bytes_ceiling);
     }
 
     Ok(lowers)
@@ -584,6 +752,9 @@ pub(super) async fn build_mem_snapshot_image_config(
         Some(new_layer),
         "mem_compacted.commit",
         memory_output,
+        ConfigManager::global_config()
+            .orchestrator
+            .chain_bytes_ceiling,
     )
     .await?;
 
@@ -981,6 +1152,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            0,
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -1010,6 +1182,88 @@ mod tests {
             assert_eq!(source_metadata.dev(), adopted_metadata.dev());
             assert_eq!(source_metadata.ino(), adopted_metadata.ino());
         }
+    }
+
+    /// Two paths to the same inode must count once, otherwise every hardlinked
+    /// generation would inflate the measured chain and trigger a compaction the
+    /// ceiling does not actually require.
+    #[test]
+    fn chain_allocated_bytes_counts_a_hardlinked_layer_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layer = temp.path().join("generation.commit");
+        std::fs::write(&layer, vec![0xABu8; 8192]).expect("write layer");
+        let alias = temp.path().join("generation-hardlink.commit");
+        std::fs::hard_link(&layer, &alias).expect("hardlink layer");
+
+        let single = chain_allocated_bytes([layer.as_path()]);
+        assert!(single > 0, "a written layer must allocate bytes");
+        assert_eq!(
+            chain_allocated_bytes([layer.as_path(), alias.as_path()]),
+            single,
+            "a hardlink must not be counted twice"
+        );
+        // An unreadable or remote (empty) path contributes no local bytes and
+        // must not abort the measurement.
+        let missing = temp.path().join("missing.commit");
+        assert_eq!(
+            chain_allocated_bytes([layer.as_path(), missing.as_path(), Path::new("")]),
+            single
+        );
+    }
+
+    /// A stable prefix that cannot be reclaimed must fail the rewrite by name.
+    #[tokio::test]
+    async fn rewrite_stable_prefix_above_ceiling_fails_named_and_leaves_no_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        let runtime_layer = seal_raw_test_layer(&runtime_root, "gen-0", 4096, &[(0, 0xAA)]).await;
+        let lowers = vec![local_layer_config(&runtime_layer)];
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        // 1 byte cannot be satisfied by any chain, so the second measurement
+        // after compaction rejects even the compacted output.
+        let err = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            1,
+        )
+        .await
+        .expect_err("a chain above the ceiling must fail");
+
+        assert!(
+            err.to_string().contains(CHAIN_BYTES_CEILING_EXCEEDED),
+            "error must carry the named code: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<ChainBytesCeilingExceeded>().is_some(),
+            "the error must stay downcastable so the pause path classifies it"
+        );
+        assert!(
+            !output_dir.join(MANAGED_BASE_LAYER_FILE).exists(),
+            "a rejected pause must not leave the compacted layer behind"
+        );
+        assert!(
+            !output_dir.join(INHERITED_LAYERS_DIR).exists(),
+            "a rejected pause must not adopt the runtime suffix"
+        );
+        assert!(
+            !std::fs::read_dir(&output_dir)
+                .expect("list output dir")
+                .any(|entry| entry
+                    .expect("read output entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")),
+            "a rejected pause must not leave a temporary compaction file"
+        );
     }
 
     #[tokio::test]
@@ -1046,6 +1300,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            0,
         )
         .await
         .expect("rewrite with deep stable prefix");
@@ -1095,6 +1350,86 @@ mod tests {
         commit_path
     }
 
+    /// Allocated bytes of a layer chain, deduplicated by device and inode so a
+    /// hardlinked generation is counted once.
+    fn chain_allocated_bytes(paths: &[PathBuf]) -> u64 {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for path in paths {
+            let metadata = std::fs::metadata(path).expect("layer metadata");
+            if !seen.insert((metadata.dev(), metadata.ino())) {
+                continue;
+            }
+            total = total.saturating_add(metadata.blocks().saturating_mul(512));
+        }
+        total
+    }
+
+    /// A chain above the byte ceiling must collapse the runtime-owned suffix
+    /// into one complete generation even though the layer-count budget alone
+    /// would keep adopting it layer by layer.
+    #[tokio::test]
+    async fn rewrite_byte_ceiling_compacts_runtime_suffix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // Every generation rewrites the same two pages, so a full compaction
+        // deduplicates them and lands well below the chain it replaces.
+        let mut layers = Vec::new();
+        for (index, byte) in [0xAAu8, 0xBB, 0xCC, 0xDD].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("gen-{index}"),
+                8192,
+                &[(0, byte), (4096, byte)],
+            )
+            .await;
+            layers.push(local_layer_config(&path));
+        }
+        let chain_paths: Vec<PathBuf> = layers
+            .iter()
+            .map(|lower| PathBuf::from(&lower.file))
+            .collect();
+        let chain_bytes = chain_allocated_bytes(&chain_paths);
+        assert!(chain_bytes > 0, "sealed layers must allocate bytes");
+        // Above the compacted size, below the chain: exactly the case the byte
+        // trigger exists for.
+        let ceiling = chain_bytes * 3 / 4;
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            layers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ceiling,
+        )
+        .await
+        .expect("rewrite above the byte ceiling");
+
+        assert_eq!(
+            rewritten.len(),
+            1,
+            "a chain above the ceiling must collapse into one generation"
+        );
+        let compacted = PathBuf::from(&rewritten[0].file);
+        assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
+        assert!(compacted.exists());
+        assert!(
+            chain_allocated_bytes(std::slice::from_ref(&compacted)) <= ceiling,
+            "the compacted generation must fit under the ceiling"
+        );
+        assert!(
+            !output_dir.join(INHERITED_LAYERS_DIR).exists(),
+            "compaction must not adopt the suffix before collapsing it"
+        );
+    }
+
     #[tokio::test]
     async fn rewrite_shrinking_budget_compacts_runtime_suffix() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1126,6 +1461,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            0,
         )
         .await
         .expect("rewrite with shrinking budget");
@@ -1217,6 +1553,7 @@ mod tests {
             &new_layer,
             temp.path(),
             OverlaybdCompactOutput::Raw,
+            0,
         )
         .await
         .expect("build memory image config");

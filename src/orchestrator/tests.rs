@@ -3836,6 +3836,92 @@ async fn pause_failure_rolls_back_to_running_and_preserves_handle() -> Result<()
 }
 
 #[tokio::test]
+async fn pause_chain_ceiling_exceeded_keeps_running_and_allows_retry_after_raise() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    // The backend rejects the pause because the chain cannot be brought under
+    // the ceiling; this is a recoverable capture error, never a terminal one.
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "CHAIN_BYTES_CEILING_EXCEEDED: paused sandbox chain needs 64424509440 \
+                      bytes with a stable prefix that already exceeds the 42949672960 byte \
+                      ceiling"
+                .to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "pause-ceiling")]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("a pause above the chain ceiling must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("CHAIN_BYTES_CEILING_EXCEEDED"),
+        "the failure must surface the named code: {message}"
+    );
+    assert!(
+        matches!(
+            err,
+            OrchestratorError::SandboxOperationFailed {
+                operation: SandboxOperation::Pause,
+                ..
+            }
+        ),
+        "the ceiling breach must stay a recoverable pause failure"
+    );
+
+    // The sandbox keeps its runtime state: still Running, handle and route
+    // attached, no paused record written.
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("a ceiling breach must not remove the sandbox");
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert!(metadata.paused_state.is_none());
+    assert!(
+        orchestrator
+            .sandboxes
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "a ceiling breach must not detach the runtime handle"
+    );
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
+
+    // Once the operator raises the ceiling, the very same sandbox pauses.
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    let paused = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("sandbox should remain after a successful retry");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert!(paused.paused_state.is_some());
+    assert_proxy_paused(&orchestrator, &sandbox_id).await?;
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn pause_failure_with_failed_recovery_removes_sandbox() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
