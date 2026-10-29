@@ -670,17 +670,27 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     sandbox.start().await?;
     write_disk_marker(&mut sandbox).await?;
 
-    // Establish the base chain before any ceiling is injected. A compaction can
-    // only merge the runtime-owned suffix, so the ceiling has to hold that base
-    // plus one compacted generation (at most a touched-page generation's worth
-    // of guest memory); deriving it from the measured base keeps the test
-    // independent of the image's layer sizes instead of guessing.
+    // Establish the base chains before any ceiling is injected. One ceiling
+    // bounds both the memory and the rootfs chain of this sandbox, and a
+    // compaction can only merge the runtime-owned suffix, so the ceiling has to
+    // hold the larger base plus one compacted generation (at most a
+    // touched-page generation's worth of guest memory). Deriving it from the
+    // measured base keeps the test independent of the image's layer sizes
+    // instead of guessing a constant.
     let mut current = sandbox.pause().await?;
     let pause_count = 10;
-    let base_footprint =
-        allocated_bytes(&lower_file_paths_from_image_config(
-            &current.mem_overlaybd_config.image_config_path,
-        )?);
+    let base_mem_footprint = allocated_bytes(&lower_file_paths_from_image_config(
+        &current.mem_overlaybd_config.image_config_path,
+    )?);
+    let base_rootfs_footprint = allocated_bytes(&lower_file_paths_from_image_config(
+        &current
+            .common
+            .rootfs_image_config
+            .as_ref()
+            .context("paused snapshot should carry a rootfs image config")?
+            .image_config_path,
+    )?);
+    let base_footprint = base_mem_footprint.max(base_rootfs_footprint);
     let ceiling = (base_footprint + 2 * guest_memory).min(
         agentenv::cfg::ConfigManager::global_config()
             .orchestrator
@@ -688,14 +698,15 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     );
     assert!(
         base_footprint <= ceiling,
-        "the ceiling must hold the measured base chain: {base_footprint} > {ceiling}"
+        "the ceiling must hold the larger base chain (memory {base_mem_footprint} bytes, rootfs \
+         {base_rootfs_footprint} bytes): {base_footprint} > {ceiling}"
     );
 
     let mut compaction_seen = false;
     let mut first_footprint = None;
     for pause_index in 0..pause_count {
-        let mut resumed = FirecrackerSandbox::from_snapshot_config(&current)?
-            .with_chain_bytes_ceiling(ceiling);
+        let mut resumed =
+            FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(ceiling);
         resumed.start().await?;
         let write = resumed
             .run_command(
