@@ -102,15 +102,21 @@ async fn take_over_stale_lock(
             ))
         }
     };
-    let stale = metadata
-        .last_modified
-        .is_some_and(|modified| modified.elapsed().is_ok_and(|age| age >= MAINTENANCE_LOCK_STALE_AFTER));
+    let stale = metadata.last_modified.is_some_and(|modified| {
+        modified
+            .elapsed()
+            .is_ok_and(|age| age >= MAINTENANCE_LOCK_STALE_AFTER)
+    });
     if !stale {
         return Ok(None);
     }
     warn!(key, "taking over a maintenance lock its holder left behind");
     client
-        .put_bytes(key, token.clone().into_bytes(), OssUploadArtifact::CatalogRecord)
+        .put_bytes(
+            key,
+            token.clone().into_bytes(),
+            OssUploadArtifact::CatalogRecord,
+        )
         .await
         .map_err(|error| {
             RepositoryError::backend(format!("replace maintenance lock '{key}'"), error)
@@ -240,10 +246,7 @@ impl Repository for OssRepository {
             .list_entries_recursive(BlobKey::LAYERS_PREFIX)
             .await
             .map_err(|error| {
-                RepositoryError::backend(
-                    format!("list '{}'", BlobKey::LAYERS_PREFIX),
-                    error,
-                )
+                RepositoryError::backend(format!("list '{}'", BlobKey::LAYERS_PREFIX), error)
             })?;
         let mut layers: Vec<ManagedLayerObject> = entries
             .into_iter()

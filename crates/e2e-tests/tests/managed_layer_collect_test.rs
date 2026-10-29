@@ -16,16 +16,23 @@ use tokio::sync::OnceCell;
 static FIXTURE: OnceCell<MinioFixture> = OnceCell::const_new();
 
 async fn fixture() -> &'static MinioFixture {
-    FIXTURE.get_or_init(|| async { MinioFixture::start().await.expect("start MinIO") }).await
+    FIXTURE
+        .get_or_init(|| async { MinioFixture::start().await.expect("start MinIO") })
+        .await
 }
 
 fn ensure_test_config() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let config_root = workspace_root.join("target").join("managed-layer-collect-config");
+        let config_root = workspace_root
+            .join("target")
+            .join("managed-layer-collect-config");
         std::fs::create_dir_all(&config_root).expect("config dir");
-        std::env::set_var("AENV_CONFIG_PATH", workspace_root.join("config").join("default.toml"));
+        std::env::set_var(
+            "AENV_CONFIG_PATH",
+            workspace_root.join("config").join("default.toml"),
+        );
         std::env::set_var("AENV_HOME_PATH", &config_root);
         std::env::set_var("AENV_DEPS_PATH", config_root.join("deps"));
         std::env::set_var("AENV_SNAPSHOT_LOCAL_CACHE_PATH", config_root.join("cache"));

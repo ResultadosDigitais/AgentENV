@@ -106,10 +106,7 @@ impl PosixFsArtifactStore {
             if !entry
                 .file_type()
                 .map_err(|error| {
-                    RepositoryError::backend(
-                        format!("inspect '{}'", entry.path().display()),
-                        error,
-                    )
+                    RepositoryError::backend(format!("inspect '{}'", entry.path().display()), error)
                 })?
                 .is_file()
             {

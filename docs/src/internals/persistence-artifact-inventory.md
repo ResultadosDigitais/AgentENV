@@ -162,6 +162,15 @@ Two things the pass never does:
 
 Every pass records cited layers and bytes, orphan layers and bytes, unexpired and unreadable layers, deleted layers and reclaimed bytes, and the objects it could not handle. A single failure never stops the pass.
 
+### Rolling it out
+
+Report first, in this order, on a node whose repository is the environment you are cleaning:
+
+1. Start one node with `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED=true`. The pass only removes what the node that ran it can see, so run it on a node holding the environment's live sandboxes; a node with none reports the layer of every paused sandbox that is not running right now.
+2. Run `POST /admin/managed-layers/collect` with `{"mode": "report"}` and compare `orphanLayers`/`orphanBytes` with what you measured independently. A difference larger than the layers a known publication is uploading means the citation set is missing a source; **stop** and investigate, do not enforce.
+3. Only then run `{"mode": "enforce"}`. It applies the same grace period, so the layers a pass in flight is uploading stay.
+4. The pass never removes an object whose name is not a digest. A non-zero `unreadableLayers` is expected from older releases and stays reported every pass.
+
 ## Snapshot Runtime Resolution
 
 Owned by `src/snapshot/artifact_cache.rs`, `src/snapshot/runtime_support.rs`, and backend runtime resolvers.

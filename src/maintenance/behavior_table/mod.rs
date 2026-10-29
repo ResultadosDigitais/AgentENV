@@ -15,9 +15,7 @@ use async_trait::async_trait;
 
 use super::{LiveSandboxes, ManagedLayerCollectMode, ManagedLayerCollectRequest};
 use crate::image::{ImageCatalog, PublishedImage};
-use crate::repository::{
-    BlobBody, BlobKey, DocumentKey, LayerRole, Repository, RepositoryResult,
-};
+use crate::repository::{BlobBody, BlobKey, DocumentKey, LayerRole, Repository, RepositoryResult};
 use crate::snapshot::{CommandContext, SnapshotRecord, SnapshotRuntimeVersions};
 use crate::types::{ImageConfigs, OverlaybdLayerRef, SandboxResources};
 use crate::volume::{VolumeRecord, VolumeStatus};
@@ -39,10 +37,7 @@ pub fn layer(digest: &str) -> OverlaybdLayerRef {
 }
 
 pub fn request(mode: ManagedLayerCollectMode) -> ManagedLayerCollectRequest {
-    ManagedLayerCollectRequest {
-        mode,
-        grace: GRACE,
-    }
+    ManagedLayerCollectRequest { mode, grace: GRACE }
 }
 
 /// A node with no live sandbox.
@@ -185,7 +180,10 @@ pub fn age_layer(root: &std::path::Path, digest: &str) {
         }
         .posix_path(),
     );
-    filetime_set(&path, std::time::SystemTime::now() - Duration::from_secs(24 * 3600));
+    filetime_set(
+        &path,
+        std::time::SystemTime::now() - Duration::from_secs(24 * 3600),
+    );
 }
 
 /// Writes one POSIX object under `managed-layers/` whose name does not translate
@@ -200,7 +198,10 @@ pub fn write_unreadable_layer(root: &std::path::Path) {
         std::fs::create_dir_all(parent).expect("mkdir managed layers");
     }
     std::fs::write(&path, [0u8; 32]).expect("write unreadable layer");
-    filetime_set(&path, std::time::SystemTime::now() - Duration::from_secs(24 * 3600));
+    filetime_set(
+        &path,
+        std::time::SystemTime::now() - Duration::from_secs(24 * 3600),
+    );
 }
 
 pub fn filetime_set(path: &std::path::Path, at: std::time::SystemTime) {
@@ -306,13 +307,10 @@ macro_rules! behavior_table {
                 // rather than as a layer a publish in flight may still cite.
                 let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Report);
 
-                let report = collect_managed_layers(
-                    repository.as_ref(),
-                    &NoLiveSandboxesUnderTest,
-                    &pass,
-                )
-                .await
-                .expect("collect");
+                let report =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await
+                        .expect("collect");
 
                 assert_eq!(report.cited_layers, 1);
                 assert_eq!(report.cited_bytes, 64);
@@ -387,7 +385,9 @@ macro_rules! behavior_table {
                 assert_eq!(report.deleted_layers, 0);
                 assert_eq!(report.reclaimed_bytes, 0);
                 // The backend still holds it: the report must not have deleted.
-                assert!(stored_layer_keys(repository.as_ref()).await.contains(&stale));
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&stale));
             }
 
             #[tokio::test]
@@ -530,7 +530,9 @@ macro_rules! behavior_table {
                     "a live sandbox whose source is gone must downgrade the pass"
                 );
                 assert_eq!(report.deleted_layers, 0);
-                assert!(stored_layer_keys(repository.as_ref()).await.contains(&orphan));
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&orphan));
             }
 
             #[tokio::test]
@@ -541,7 +543,8 @@ macro_rules! behavior_table {
                     .await
                     .expect("store live layer");
                 store_snapshot_record(repository.as_ref(), &[&live_layer]).await;
-                let pass = age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce);
+                let pass =
+                    age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce);
                 let records = repository
                     .read_documents(DocumentCollection::SnapshotRecords)
                     .await

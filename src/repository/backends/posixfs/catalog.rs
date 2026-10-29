@@ -159,7 +159,9 @@ impl PosixFsCatalogStore {
         &self,
         name: &str,
     ) -> RepositoryResult<Option<(MaintenanceLock, PosixMaintenanceLockKeeper)>> {
-        let path = self.root.join(crate::repository::maintenance_lock_key(name));
+        let path = self
+            .root
+            .join(crate::repository::maintenance_lock_key(name));
         let Some(parent) = path.parent() else {
             return Err(RepositoryError::Backend {
                 message: format!("resolve parent for maintenance lock '{}'", path.display()),

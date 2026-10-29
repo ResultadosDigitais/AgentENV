@@ -280,7 +280,10 @@ impl From<ManagedLayerCollectMode> for models::ManagedLayerCollectMode {
 impl From<ManagedLayerCollectReport> for models::ManagedLayerCollectReport {
     fn from(report: ManagedLayerCollectReport) -> Self {
         models::ManagedLayerCollectReport {
-            mode: report.mode.unwrap_or(ManagedLayerCollectMode::Report).into(),
+            mode: report
+                .mode
+                .unwrap_or(ManagedLayerCollectMode::Report)
+                .into(),
             cited_layers: report.cited_layers,
             cited_bytes: report.cited_bytes,
             orphan_layers: report.orphan_layers,

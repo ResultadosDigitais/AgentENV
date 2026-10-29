@@ -262,7 +262,10 @@ where
 /// The gauges carry the pass's own numbers, so the last pass is always what
 /// `/metrics` shows. The histograms keep the trend.
 fn record_pass_metrics(report: &ManagedLayerCollectReport, elapsed: Duration) {
-    let mode = report.mode.unwrap_or(ManagedLayerCollectMode::Report).as_str();
+    let mode = report
+        .mode
+        .unwrap_or(ManagedLayerCollectMode::Report)
+        .as_str();
     metrics::gauge!("agentenv_managed_layer_cited_layers", "mode" => mode)
         .set(report.cited_layers as f64);
     metrics::gauge!("agentenv_managed_layer_cited_bytes", "mode" => mode)
@@ -557,4 +560,3 @@ impl VolumeCitation {
         collect_refs(self.backing_layers, cited);
     }
 }
-

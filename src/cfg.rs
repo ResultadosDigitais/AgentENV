@@ -382,7 +382,10 @@ pub struct SnapshotManagedLayerCollectConfig {
     /// belongs to a publication in flight. Measured on staging from a golden's
     /// first layer upload to its record commit; see
     /// `docs/src/internals/persistence-artifact-inventory.md`.
-    #[config(default = 7200u64, env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS")]
+    #[config(
+        default = 7200u64,
+        env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS"
+    )]
     pub grace_secs: u64,
 }
 

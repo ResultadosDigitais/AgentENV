@@ -93,7 +93,8 @@ pub struct ManagedLayerObject {
 /// with the process; this bound keeps the next scheduled pass from being
 /// blocked forever. It is far longer than a pass takes, so a live pass is never
 /// overtaken.
-pub const MAINTENANCE_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+pub const MAINTENANCE_LOCK_STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
 
 /// A held maintenance lock. The token identifies this holder, so a release
 /// never removes a lock another pass has since taken over.
