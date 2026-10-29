@@ -746,6 +746,24 @@ pub(super) async fn build_mem_snapshot_image_config(
     })
 }
 
+/// One overlaybd device's staging inputs, as the pause path hands them over.
+///
+/// Grouped into a struct because every field travels together (one device, its
+/// live runtime config, the snapshot directory that receives the staged config,
+/// and the chain budget the rewrite enforces) and because a long positional
+/// argument list of same-typed values made it easy to pair a ceiling with the
+/// wrong roots at a call site without the compiler noticing.
+pub(super) struct RestackSnapshotDevice<'a> {
+    pub(super) ublk_device: &'a UblkDevice,
+    pub(super) read_only: bool,
+    pub(super) live_runtime_image_config_path: &'a Path,
+    pub(super) output_dir: &'a Path,
+    pub(super) snapshot_layer_file_name: &'a str,
+    pub(super) kind: &'static str,
+    pub(super) chain_bytes_ceiling: u64,
+    pub(super) runtime_owned_roots: &'a [PathBuf],
+}
+
 /// Stage a persisted snapshot config from the current live overlaybd runtime.
 ///
 /// Writable runtimes are first restacked in-place so the sealed old upper
@@ -753,15 +771,18 @@ pub(super) async fn build_mem_snapshot_image_config(
 /// only stage the persisted snapshot image config. The sealed layer always
 /// stays raw; compression, when enabled, happens once at publish time.
 pub(super) async fn restack_snapshot_overlaybd_device(
-    ublk_device: &UblkDevice,
-    read_only: bool,
-    live_runtime_image_config_path: &Path,
-    output_dir: &Path,
-    snapshot_layer_file_name: &str,
-    kind: &'static str,
-    chain_bytes_ceiling: u64,
-    runtime_owned_roots: &[PathBuf],
+    request: RestackSnapshotDevice<'_>,
 ) -> Result<PathBuf> {
+    let RestackSnapshotDevice {
+        ublk_device,
+        read_only,
+        live_runtime_image_config_path,
+        output_dir,
+        snapshot_layer_file_name,
+        kind,
+        chain_bytes_ceiling,
+        runtime_owned_roots,
+    } = request;
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create overlaybd snapshot dir {}", output_dir.display()))?;
@@ -796,16 +817,16 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     chain_bytes_ceiling: u64,
     runtime_owned_roots: &[PathBuf],
 ) -> Result<PathBuf> {
-    restack_snapshot_overlaybd_device(
+    restack_snapshot_overlaybd_device(RestackSnapshotDevice {
         ublk_device,
         read_only,
         live_runtime_image_config_path,
-        &snapshot_root.join("rootfs"),
-        "snapshot.commit",
-        "rootfs",
+        output_dir: &snapshot_root.join("rootfs"),
+        snapshot_layer_file_name: "snapshot.commit",
+        kind: "rootfs",
         chain_bytes_ceiling,
         runtime_owned_roots,
-    )
+    })
     .await
 }
 
@@ -1136,7 +1157,10 @@ mod tests {
             .join("gen1")
             .join("rootfs.commit");
         std::fs::write(&runtime_lower, b"runtime lower").expect("write runtime lower");
-        let stable_lower = temp.path().join("image-cache").join("base.overlaybd.commit");
+        let stable_lower = temp
+            .path()
+            .join("image-cache")
+            .join("base.overlaybd.commit");
         std::fs::create_dir_all(stable_lower.parent().unwrap()).expect("create cache root");
         std::fs::write(&stable_lower, b"stable lower").expect("write stable lower");
 

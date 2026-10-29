@@ -19,7 +19,7 @@ use super::config::{
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
+    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs, RestackSnapshotDevice,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
@@ -2404,18 +2404,19 @@ impl FirecrackerSandbox {
                 || "snapshot.commit".to_owned(),
                 |_| format!("snapshot-{}.commit", Uuid::now_v7().simple()),
             );
-            let snapshot_image_config_path = restack_snapshot_overlaybd_device(
-                &runtime.device,
-                drive.read_only(),
-                &runtime.image_config_path,
-                &output_dir,
-                &snapshot_layer_file_name,
-                "drive",
-                self.chain_bytes_ceiling,
-                &self.runtime_owned_roots,
-            )
-            .await
-            .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
+            let snapshot_image_config_path =
+                restack_snapshot_overlaybd_device(RestackSnapshotDevice {
+                    ublk_device: &runtime.device,
+                    read_only: drive.read_only(),
+                    live_runtime_image_config_path: &runtime.image_config_path,
+                    output_dir: &output_dir,
+                    snapshot_layer_file_name: &snapshot_layer_file_name,
+                    kind: "drive",
+                    chain_bytes_ceiling: self.chain_bytes_ceiling,
+                    runtime_owned_roots: &self.runtime_owned_roots,
+                })
+                .await
+                .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
             snapped.push(
                 drive
                     .with_image_config_path(snapshot_image_config_path)
@@ -2454,16 +2455,16 @@ impl FirecrackerSandbox {
                 continue;
             }
             let snapshot_layer_file_name = format!("snapshot-{}.commit", Uuid::now_v7().simple());
-            restack_snapshot_overlaybd_device(
-                &runtime.device,
-                false,
-                &runtime.image_config_path,
+            restack_snapshot_overlaybd_device(RestackSnapshotDevice {
+                ublk_device: &runtime.device,
+                read_only: false,
+                live_runtime_image_config_path: &runtime.image_config_path,
                 output_dir,
-                &snapshot_layer_file_name,
-                "volume",
-                self.chain_bytes_ceiling,
-                &self.runtime_owned_roots,
-            )
+                snapshot_layer_file_name: &snapshot_layer_file_name,
+                kind: "volume",
+                chain_bytes_ceiling: self.chain_bytes_ceiling,
+                runtime_owned_roots: &self.runtime_owned_roots,
+            })
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
         }
