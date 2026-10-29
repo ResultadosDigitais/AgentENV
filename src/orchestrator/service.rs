@@ -1373,6 +1373,9 @@ where
     pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
         let was_already_shutting_down = self.is_shutting_down.swap(true, Ordering::AcqRel);
         let _ = self.shutdown_tx.send_replace(true);
+        // Shutdown persists every running sandbox; reclaiming bytes now would
+        // only slow it down and race the artifacts still being written.
+        crate::orchestrator::persistence::begin_graceful_shutdown();
 
         if !was_already_shutting_down {
             info!("orchestrator shutdown requested; stopping all sandboxes");

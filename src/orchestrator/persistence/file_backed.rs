@@ -24,6 +24,30 @@ const RECORD_DB_DIR: &str = "records.db";
 /// `sandbox::firecracker::overlaybd_snapshot`.
 const ALLOCATION_BLOCK_SIZE: u64 = 512;
 
+/// Set for the duration of a graceful shutdown.
+///
+/// Shutdown persists every running sandbox as `Paused`, and the machine is
+/// about to stop: reclaiming bytes there can only slow the shutdown down and
+/// risks deleting an artifact a not-yet-persisted sandbox still needs paths to.
+/// The next pause on a live node sweeps instead.
+static GRACEFUL_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the process as being in graceful shutdown, so `persist_paused` stops
+/// reclaiming bytes from stale generations. Idempotent; call
+/// [`end_graceful_shutdown`] to resume sweeping.
+pub(crate) fn begin_graceful_shutdown() {
+    GRACEFUL_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Leave graceful shutdown. Exposed for tests and for a shutdown that aborts.
+pub(crate) fn end_graceful_shutdown() {
+    GRACEFUL_SHUTDOWN.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn is_graceful_shutdown() -> bool {
+    GRACEFUL_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PersistedPausedLifecycle {
@@ -142,7 +166,7 @@ impl FileBackedSandboxPersister {
         artifact_root: &Path,
         sandbox_id: &SandboxId,
     ) -> PersistenceResult<()> {
-        if self.chain_bytes_ceiling == 0 {
+        if self.chain_bytes_ceiling == 0 || is_graceful_shutdown() {
             return Ok(());
         }
         let sandbox_root = self.sandbox_artifact_root(sandbox_id);
@@ -1020,6 +1044,63 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A graceful shutdown persists every sandbox at once; the sweep must not
+    /// run there, or it competes with the artifacts still being written.
+    #[tokio::test]
+    async fn persist_paused_skips_the_sweep_during_graceful_shutdown() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..4 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("allocate artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("private.commit"), b"generation")?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        let before_shutdown = generation_dirs(&sandbox_root);
+        begin_graceful_shutdown();
+        let shutdown_root = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate artifact root");
+        std::fs::create_dir_all(&shutdown_root)?;
+        std::fs::write(shutdown_root.join("private.commit"), b"generation")?;
+        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+        persister
+            .persist_paused(&metadata, Some(&shutdown_root), paused_state.as_ref())
+            .await?;
+        // Leaving shutdown here keeps the process-level flag from leaking into
+        // the other tests in this binary.
+        end_graceful_shutdown();
+
+        let mut expected = before_shutdown.clone();
+        expected.push(shutdown_root);
+        expected.sort();
+        assert_eq!(
+            generation_dirs(&sandbox_root),
+            expected,
+            "a pause during shutdown must add its generation and reclaim nothing"
+        );
+        assert!(
+            roots
+                .iter()
+                .all(|root| root.exists() || !before_shutdown.contains(root)),
+            "no generation present before shutdown may be removed by it"
+        );
         Ok(())
     }
 

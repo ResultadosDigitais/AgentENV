@@ -10,6 +10,7 @@ use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 
 pub use file_backed::FileBackedSandboxPersister;
+pub(crate) use file_backed::{begin_graceful_shutdown, end_graceful_shutdown};
 #[cfg(test)]
 pub(crate) use mock::{RecordingCall, RecordingPersister};
 
