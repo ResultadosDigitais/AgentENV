@@ -1,38 +1,36 @@
 //! The managed-layer collector's behavior table.
 //!
 //! Every scenario is written once here and run against every backend, so a
-//! backend cannot encode its own version of the rule. The OSS backend runs the
-//! same table from `crates/e2e-tests`, which is where MinIO lives.
+//! backend cannot encode its own version of the rule. POSIX runs it at the
+//! bottom of this file; the OSS backend runs the same [`behavior_table!`] macro
+//! from `crates/e2e-tests`, which is where MinIO lives.
+//!
+//! This module is compiled outside `cfg(test)` on purpose, the same way
+//! `snapshot::mock` is: an integration test in another crate can only see it
+//! then.
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::{
-    collect_managed_layers, LiveSandboxes, ManagedLayerCollectMode, ManagedLayerCollectRequest,
-    ManagedLayerCollectorError,
-};
+use super::{LiveSandboxes, ManagedLayerCollectMode, ManagedLayerCollectRequest};
 use crate::image::{ImageCatalog, PublishedImage};
 use crate::repository::{
-    BlobBody, BlobKey, DocumentKey, LayerRole, ManagedLayerObject, Repository, RepositoryResult,
+    BlobBody, BlobKey, DocumentKey, LayerRole, Repository, RepositoryResult,
 };
-use crate::repository::backends::PosixFsRepository;
-use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
-use crate::types::{OverlaybdLayerRef, SandboxResources};
+use crate::snapshot::{CommandContext, SnapshotRecord, SnapshotRuntimeVersions};
+use crate::types::{ImageConfigs, OverlaybdLayerRef, SandboxResources};
 use crate::volume::{VolumeRecord, VolumeStatus};
 
-/// A layer directory with no records at all: everything in it is a candidate.
-///
-/// The grace of one hour is far longer than any test takes, so a layer written
-/// now is always inside it unless a scenario says otherwise.
-const GRACE: Duration = Duration::from_secs(3600);
+/// A grace far longer than any test takes, so a layer written now is always
+/// inside it unless a scenario says otherwise.
+pub const GRACE: Duration = Duration::from_secs(3600);
 
-fn digest(seed: &str) -> String {
+pub fn digest(seed: &str) -> String {
     crate::digest::sha256_digest(seed.as_bytes())
 }
 
-fn layer(digest: &str) -> OverlaybdLayerRef {
+pub fn layer(digest: &str) -> OverlaybdLayerRef {
     OverlaybdLayerRef::Managed(crate::types::ManagedLayer {
         digest: digest.to_owned(),
         size: 4096,
@@ -40,7 +38,7 @@ fn layer(digest: &str) -> OverlaybdLayerRef {
     })
 }
 
-fn request(mode: ManagedLayerCollectMode) -> ManagedLayerCollectRequest {
+pub fn request(mode: ManagedLayerCollectMode) -> ManagedLayerCollectRequest {
     ManagedLayerCollectRequest {
         mode,
         grace: GRACE,
@@ -48,7 +46,7 @@ fn request(mode: ManagedLayerCollectMode) -> ManagedLayerCollectRequest {
 }
 
 /// A node with no live sandbox.
-struct NoLiveSandboxesUnderTest;
+pub struct NoLiveSandboxesUnderTest;
 
 #[async_trait]
 impl LiveSandboxes for NoLiveSandboxesUnderTest {
@@ -58,7 +56,7 @@ impl LiveSandboxes for NoLiveSandboxesUnderTest {
 }
 
 /// A node whose live sandboxes all read the given snapshot IDs.
-struct LiveSandboxesUnderTest(Vec<String>);
+pub struct LiveSandboxesUnderTest(pub Vec<String>);
 
 #[async_trait]
 impl LiveSandboxes for LiveSandboxesUnderTest {
@@ -70,7 +68,7 @@ impl LiveSandboxes for LiveSandboxesUnderTest {
 /// Stores one managed layer of `bytes` bytes straight through the blob
 /// primitives, which is exactly what a publication does before it writes its
 /// record.
-async fn store_layer<R: Repository + ?Sized>(
+pub async fn store_layer<R: Repository + ?Sized>(
     repository: &R,
     digest: &str,
     bytes: u64,
@@ -86,18 +84,21 @@ async fn store_layer<R: Repository + ?Sized>(
         .await
 }
 
-async fn stored_layer_keys<R: Repository + ?Sized>(repository: &R) -> BTreeSet<String> {
+/// The digests of every managed layer the backend currently stores.
+pub async fn stored_layer_keys<R: Repository + ?Sized>(
+    repository: &R,
+) -> std::collections::BTreeSet<String> {
     repository
         .list_managed_layers()
         .await
-        .unwrap()
+        .expect("list managed layers")
         .into_iter()
         .filter_map(|object| object.layer_digest)
         .collect()
 }
 
-/// Writes a snapshot record whose committed rootfs cites `layers`.
-async fn store_snapshot_record<R: Repository + ?Sized>(repository: &R, layers: &[&str]) {
+/// Writes a committed snapshot record whose rootfs cites `layers`.
+pub async fn store_snapshot_record<R: Repository + ?Sized>(repository: &R, layers: &[&str]) {
     let record = SnapshotRecord {
         id: crate::types::SnapshotId::generate(),
         alias: None,
@@ -112,9 +113,24 @@ async fn store_snapshot_record<R: Repository + ?Sized>(repository: &R, layers: &
         resources: SandboxResources::default(),
         created_at_unix_ms: 0,
         updated_at_unix_ms: 0,
-        committed: Some(CommittedSnapshot {
+        committed: Some(crate::snapshot::CommittedSnapshot {
+            context: CommandContext::default(),
+            startup: None,
+            runtime_versions: SnapshotRuntimeVersions::new(
+                "kernel".to_owned(),
+                "firecracker".to_owned(),
+                "envd".to_owned(),
+                "0.1.0".to_owned(),
+            ),
+            virtualization_mode: Default::default(),
+            image_configs: ImageConfigs::new(),
             rootfs_layers: layers.iter().map(|digest| layer(digest)).collect(),
-            ..CommittedSnapshot::mock()
+            attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
+            memory_layers: Vec::new(),
+            disk_publications: Vec::new(),
+            custom_extension_params: None,
+            memory_startup: None,
         }),
         deleting: false,
     };
@@ -126,7 +142,7 @@ async fn store_snapshot_record<R: Repository + ?Sized>(repository: &R, layers: &
 }
 
 /// Writes a volume record whose backing cites `layers`.
-async fn store_volume_record<R: Repository + ?Sized>(repository: &R, layers: &[&str]) {
+pub async fn store_volume_record<R: Repository + ?Sized>(repository: &R, layers: &[&str]) {
     let record = VolumeRecord {
         id: "vol_collect".to_owned(),
         name: "collect".to_owned(),
@@ -147,7 +163,7 @@ async fn store_volume_record<R: Repository + ?Sized>(repository: &R, layers: &[&
 }
 
 /// Publishes an image description that owns `layers`.
-async fn store_image<R: Repository + ?Sized>(repository: &R, layers: &[&str]) {
+pub async fn store_image<R: Repository + ?Sized>(repository: &R, layers: &[&str]) {
     let image = PublishedImage::new(
         "amd64".to_owned(),
         layers.iter().map(|digest| layer(digest)).collect(),
@@ -156,10 +172,12 @@ async fn store_image<R: Repository + ?Sized>(repository: &R, layers: &[&str]) {
     repository.put_image(&image).await.expect("publish image");
 }
 
-/// Makes an object look older than any grace, without changing the backend's
-/// own clock: the pass reads `last_modified`, and only the POSIX backend can be
-/// aged through the filesystem.
-fn age_layer(root: &std::path::Path, digest: &str) {
+/// Makes a POSIX-stored layer look older than any grace.
+///
+/// The pass reads the backend's own `last_modified`, so this reaches the file
+/// the backend stored. A backend whose storage is not on this filesystem cannot
+/// be aged this way and asks for a zero grace instead.
+pub fn age_layer(root: &std::path::Path, digest: &str) {
     let path = root.join(
         BlobKey::Layer {
             digest: digest.to_owned(),
@@ -167,49 +185,41 @@ fn age_layer(root: &std::path::Path, digest: &str) {
         }
         .posix_path(),
     );
-    let old = std::time::SystemTime::now() - Duration::from_secs(24 * 3600);
-    filetime_set(&path, old);
+    filetime_set(&path, std::time::SystemTime::now() - Duration::from_secs(24 * 3600));
 }
 
-/// Stores one object under `managed-layers/` whose name does not translate back
-/// to a digest, straight into the backend's storage.
+/// Writes one POSIX object under `managed-layers/` whose name does not translate
+/// back to a digest.
 ///
 /// It cannot go through `put_blob`, which only writes digest-shaped names: such
 /// an object is exactly what an older release, or a hand edit, leaves behind.
-async fn write_unreadable_layer<R: Repository + ?Sized>(
-    repository: &R,
-    root: &std::path::Path,
-) {
+pub fn write_unreadable_layer(root: &std::path::Path) {
     let key = format!("{}/not-a-digest.overlaybd.commit", BlobKey::LAYERS_DIR);
     let path = root.join(&key);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("mkdir managed layers");
     }
     std::fs::write(&path, [0u8; 32]).expect("write unreadable layer");
-    let old = std::time::SystemTime::now() - Duration::from_secs(24 * 3600);
-    filetime_set(&path, old);
-    let _ = repository;
+    filetime_set(&path, std::time::SystemTime::now() - Duration::from_secs(24 * 3600));
 }
 
-fn filetime_set(path: &std::path::Path, at: std::time::SystemTime) {
+pub fn filetime_set(path: &std::path::Path, at: std::time::SystemTime) {
     // `filetime` is not a dependency, and the standard library cannot set a
     // file's mtime; `utimensat` is one call. Keeping it here avoids adding a
     // crate for a test-only helper.
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
+    let seconds = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs() as libc::time_t;
     let times = [
         libc::timespec {
-            tv_sec: at
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("after epoch")
-                .as_secs() as libc::time_t,
+            tv_sec: seconds,
             tv_nsec: 0,
         },
         libc::timespec {
-            tv_sec: at
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("after epoch")
-                .as_secs() as libc::time_t,
+            tv_sec: seconds,
             tv_nsec: 0,
         },
     ];
@@ -225,25 +235,45 @@ fn filetime_set(path: &std::path::Path, at: std::time::SystemTime) {
 
 /// Runs the whole table against one repository backend.
 ///
-/// `root` is where a POSIX backend stores its files, so a scenario can age a
-/// layer; `age` says whether the backend exposes file timestamps this way.
+/// `repository` is an `async` expression (usually a call to a helper the caller
+/// defines) that yields `Arc<dyn Repository>` over the temporary directory it
+/// is given; `root` says where that backend stores its files; `age` says
+/// whether a scenario can age a layer there. With `age` false the table asks
+/// for a zero grace, so "older than the grace" still holds for anything written
+/// before the pass.
+///
+/// The expansion needs the caller crate to have `tokio` (with `macros`) and
+/// `tempfile` available, which every test crate here does.
+#[macro_export]
 macro_rules! behavior_table {
     ($name:ident, $repository:expr, $root:expr, $age:expr) => {
-        mod $name {
-            use super::*;
+        #[allow(dead_code)]
+        async fn __behavior_table_constructor(
+            root: &std::path::Path,
+        ) -> std::sync::Arc<dyn Repository> {
+            $repository(root).await
+        }
 
-            async fn repository() -> (Box<dyn Repository>, tempfile::TempDir) {
+        mod $name {
+            use $crate::maintenance::behavior_table::{
+                age_layer, digest, request, store_image, store_layer, store_snapshot_record,
+                store_volume_record, stored_layer_keys, write_unreadable_layer,
+                LiveSandboxesUnderTest, NoLiveSandboxesUnderTest,
+            };
+            use $crate::maintenance::{
+                collect_managed_layers, ManagedLayerCollectMode, ManagedLayerCollectRequest,
+                ManagedLayerCollectorError,
+            };
+            use $crate::repository::{DocumentCollection, ManagedLayerObject, Repository};
+
+            async fn repository() -> (std::sync::Arc<dyn Repository>, tempfile::TempDir) {
                 let temp = tempfile::TempDir::new().expect("tempdir");
-                let repository: Box<dyn Repository> = $repository(temp.path());
+                let repository = super::__behavior_table_constructor(temp.path()).await;
                 (repository, temp)
             }
 
-            /// Makes the layer `digest` old enough to be collected.
-            ///
-            /// A backend whose storage this test cannot reach through the
-            /// filesystem ages nothing and asks for a zero grace instead, so
-            /// "older than the grace" still holds for anything written before
-            /// the pass started.
+            /// Makes the layer `digest` old enough to be collected, or asks for
+            /// a zero grace when this backend's storage cannot be aged.
             fn age_or_shrink_grace(
                 temp: &tempfile::TempDir,
                 digest: &str,
@@ -255,7 +285,7 @@ macro_rules! behavior_table {
                 } else {
                     ManagedLayerCollectRequest {
                         mode,
-                        grace: Duration::ZERO,
+                        grace: std::time::Duration::ZERO,
                     }
                 }
             }
@@ -304,13 +334,10 @@ macro_rules! behavior_table {
                     .expect("store orphan");
                 let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
 
-                let report = collect_managed_layers(
-                    repository.as_ref(),
-                    &NoLiveSandboxesUnderTest,
-                    &pass,
-                )
-                .await
-                .expect("collect");
+                let report =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await
+                        .expect("collect");
 
                 assert_eq!(report.deleted_layers, 1);
                 assert_eq!(report.reclaimed_bytes, 256);
@@ -350,13 +377,10 @@ macro_rules! behavior_table {
                     .expect("store orphan");
                 let pass = age_or_shrink_grace(&temp, &stale, ManagedLayerCollectMode::Report);
 
-                let report = collect_managed_layers(
-                    repository.as_ref(),
-                    &NoLiveSandboxesUnderTest,
-                    &pass,
-                )
-                .await
-                .expect("collect");
+                let report =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await
+                        .expect("collect");
 
                 assert_eq!(report.orphan_layers, 1);
                 assert_eq!(report.orphan_bytes, 1024);
@@ -374,15 +398,13 @@ macro_rules! behavior_table {
                     .await
                     .expect("store image layer");
                 store_image(repository.as_ref(), &[&image_layer]).await;
-                let pass = age_or_shrink_grace(&temp, &image_layer, ManagedLayerCollectMode::Enforce);
+                let pass =
+                    age_or_shrink_grace(&temp, &image_layer, ManagedLayerCollectMode::Enforce);
 
-                let report = collect_managed_layers(
-                    repository.as_ref(),
-                    &NoLiveSandboxesUnderTest,
-                    &pass,
-                )
-                .await
-                .expect("collect");
+                let report =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await
+                        .expect("collect");
 
                 assert_eq!(report.cited_layers, 1);
                 assert_eq!(report.deleted_layers, 0);
@@ -402,13 +424,10 @@ macro_rules! behavior_table {
                 let pass =
                     age_or_shrink_grace(&temp, &volume_layer, ManagedLayerCollectMode::Enforce);
 
-                let report = collect_managed_layers(
-                    repository.as_ref(),
-                    &NoLiveSandboxesUnderTest,
-                    &pass,
-                )
-                .await
-                .expect("collect");
+                let report =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await
+                        .expect("collect");
 
                 assert_eq!(report.cited_layers, 1);
                 assert_eq!(report.deleted_layers, 0);
@@ -420,7 +439,7 @@ macro_rules! behavior_table {
             #[tokio::test]
             async fn an_object_whose_name_is_not_a_digest_never_leaves() {
                 let (repository, temp) = repository().await;
-                write_unreadable_layer(repository.as_ref(), &$root(&temp)).await;
+                write_unreadable_layer(&$root(&temp));
 
                 let listed = repository.list_managed_layers().await.expect("list");
                 let unreadable = listed
@@ -437,7 +456,7 @@ macro_rules! behavior_table {
                     &NoLiveSandboxesUnderTest,
                     &ManagedLayerCollectRequest {
                         mode: ManagedLayerCollectMode::Enforce,
-                        grace: Duration::ZERO,
+                        grace: std::time::Duration::ZERO,
                     },
                 )
                 .await
@@ -496,7 +515,7 @@ macro_rules! behavior_table {
                     .await
                     .expect("store orphan");
                 let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
-                let missing = crate::types::SnapshotId::generate().to_string();
+                let missing = $crate::types::SnapshotId::generate().to_string();
 
                 let report = collect_managed_layers(
                     repository.as_ref(),
@@ -524,7 +543,7 @@ macro_rules! behavior_table {
                 store_snapshot_record(repository.as_ref(), &[&live_layer]).await;
                 let pass = age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce);
                 let records = repository
-                    .read_documents(crate::repository::DocumentCollection::SnapshotRecords)
+                    .read_documents(DocumentCollection::SnapshotRecords)
                     .await
                     .expect("read records");
                 let origin = records.first().expect("one record").0.clone();
@@ -566,11 +585,18 @@ macro_rules! behavior_table {
     };
 }
 
+/// Builds a POSIX repository under `root`.
+#[cfg(test)]
+pub async fn posix_repository(root: &std::path::Path) -> std::sync::Arc<dyn Repository> {
+    std::sync::Arc::new(crate::repository::backends::PosixFsRepository::new(
+        root.join("repository"),
+    ))
+}
+
+#[cfg(test)]
 behavior_table!(
     posix,
-    |root: &std::path::Path| -> Box<dyn Repository> {
-        Box::new(PosixFsRepository::new(root.join("repository")))
-    },
+    posix_repository,
     |temp: &tempfile::TempDir| temp.path().join("repository"),
     true
 );

@@ -6,6 +6,7 @@
 //! built on it, while `snapshot` may not import `volume`. Keeping the reader
 //! here keeps every other module's dependency direction intact.
 
+pub mod behavior_table;
 mod live_sandboxes;
 mod managed_layers;
 

@@ -177,6 +177,7 @@ where
     R: Repository + ?Sized,
     L: LiveSandboxes + ?Sized,
 {
+    let started = std::time::Instant::now();
     let mut report = ManagedLayerCollectReport {
         mode: Some(request.mode),
         ..ManagedLayerCollectReport::default()
@@ -235,8 +236,11 @@ where
         }
     }
 
+    let elapsed = started.elapsed();
+    record_pass_metrics(&report, elapsed);
     info!(
         mode = request.mode.as_str(),
+        elapsed_ms = elapsed.as_millis(),
         cited_layers = report.cited_layers,
         cited_bytes = report.cited_bytes,
         orphan_layers = report.orphan_layers,
@@ -250,6 +254,33 @@ where
         "managed layer collection pass finished"
     );
     Ok(report)
+}
+
+/// Records one pass, so an operator can see the bucket shrinking without
+/// reading the log.
+///
+/// The gauges carry the pass's own numbers, so the last pass is always what
+/// `/metrics` shows. The histograms keep the trend.
+fn record_pass_metrics(report: &ManagedLayerCollectReport, elapsed: Duration) {
+    let mode = report.mode.unwrap_or(ManagedLayerCollectMode::Report).as_str();
+    metrics::gauge!("agentenv_managed_layer_cited_layers", "mode" => mode)
+        .set(report.cited_layers as f64);
+    metrics::gauge!("agentenv_managed_layer_cited_bytes", "mode" => mode)
+        .set(report.cited_bytes as f64);
+    metrics::gauge!("agentenv_managed_layer_orphan_layers", "mode" => mode)
+        .set(report.orphan_layers as f64);
+    metrics::gauge!("agentenv_managed_layer_orphan_bytes", "mode" => mode)
+        .set(report.orphan_bytes as f64);
+    metrics::gauge!("agentenv_managed_layer_unexpired_layers", "mode" => mode)
+        .set(report.unexpired_layers as f64);
+    metrics::gauge!("agentenv_managed_layer_unreadable_layers", "mode" => mode)
+        .set(report.unreadable_layers as f64);
+    metrics::counter!("agentenv_managed_layer_collect_reclaimed_bytes_total", "mode" => mode)
+        .increment(report.reclaimed_bytes);
+    metrics::counter!("agentenv_managed_layer_collect_deleted_layers_total", "mode" => mode)
+        .increment(report.deleted_layers);
+    metrics::histogram!("agentenv_managed_layer_collect_duration_seconds", "mode" => mode)
+        .record(elapsed.as_secs_f64());
 }
 
 async fn release<R: Repository + ?Sized>(repository: &R, lock: MaintenanceLock) {
@@ -288,32 +319,49 @@ where
     // not delete anything at all: a report is the only safe answer.
     let mut unreadable = Vec::new();
 
-    for (id, bytes) in repository
+    // A catalog the pass cannot read at all leaves every record it holds
+    // uncited, which would make live layers look like orphans. It is recorded
+    // as a failure, and the failure downgrades the pass to a report below.
+    match repository
         .read_documents(DocumentCollection::SnapshotRecords)
         .await
-        .unwrap_or_default()
     {
-        match SnapshotCitation::decode(&bytes) {
-            Ok(citation) => citation.collect_into(&mut cited),
-            Err(message) => unreadable.push(ManagedLayerCollectFailure {
-                key: format!("{}{id}.json", DocumentCollection::SnapshotRecords.prefix()),
-                message,
-            }),
+        Ok(records) => {
+            for (id, bytes) in records {
+                match SnapshotCitation::decode(&bytes) {
+                    Ok(citation) => citation.collect_into(&mut cited),
+                    Err(message) => unreadable.push(ManagedLayerCollectFailure {
+                        key: format!("{}{id}.json", DocumentCollection::SnapshotRecords.prefix()),
+                        message,
+                    }),
+                }
+            }
         }
+        Err(error) => unreadable.push(ManagedLayerCollectFailure {
+            key: DocumentCollection::SnapshotRecords.prefix().to_owned(),
+            message: error.to_string(),
+        }),
     }
 
-    for (id, bytes) in repository
+    match repository
         .read_documents(DocumentCollection::VolumeRecords)
         .await
-        .unwrap_or_default()
     {
-        match VolumeCitation::decode(&bytes) {
-            Ok(citation) => citation.collect_into(&mut cited),
-            Err(message) => unreadable.push(ManagedLayerCollectFailure {
-                key: format!("{}{id}.json", DocumentCollection::VolumeRecords.prefix()),
-                message,
-            }),
+        Ok(records) => {
+            for (id, bytes) in records {
+                match VolumeCitation::decode(&bytes) {
+                    Ok(citation) => citation.collect_into(&mut cited),
+                    Err(message) => unreadable.push(ManagedLayerCollectFailure {
+                        key: format!("{}{id}.json", DocumentCollection::VolumeRecords.prefix()),
+                        message,
+                    }),
+                }
+            }
         }
+        Err(error) => unreadable.push(ManagedLayerCollectFailure {
+            key: DocumentCollection::VolumeRecords.prefix().to_owned(),
+            message: error.to_string(),
+        }),
     }
 
     match repository.list_images().await {
@@ -510,6 +558,3 @@ impl VolumeCitation {
     }
 }
 
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
