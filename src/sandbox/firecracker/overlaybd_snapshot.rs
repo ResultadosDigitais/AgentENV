@@ -80,18 +80,6 @@ fn chain_ceiling_exceeded(observed_bytes: u64, ceiling_bytes: u64) -> anyhow::Er
     })
 }
 
-fn is_chain_ceiling_exceeded(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.is::<ChainBytesCeilingExceeded>())
-}
-
-/// Allocated bytes of a layer chain, deduplicated by device and inode so a
-/// hardlinked generation is counted once instead of once per path.
-///
-/// Remote lowers have no local file and contribute no local bytes; a local
-/// layer that cannot be inspected is skipped with a warning rather than
-/// failing the pause, which can only under-report (never over-report) the
-/// chain and therefore never triggers a spurious compaction.
 /// Byte ceiling observability for the paused artifact chain.
 ///
 /// Labels stay bounded: `kind` is one of `rootfs` / `memory`, never a sandbox
@@ -101,7 +89,6 @@ mod chain_metrics {
     pub(super) const COMPACTIONS: &str = "agentenv_paused_sandbox_chain_compactions_total";
     pub(super) const CEILING_EXCEEDED: &str =
         "agentenv_paused_sandbox_chain_ceiling_exceeded_total";
-    pub(super) const RECLAIMED_BYTES: &str = "agentenv_paused_sandbox_chain_reclaimed_bytes_total";
 
     pub(super) fn record_chain_bytes(kind: &'static str, bytes: u64, ceiling: u64) {
         metrics::gauge!(CHAIN_BYTES, "kind" => kind).set(bytes as f64);
@@ -115,14 +102,15 @@ mod chain_metrics {
     pub(super) fn record_ceiling_exceeded(kind: &'static str) {
         metrics::counter!(CEILING_EXCEEDED, "kind" => kind).increment(1);
     }
-
-    pub(super) fn record_reclaimed_bytes(kind: &'static str, bytes: u64) {
-        if bytes > 0 {
-            metrics::counter!(RECLAIMED_BYTES, "kind" => kind).increment(bytes);
-        }
-    }
 }
 
+/// Allocated bytes of a layer chain, deduplicated by device and inode so a
+/// hardlinked generation is counted once instead of once per path.
+///
+/// Remote lowers have no local file and contribute no local bytes; a local
+/// layer that cannot be inspected is skipped with a warning rather than
+/// failing the pause, which can only under-report (never over-report) the
+/// chain and therefore never triggers a spurious compaction.
 fn chain_allocated_bytes<'a>(paths: impl IntoIterator<Item = &'a Path>) -> u64 {
     let mut seen = std::collections::HashSet::new();
     let mut total = 0u64;
@@ -1195,18 +1183,18 @@ mod tests {
         let alias = temp.path().join("generation-hardlink.commit");
         std::fs::hard_link(&layer, &alias).expect("hardlink layer");
 
-        let single = chain_allocated_bytes([layer.as_path()]);
+        let single = super::chain_allocated_bytes([layer.as_path()]);
         assert!(single > 0, "a written layer must allocate bytes");
         assert_eq!(
-            chain_allocated_bytes([layer.as_path(), alias.as_path()]),
+            super::chain_allocated_bytes([layer.as_path(), alias.as_path()]),
             single,
             "a hardlink must not be counted twice"
         );
-        // An unreadable or remote (empty) path contributes no local bytes and
-        // must not abort the measurement.
+        // A remote (empty) or missing path contributes no local bytes and must
+        // not abort the measurement.
         let missing = temp.path().join("missing.commit");
         assert_eq!(
-            chain_allocated_bytes([layer.as_path(), missing.as_path(), Path::new("")]),
+            super::chain_allocated_bytes([layer.as_path(), missing.as_path(), Path::new("")]),
             single
         );
     }
@@ -1350,19 +1338,10 @@ mod tests {
         commit_path
     }
 
-    /// Allocated bytes of a layer chain, deduplicated by device and inode so a
-    /// hardlinked generation is counted once.
+    /// Allocated bytes of an existing layer chain, using the production helper
+    /// so the test exercises the same deduplication the ceiling relies on.
     fn chain_allocated_bytes(paths: &[PathBuf]) -> u64 {
-        let mut seen = std::collections::HashSet::new();
-        let mut total = 0u64;
-        for path in paths {
-            let metadata = std::fs::metadata(path).expect("layer metadata");
-            if !seen.insert((metadata.dev(), metadata.ino())) {
-                continue;
-            }
-            total = total.saturating_add(metadata.blocks().saturating_mul(512));
-        }
-        total
+        super::chain_allocated_bytes(paths.iter().map(PathBuf::as_path))
     }
 
     /// A chain above the byte ceiling must collapse the runtime-owned suffix
@@ -1553,7 +1532,6 @@ mod tests {
             &new_layer,
             temp.path(),
             OverlaybdCompactOutput::Raw,
-            0,
         )
         .await
         .expect("build memory image config");

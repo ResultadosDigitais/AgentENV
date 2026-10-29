@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -621,6 +622,110 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Ten consecutive pauses of one sandbox stay under a small chain ceiling.
+///
+/// Needs a real Firecracker host (`/dev/kvm`) and ublk, so it lives in the
+/// gated integration target and is skipped with a clear message elsewhere. The
+/// printed footprint uses the same method as the staging measurement: allocated
+/// bytes deduplicated by device and inode.
+#[tokio::test]
+async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<()> {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!(
+            "skipping ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling: /dev/kvm is not \
+             available on this host"
+        );
+        return Ok(());
+    }
+    common::setup().await;
+    // A small ceiling keeps the test cheap; the production default is 48 GiB.
+    let ceiling = agentenv::cfg::ConfigManager::global_config()
+        .orchestrator
+        .chain_bytes_ceiling
+        .min(4 << 30);
+
+    let sandbox_config = common::default_sandbox_config()?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    sandbox.start().await?;
+    write_disk_marker(&mut sandbox).await?;
+
+    let artifacts_root = tempfile::tempdir()?;
+    let sandbox_root = artifacts_root.path().join("sandbox");
+    fs::create_dir_all(&sandbox_root)?;
+    let pause_count = 10;
+    let mut compaction_seen = false;
+    let mut first_footprint = None;
+
+    let mut current = sandbox.pause().await?;
+    for pause_index in 0..pause_count {
+        let generation_dir = sandbox_root.join(format!("gen-{pause_index}"));
+        fs::create_dir_all(&generation_dir)?;
+        let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&current).await?;
+        let (snapshot, _) = resumed.pause_to_dir(&generation_dir).await?;
+
+        let lowers =
+            lower_file_paths_from_image_config(&snapshot.mem_overlaybd_config.image_config_path)?;
+        let footprint = allocated_bytes(&lowers);
+        first_footprint.get_or_insert(footprint);
+        // A compaction rewrote the runtime-owned suffix into one generation.
+        if lowers
+            .iter()
+            .any(|path| path.ends_with("mem_compacted.commit"))
+        {
+            compaction_seen = true;
+        }
+        eprintln!(
+            "pause {}: chain footprint {} bytes ({} lowers), ceiling {} bytes",
+            pause_index + 1,
+            footprint,
+            lowers.len(),
+            ceiling
+        );
+        current = snapshot;
+    }
+
+    let final_lowers =
+        lower_file_paths_from_image_config(&current.mem_overlaybd_config.image_config_path)?;
+    let final_footprint = allocated_bytes(&final_lowers);
+    let generation_count = fs::read_dir(&sandbox_root)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .count();
+    eprintln!(
+        "ten pauses: first footprint {} bytes, final footprint {} bytes, {} generation \
+         directories on disk",
+        first_footprint.expect("at least one pause ran"),
+        final_footprint,
+        generation_count
+    );
+
+    assert!(
+        final_footprint <= ceiling,
+        "ten pauses must leave the chain under the ceiling: {final_footprint} > {ceiling}"
+    );
+    assert!(
+        compaction_seen,
+        "at least one pause must have compacted the runtime-owned suffix"
+    );
+    assert!(
+        generation_count < pause_count,
+        "the artifact directory must not accumulate one generation per pause: {generation_count} \
+         for {pause_count} pauses"
+    );
+    Ok(())
+}
+
+/// Allocated bytes of a set of layer paths, deduplicated by device and inode.
+fn allocated_bytes(paths: &[PathBuf]) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .filter(|metadata| seen.insert((metadata.dev(), metadata.ino())))
+        .map(|metadata| metadata.blocks().saturating_mul(512))
+        .sum()
 }
 
 /// Runs a connectivity probe, retrying expected successes so transient public
