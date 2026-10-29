@@ -248,6 +248,17 @@ algorithm = "lz4"
 # parallel without changing the output layout.
 workers = 1
 
+# Collecting managed layers no record cites. A layer is content addressed and
+# shared, so deleting a snapshot leaves its layers behind; this pass sweeps
+# them. It is off by default because a collected layer cannot be recreated
+# without its origin. The admin endpoint answers 409 while it is disabled.
+# [snapshot.managed_layer_collect]
+# enabled = false
+# How old an uncited layer must be before enforce may delete it. A publish
+# uploads its layers before it writes the record that cites them, so a layer
+# uploaded moments ago and not cited yet belongs to a publish in flight.
+# grace_secs = 7200
+
 # Optional for OSS and POSIX backends: record the guest's startup memory pages once per snapshot
 # at publish time (a short local re-resume on the capture node, ~10s budget),
 # store a tiny v4 page manifest, and prefetch the listed positions

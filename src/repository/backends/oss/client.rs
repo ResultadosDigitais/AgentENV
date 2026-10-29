@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -70,6 +70,15 @@ impl OssUploadArtifact {
             Self::Alias => "alias",
         }
     }
+}
+
+/// One object a recursive listing returned, before its key is made relative to
+/// the configured backend prefix.
+#[derive(Clone, Debug)]
+pub(crate) struct OssListedObject {
+    pub(crate) key: String,
+    pub(crate) bytes: u64,
+    pub(crate) last_modified: Option<SystemTime>,
 }
 
 /// An operator configuration and the operator last built from it.
@@ -233,6 +242,32 @@ impl OssClient {
         result
     }
 
+    /// One object's size and modification time, without reading it.
+    pub(crate) async fn stat(&self, key: &str) -> Result<OssListedObject> {
+        let strip = (!self.prefix.is_empty()).then(|| format!("{}/", self.prefix));
+        let entry = self
+            .run_with_key(key, |operator, key| async move {
+                let metadata = operator.stat(&key).await?;
+                Ok(OssListedObject {
+                    key,
+                    bytes: metadata.content_length(),
+                    last_modified: metadata.last_modified().map(SystemTime::from),
+                })
+            })
+            .await
+            .with_context(|| format!("oss stat '{key}'"))?;
+        Ok(match strip {
+            Some(strip) => OssListedObject {
+                key: entry
+                    .key
+                    .strip_prefix(&strip)
+                    .map_or(entry.key.clone(), str::to_owned),
+                ..entry
+            },
+            None => entry,
+        })
+    }
+
     /// Check whether an object exists.
     pub(crate) async fn exists(&self, key: &str) -> Result<bool> {
         let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "exists");
@@ -262,13 +297,57 @@ impl OssClient {
             .await
             .with_context(|| format!("oss list '{prefix}'"))?;
 
+        Ok(self.strip_prefix(keys))
+    }
+
+    /// Makes listed keys relative to the configured backend prefix.
+    fn strip_prefix(&self, keys: Vec<String>) -> Vec<String> {
         if self.prefix.is_empty() {
-            return Ok(keys);
+            return keys;
         }
         let strip = format!("{}/", self.prefix);
-        Ok(keys
+        keys.into_iter()
+            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
+            .collect()
+    }
+
+    /// Lists every object under `prefix` recursively, with the size and
+    /// modification time the store reports for each. Keys come back relative to
+    /// the configured backend prefix, like [`Self::list_keys_recursive`].
+    pub(crate) async fn list_entries_recursive(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<OssListedObject>> {
+        let strip = (!self.prefix.is_empty()).then(|| format!("{}/", self.prefix));
+        let entries = self
+            .run_with_key(prefix, |operator, prefix| async move {
+                let entries = operator.list_with(&prefix).recursive(true).await?;
+                Ok(entries
+                    .into_iter()
+                    .filter(|entry| !entry.metadata().mode().is_dir())
+                    .map(|entry| {
+                        let metadata = entry.metadata();
+                        OssListedObject {
+                            key: entry.path().to_string(),
+                            bytes: metadata.content_length(),
+                            last_modified: metadata.last_modified().map(SystemTime::from),
+                        }
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await
+            .with_context(|| format!("oss list '{prefix}'"))?;
+        let Some(strip) = strip else {
+            return Ok(entries);
+        };
+        Ok(entries
             .into_iter()
-            .map(|p| p.strip_prefix(&strip).unwrap_or(&p).to_string())
+            .map(|mut entry| {
+                if let Some(relative) = entry.key.strip_prefix(&strip) {
+                    entry.key = relative.to_owned();
+                }
+                entry
+            })
             .collect())
     }
 

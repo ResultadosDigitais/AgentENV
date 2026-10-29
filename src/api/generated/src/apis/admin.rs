@@ -11,6 +11,24 @@ use crate::{models, types::*};
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum AdminManagedLayersCollectPostResponse {
+    /// Successfully ran one collection pass
+    Status200_SuccessfullyRanOneCollectionPass(models::ManagedLayerCollectReport),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Forbidden
+    Status403_Forbidden(models::Error),
+    /// The pass is disabled on this node, another pass holds the lock, or enforce was requested before a report ran in this process.
+    Status409_ThePassIsDisabledOnThisNode(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum NodesGetResponse {
     /// Successfully returned all nodes
     Status200_SuccessfullyReturnedAllNodes(Vec<models::Node>),
@@ -39,6 +57,19 @@ pub enum NodesNodeIdGetResponse {
 #[allow(clippy::ptr_arg)]
 pub trait Admin<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::ErrorHandler<E> {
     type Claims;
+
+    /// Collect managed layers no record cites.
+    ///
+    /// AdminManagedLayersCollectPost - POST /admin/managed-layers/collect
+    async fn admin_managed_layers_collect_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        body: &models::ManagedLayerCollectRequest,
+    ) -> Result<AdminManagedLayersCollectPostResponse, E>;
 
     /// List nodes.
     ///

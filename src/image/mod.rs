@@ -117,6 +117,13 @@ impl PublishedImage {
         }
     }
 
+    /// The ordered layers this image owns in the repository. They are managed
+    /// layers, so a layer cited here is kept by a published image even when no
+    /// snapshot or volume record mentions it.
+    pub fn layers(&self) -> &[OverlaybdLayerRef] {
+        &self.layers
+    }
+
     pub(crate) fn encode(&self) -> Result<(String, Vec<u8>)> {
         self.validate()?;
         let mut value = serde_json::to_value(self)?;

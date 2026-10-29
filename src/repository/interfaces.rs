@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use tempfile::NamedTempFile;
@@ -68,6 +69,72 @@ pub enum DocumentChange {
 /// function of its input.
 pub type DocumentUpdate =
     Box<dyn Fn(Option<&[u8]>) -> RepositoryResult<DocumentChange> + Send + Sync>;
+
+/// One object found under `managed-layers/`.
+///
+/// [`layer_digest`] is `None` when the object name does not translate back to
+/// a `sha256:<hex>` digest, which makes the object unreachable by any record:
+/// it must never be deleted, because the substrate cannot prove what it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedLayerObject {
+    /// The repository-relative key the backend stores the object under.
+    pub key: String,
+    /// The digest the key translates back to, or `None` when it does not.
+    pub layer_digest: Option<String>,
+    /// The object's size in bytes.
+    pub bytes: u64,
+    /// When the object was last written, when the backend reports it.
+    pub last_modified: Option<SystemTime>,
+}
+
+/// How long a maintenance lock object may sit unreleased before a later pass
+/// takes it over. A pass that dies without releasing (a crash, a node lost
+/// mid-sweep) leaves its lock object behind on backends that cannot drop a lock
+/// with the process; this bound keeps the next scheduled pass from being
+/// blocked forever. It is far longer than a pass takes, so a live pass is never
+/// overtaken.
+pub const MAINTENANCE_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// A held maintenance lock. The token identifies this holder, so a release
+/// never removes a lock another pass has since taken over.
+///
+/// Dropping the lock releases whatever the backend holds: a POSIX backend holds
+/// an `flock` that the kernel drops with the process, so a pass that dies leaves
+/// no stale lock. Dropping is enough for those backends; call
+/// [`Repository::release_maintenance_lock`] so a backend that must remove a lock
+/// object can do it.
+#[derive(Debug)]
+pub struct MaintenanceLock {
+    /// The lock's name in the repository.
+    pub name: String,
+    /// This holder's token.
+    pub token: String,
+    /// Backend state that keeps the lock held for as long as it lives. It is
+    /// never read: holding it *is* the point, and dropping it releases the lock.
+    _keeper: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl MaintenanceLock {
+    pub(crate) fn new(name: String, token: String) -> Self {
+        Self {
+            name,
+            token,
+            _keeper: None,
+        }
+    }
+
+    pub(crate) fn with_keeper(
+        name: String,
+        token: String,
+        keeper: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            name,
+            token,
+            _keeper: Some(keeper),
+        }
+    }
+}
 
 fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     Err(RepositoryError::Unsupported {
@@ -182,5 +249,40 @@ pub trait Repository: Send + Sync {
         _collection: DocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         unsupported("repository documents")
+    }
+
+    /// Lists every object stored under `managed-layers/`, without following
+    /// any catalog. A record that cites a layer is the only thing that keeps
+    /// it alive, so this is what a managed-layer collection pass compares the
+    /// citation set against.
+    async fn list_managed_layers(&self) -> RepositoryResult<Vec<ManagedLayerObject>> {
+        unsupported("managed layer enumeration")
+    }
+
+    /// Removes one object listed by [`Self::list_managed_layers`], named by its
+    /// [`ManagedLayerObject::key`]. A missing object is considered success, so
+    /// a retried pass converges.
+    async fn delete_managed_layer(&self, _key: &str) -> RepositoryResult<()> {
+        unsupported("managed layer collection")
+    }
+
+    /// Takes the named maintenance lock for the lifetime of one pass, so two
+    /// passes never overlap. `Ok(None)` reports that another pass holds it.
+    ///
+    /// The lock excludes other maintenance passes only. It does not exclude
+    /// publishers: a publish uploads its layers before it writes the record
+    /// that cites them, so a pass may see a layer no record cites yet. The
+    /// collection grace period, not this lock, covers that race.
+    async fn acquire_maintenance_lock(
+        &self,
+        _name: &str,
+    ) -> RepositoryResult<Option<MaintenanceLock>> {
+        unsupported("maintenance lock")
+    }
+
+    /// Releases a lock returned by [`Self::acquire_maintenance_lock`]. A lock
+    /// left behind by a process that died is taken over by a later pass.
+    async fn release_maintenance_lock(&self, _lock: MaintenanceLock) -> RepositoryResult<()> {
+        unsupported("maintenance lock")
     }
 }
