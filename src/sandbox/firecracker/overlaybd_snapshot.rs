@@ -27,7 +27,6 @@ use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
 
 use super::process_vm_reader::ProcessVmReader;
-use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
 use crate::overlaybd::{compact_layers, create_commit_args, OverlaybdCompactOutput};
 use crate::sandbox::ublk::{UblkDevice, UblkDeviceManager};
@@ -180,21 +179,18 @@ fn local_layer_config_with_descriptor(
     }
 }
 
-/// Resolve the directories whose layers this process creates at runtime.
+/// The node-local artifact store the persister allocates paused generations from.
 ///
-/// The pause path needs them to tell its own lowers from the immutable stable
-/// prefix. They are resolved once per sandbox, at build time, from the only
-/// production sources (`firecracker.work_dir` for managed snapshots and
-/// `orchestrator.persisted_sandbox_store_path`), and passed down explicitly so
-/// a test can inject its own roots instead of mutating process-wide config.
-pub(super) fn runtime_owned_roots() -> Vec<PathBuf> {
-    let config = ConfigManager::global_config();
-    [
-        managed_snapshot_base(),
-        config.orchestrator.persisted_sandbox_store_path.clone(),
-    ]
-    .into_iter()
-    .collect()
+/// The only root that cannot be derived from the pause itself: it is chosen by
+/// the orchestrator's persister and reaches a sandbox only through this config
+/// value. The sandbox's own snapshot tree is deliberately not resolved here —
+/// `FirecrackerSandbox::runtime_owned_roots` takes it from the very directory
+/// the pause writes into.
+pub(super) fn persisted_sandbox_store_root() -> PathBuf {
+    ConfigManager::global_config()
+        .orchestrator
+        .persisted_sandbox_store_path
+        .clone()
 }
 
 /// Whether `path` lives under one of `roots`, compared in canonical form.
@@ -1083,14 +1079,10 @@ mod tests {
 
     #[test]
     fn split_runtime_suffix_preserves_stable_lowers() {
-        let config = ConfigManager::global_config();
-        let snapshot_store_root = config
-            .backend
-            .posix_fs
-            .as_ref()
-            .map(|posix_fs| posix_fs.snapshot_store.clone())
-            .unwrap_or_else(|| std::env::temp_dir().join("test_snapshot_store"));
-        let persisted_sandbox_store_root = config.orchestrator.persisted_sandbox_store_path.clone();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot_store_root = temp.path().join("snapshot-store");
+        let persisted_sandbox_store_root = temp.path().join("persisted-sandboxes");
+        let sandbox_snapshot_tree = temp.path().join("managed-snapshots").join("sandbox-self");
         let snapshot_store_lower = snapshot_store_root
             .join("managed-layers")
             .join("sha256_base.overlaybd.commit");
@@ -1100,7 +1092,9 @@ mod tests {
             .join("1700000000000")
             .join("rootfs")
             .join("snapshot.commit");
-        let managed_base_lower = managed_snapshot_base().join("sandbox/1700000000001/mem.commit");
+        let managed_base_lower = sandbox_snapshot_tree
+            .join("1700000000001")
+            .join("snapshot.commit");
         let lowers = vec![
             LayerConfig {
                 file: String::new(),
@@ -1112,8 +1106,9 @@ mod tests {
             local_layer_config(&persisted_store_lower),
             local_layer_config(&managed_base_lower),
         ];
+        let runtime_owned_roots = [sandbox_snapshot_tree, persisted_sandbox_store_root];
 
-        let (preserved, managed) = split_runtime_suffix(lowers, &runtime_owned_roots());
+        let (preserved, managed) = split_runtime_suffix(lowers, &runtime_owned_roots);
 
         assert_eq!(preserved.len(), 2);
         assert_eq!(preserved[0].file, "");

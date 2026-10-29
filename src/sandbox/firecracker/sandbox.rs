@@ -201,11 +201,18 @@ pub struct FirecrackerSandbox {
     /// stays in one place and a test can drive the pause path with its own
     /// ceiling without mutating process-wide configuration.
     chain_bytes_ceiling: u64,
-    /// Directories whose overlaybd layers this sandbox creates at runtime,
-    /// resolved once when the sandbox is built. The pause path compares each
-    /// lower against these (in canonical form) to keep its own layers in the
-    /// runtime-owned suffix, which is the only part compaction may rewrite.
-    runtime_owned_roots: Vec<PathBuf>,
+    /// Node-local artifact store the persister allocates paused generations
+    /// from, resolved once when the sandbox is built.
+    ///
+    /// The other directory whose layers this sandbox creates at runtime — its
+    /// own snapshot tree — is deliberately *not* stored here: the pause derives
+    /// it at pause time from the very value it builds its `output_dir` from, so
+    /// the root used for classification and the directory actually written
+    /// cannot diverge. Resolving it separately at build time is what classified
+    /// every adopted lower as immutable stable prefix on the KVM suite, where
+    /// the process-wide default pointed at a different home than the sandbox
+    /// actually paused into.
+    persisted_sandbox_store_root: PathBuf,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -720,16 +727,13 @@ impl FirecrackerSandbox {
         self
     }
 
-    /// Override the directories whose layers this sandbox creates at runtime.
+    /// Override the node-local artifact store used as a runtime-owned root.
     ///
-    /// Production never calls this: [`FirecrackerSandbox::build`] resolves them
-    /// once from `firecracker.work_dir` (managed snapshots) and
-    /// `orchestrator.persisted_sandbox_store_path`. The pause path needs them to
-    /// keep its own lowers in the runtime-owned suffix; a root that does not
-    /// match leaves every pause-created layer looking immutable, which is what
-    /// let a chain grow past the byte ceiling until the pause was rejected.
-    pub fn with_runtime_owned_roots(mut self, runtime_owned_roots: Vec<PathBuf>) -> Self {
-        self.runtime_owned_roots = runtime_owned_roots;
+    /// Production never calls this: [`FirecrackerSandbox::build`] fills it from
+    /// `orchestrator.persisted_sandbox_store_path`. The sandbox's own snapshot
+    /// tree needs no override — the pause takes it from the root it writes into.
+    pub fn with_persisted_sandbox_store_root(mut self, root: PathBuf) -> Self {
+        self.persisted_sandbox_store_root = root;
         self
     }
 
@@ -1036,6 +1040,12 @@ impl FirecrackerSandbox {
         &self,
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
+        // `snapshot_dir` is the exact directory this pause adopts its lowers
+        // into (`inherited-layers/` for memory, `rootfs/inherited-layers/` for
+        // the rootfs). Naming it as a runtime-owned root ties the classification
+        // to the directory actually written, instead of to a separately
+        // resolved tree that can point at another home.
+        let runtime_owned_roots = self.runtime_owned_roots(Some(snapshot_dir));
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
         // Local layers are always captured raw; when enabled, compression
         // happens once at publish time under `[snapshot.publish_compression]`.
@@ -1058,7 +1068,7 @@ impl FirecrackerSandbox {
             snapshot_dir,
             OverlaybdCompactOutput::Raw,
             self.chain_bytes_ceiling,
-            &self.runtime_owned_roots,
+            &runtime_owned_roots,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -1102,7 +1112,7 @@ impl FirecrackerSandbox {
                 &rootfs_runtime.image_config_path,
                 snapshot_dir,
                 self.chain_bytes_ceiling,
-                &self.runtime_owned_roots,
+                &runtime_owned_roots,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
@@ -1332,9 +1342,70 @@ impl FirecrackerSandbox {
     }
 
     fn new_managed_persistent_snapshot_root(&self) -> Arc<PersistentSnapshotRootGuard> {
-        let sandbox_dir = self.id.to_string();
-        let root = managed_snapshot_base().join(sandbox_dir);
-        Arc::new(PersistentSnapshotRootGuard::new(root))
+        Arc::new(PersistentSnapshotRootGuard::new(
+            self.managed_snapshot_root_path(),
+        ))
+    }
+
+    /// The managed-snapshot base this sandbox pauses under.
+    ///
+    /// Taken from the sandbox's own launch work base — the same value
+    /// [`create_firecracker_work_dir`] places the VM's work directory under —
+    /// instead of the process-wide config. A resumed sandbox can carry a work
+    /// base that differs from whatever the global config resolves at this
+    /// moment (a test process whose home moved, a node reconfigured between
+    /// boots), and reading the global config here is exactly what made the
+    /// classification disagree with the directory the pause wrote into.
+    fn managed_snapshot_base_path(&self) -> PathBuf {
+        self.launch
+            .common()
+            .firecracker_work_base_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("aenv"))
+            .join("managed-snapshots")
+    }
+
+    /// The managed-snapshot directory this sandbox pauses into when it owns one.
+    ///
+    /// Single source for both the root guard the pause creates and the
+    /// runtime-owned classification, so the two can never name different trees.
+    fn managed_snapshot_root_path(&self) -> PathBuf {
+        self.managed_snapshot_base_path().join(self.id.to_string())
+    }
+
+    /// The snapshot tree this sandbox pauses into, whether it inherited one from
+    /// a parent snapshot or owns a per-sandbox directory.
+    ///
+    /// Derived from the launch state and the same root
+    /// [`Self::live_snapshot_root`] resolves, never from a second read of the
+    /// global config: the pause adopts its lowers under this tree, so a tree
+    /// named here that differs from the one the pause writes into classifies
+    /// every adopted lower as immutable stable prefix.
+    fn sandbox_snapshot_tree(&self) -> PathBuf {
+        if let Some(root) = &self.live_snapshot_root {
+            return root.path().to_path_buf();
+        }
+        match self.launch.managed_snapshot_root() {
+            Some(root) => root.path().to_path_buf(),
+            None => self.managed_snapshot_root_path(),
+        }
+    }
+
+    /// Directories whose overlaybd layers this sandbox's pauses create.
+    ///
+    /// `pause_output_dir` is this generation's snapshot directory; including it
+    /// means the lowers a pause adopts under `<output_dir>/inherited-layers`
+    /// stay runtime-owned whatever tree the caller chose for the pause, which
+    /// is exactly the pairing that has to hold for the ceiling to compact them.
+    fn runtime_owned_roots(&self, pause_output_dir: Option<&Path>) -> Vec<PathBuf> {
+        let mut roots = vec![
+            self.sandbox_snapshot_tree(),
+            self.persisted_sandbox_store_root.clone(),
+        ];
+        if let Some(dir) = pause_output_dir {
+            roots.push(dir.to_path_buf());
+        }
+        roots
     }
 
     async fn live_snapshot_root(&mut self) -> Result<Arc<PersistentSnapshotRootGuard>> {
@@ -1518,7 +1589,7 @@ impl FirecrackerSandbox {
             chain_bytes_ceiling: ConfigManager::global_config()
                 .orchestrator
                 .chain_bytes_ceiling,
-            runtime_owned_roots: super::overlaybd_snapshot::runtime_owned_roots(),
+            persisted_sandbox_store_root: super::overlaybd_snapshot::persisted_sandbox_store_root(),
         })
     }
 
@@ -2404,6 +2475,10 @@ impl FirecrackerSandbox {
                 || "snapshot.commit".to_owned(),
                 |_| format!("snapshot-{}.commit", Uuid::now_v7().simple()),
             );
+            // Drive layers are adopted under this drive's own output dir, so it
+            // joins the runtime-owned roots for the same reason the pause's
+            // snapshot dir does.
+            let runtime_owned_roots = self.runtime_owned_roots(Some(&output_dir));
             let snapshot_image_config_path =
                 restack_snapshot_overlaybd_device(RestackSnapshotDevice {
                     ublk_device: &runtime.device,
@@ -2413,7 +2488,7 @@ impl FirecrackerSandbox {
                     snapshot_layer_file_name: &snapshot_layer_file_name,
                     kind: "drive",
                     chain_bytes_ceiling: self.chain_bytes_ceiling,
-                    runtime_owned_roots: &self.runtime_owned_roots,
+                    runtime_owned_roots: &runtime_owned_roots,
                 })
                 .await
                 .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -2455,6 +2530,7 @@ impl FirecrackerSandbox {
                 continue;
             }
             let snapshot_layer_file_name = format!("snapshot-{}.commit", Uuid::now_v7().simple());
+            let runtime_owned_roots = self.runtime_owned_roots(Some(output_dir));
             restack_snapshot_overlaybd_device(RestackSnapshotDevice {
                 ublk_device: &runtime.device,
                 read_only: false,
@@ -2463,7 +2539,7 @@ impl FirecrackerSandbox {
                 snapshot_layer_file_name: &snapshot_layer_file_name,
                 kind: "volume",
                 chain_bytes_ceiling: self.chain_bytes_ceiling,
-                runtime_owned_roots: &self.runtime_owned_roots,
+                runtime_owned_roots: &runtime_owned_roots,
             })
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
@@ -2847,6 +2923,65 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// The roots used to classify a pause's lowers must follow the directory the
+    /// pause actually writes into, not the process-wide default.
+    ///
+    /// This is the KVM-suite shape: the test process's global config points the
+    /// managed-snapshot base at one home while the sandbox pauses into another
+    /// (`/tmp/aenv-test-<run>/home/firecracker-work/...`). When the roots were
+    /// resolved from the global config, every adopted lower looked like
+    /// immutable stable prefix, compaction only re-committed the newest
+    /// generation, and the byte ceiling eventually rejected the pause.
+    #[test]
+    fn runtime_owned_roots_follow_the_pause_tree_not_the_global_config() {
+        let root = TempDir::new().expect("tempdir");
+        // The sandbox's own firecracker work base, deliberately not the global
+        // one, exactly like a test process whose AENV_HOME_PATH differs from the
+        // managed-snapshot base the global config resolves.
+        let sandbox_work_base = root.path().join("home").join("firecracker-work");
+        let mut config = fresh_config();
+        config.common.firecracker_work_base_dir = Some(sandbox_work_base.clone());
+        let sandbox = FirecrackerSandbox::new(config).expect("sandbox");
+
+        let sandbox_tree = sandbox_work_base
+            .join("managed-snapshots")
+            .join(sandbox.sandbox_id().to_string());
+        let global_tree = managed_snapshot_base().join(sandbox.sandbox_id().to_string());
+        assert_ne!(
+            sandbox_tree, global_tree,
+            "the test must exercise a sandbox tree that differs from the global default"
+        );
+
+        // A pause writes generation `<uuid>/` under the sandbox's own tree.
+        let output_dir = sandbox_tree.join("0199a000-0000-7000-8000-000000000000");
+        let roots = sandbox.runtime_owned_roots(Some(&output_dir));
+
+        assert!(
+            roots.contains(&sandbox_tree),
+            "the sandbox's own snapshot tree must be a runtime-owned root: {roots:?}"
+        );
+        assert!(
+            roots.contains(&output_dir),
+            "the directory this pause writes into must be a runtime-owned root: {roots:?}"
+        );
+        assert!(
+            !roots.contains(&global_tree),
+            "the process-wide default must not be used to classify this pause: {roots:?}"
+        );
+
+        // The adopted lower lands under `<output_dir>/inherited-layers/`, which
+        // is what the pause rewrites when compaction has to merge it.
+        let adopted = output_dir
+            .join("inherited-layers")
+            .join("0000")
+            .join("mem.commit");
+        assert!(
+            adopted.starts_with(&sandbox_tree),
+            "an adopted lower must classify as runtime-owned, got {}",
+            adopted.display()
+        );
     }
 
     #[test]
