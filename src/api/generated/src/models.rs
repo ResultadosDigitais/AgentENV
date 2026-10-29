@@ -3655,6 +3655,10 @@ pub struct ManagedLayerCollectReport {
     #[serde(rename = "unreadableLayers")]
     pub unreadable_layers: u64,
 
+    /// Layers the pass could not classify because the citation set was unknowable (a live sandbox whose source left the catalog, or an unreadable record). They are neither cited nor orphaned, and are never deleted.
+    #[serde(rename = "unknownLayers")]
+    pub unknown_layers: u64,
+
     /// Layers actually removed. Always zero in report mode.
     #[serde(rename = "deletedLayers")]
     pub deleted_layers: u64,
@@ -3686,6 +3690,7 @@ impl ManagedLayerCollectReport {
         orphan_bytes: u64,
         unexpired_layers: u64,
         unreadable_layers: u64,
+        unknown_layers: u64,
         deleted_layers: u64,
         reclaimed_bytes: u64,
     ) -> ManagedLayerCollectReport {
@@ -3697,6 +3702,7 @@ impl ManagedLayerCollectReport {
             orphan_bytes,
             unexpired_layers,
             unreadable_layers,
+            unknown_layers,
             deleted_layers,
             reclaimed_bytes,
             downgraded_reason: None,
@@ -3724,6 +3730,8 @@ impl std::fmt::Display for ManagedLayerCollectReport {
             Some(self.unexpired_layers.to_string()),
             Some("unreadableLayers".to_string()),
             Some(self.unreadable_layers.to_string()),
+            Some("unknownLayers".to_string()),
+            Some(self.unknown_layers.to_string()),
             Some("deletedLayers".to_string()),
             Some(self.deleted_layers.to_string()),
             Some("reclaimedBytes".to_string()),
@@ -3764,6 +3772,7 @@ impl std::str::FromStr for ManagedLayerCollectReport {
             pub orphan_bytes: Vec<u64>,
             pub unexpired_layers: Vec<u64>,
             pub unreadable_layers: Vec<u64>,
+            pub unknown_layers: Vec<u64>,
             pub deleted_layers: Vec<u64>,
             pub reclaimed_bytes: Vec<u64>,
             pub downgraded_reason: Vec<String>,
@@ -3803,6 +3812,8 @@ impl std::str::FromStr for ManagedLayerCollectReport {
                     "unexpiredLayers" => intermediate_rep.unexpired_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     #[allow(clippy::redundant_clone)]
                     "unreadableLayers" => intermediate_rep.unreadable_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "unknownLayers" => intermediate_rep.unknown_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     #[allow(clippy::redundant_clone)]
                     "deletedLayers" => intermediate_rep.deleted_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     #[allow(clippy::redundant_clone)]
@@ -3859,6 +3870,11 @@ impl std::str::FromStr for ManagedLayerCollectReport {
                 .ok_or_else(|| {
                     "unreadableLayers missing in ManagedLayerCollectReport".to_string()
                 })?,
+            unknown_layers: intermediate_rep
+                .unknown_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "unknownLayers missing in ManagedLayerCollectReport".to_string())?,
             deleted_layers: intermediate_rep
                 .deleted_layers
                 .into_iter()

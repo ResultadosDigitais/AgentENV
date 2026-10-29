@@ -289,6 +289,7 @@ impl From<ManagedLayerCollectReport> for models::ManagedLayerCollectReport {
             orphan_layers: report.orphan_layers,
             orphan_bytes: report.orphan_bytes,
             unexpired_layers: report.unexpired_layers,
+            unknown_layers: report.unknown_layers,
             unreadable_layers: report.unreadable_layers,
             deleted_layers: report.deleted_layers,
             reclaimed_bytes: report.reclaimed_bytes,

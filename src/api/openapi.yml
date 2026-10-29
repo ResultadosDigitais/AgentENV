@@ -1630,6 +1630,7 @@ components:
         - orphanBytes
         - unexpiredLayers
         - unreadableLayers
+        - unknownLayers
         - deletedLayers
         - reclaimedBytes
       properties:
@@ -1661,6 +1662,14 @@ components:
           description: >-
             Objects under managed-layers/ whose name is not a digest. They are
             never deleted, because the substrate cannot prove what they are.
+        unknownLayers:
+          type: integer
+          format: uint64
+          description: >-
+            Layers the pass could not classify because the citation set was
+            unknowable (a live sandbox whose source left the catalog, or an
+            unreadable record). They are neither cited nor orphaned, and are
+            never deleted.
         deletedLayers:
           type: integer
           format: uint64

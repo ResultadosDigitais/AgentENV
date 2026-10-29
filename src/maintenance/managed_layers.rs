@@ -109,6 +109,9 @@ pub struct ManagedLayerCollectReport {
     pub unexpired_layers: u64,
     /// Objects whose name is not a digest, so they are never deleted.
     pub unreadable_layers: u64,
+    /// Layers the pass could not classify because the citation set was
+    /// unknowable. They are neither cited nor orphaned, and never deleted.
+    pub unknown_layers: u64,
     /// Layers actually removed. Always zero in report mode.
     pub deleted_layers: u64,
     /// Bytes actually removed. Always zero in report mode.
@@ -182,19 +185,17 @@ where
         mode: Some(request.mode),
         ..ManagedLayerCollectReport::default()
     };
-    let mut cited = cited_layer_digests(repository, live, &mut report).await;
+    let cited = cited_layer_digests(repository, live, &mut report).await;
 
-    // A live sandbox reading a source that is gone makes the citation set
-    // unknowable: the source's layers may still be read on demand.
-    if report.downgraded_reason.is_some() {
-        cited.clear();
-    }
+    // When the citation set is unknowable, no layer can be proven uncited, so
+    // nothing is classified as an orphan and nothing is deleted. The pass still
+    // lists the bucket, so an operator sees what it covers.
+    let knowable = report.downgraded_reason.is_none();
 
     let objects = repository.list_managed_layers().await?;
     // Enforce only when the citation set is trustworthy and the request asked
     // for it.
-    let enforce =
-        request.mode == ManagedLayerCollectMode::Enforce && report.downgraded_reason.is_none();
+    let enforce = request.mode == ManagedLayerCollectMode::Enforce && knowable;
 
     let mut to_delete = Vec::new();
     for object in objects {
@@ -204,6 +205,11 @@ where
             report.unreadable_layers += 1;
             continue;
         };
+        if !knowable {
+            // Not an orphan and not cited either: the pass cannot tell.
+            report.unknown_layers += 1;
+            continue;
+        }
         if cited.contains(digest) {
             report.cited_layers += 1;
             report.cited_bytes += object.bytes;
@@ -247,6 +253,7 @@ where
         orphan_bytes = report.orphan_bytes,
         unexpired_layers = report.unexpired_layers,
         unreadable_layers = report.unreadable_layers,
+        unknown_layers = report.unknown_layers,
         deleted_layers = report.deleted_layers,
         reclaimed_bytes = report.reclaimed_bytes,
         failures = report.failures.len(),
@@ -278,6 +285,8 @@ fn record_pass_metrics(report: &ManagedLayerCollectReport, elapsed: Duration) {
         .set(report.unexpired_layers as f64);
     metrics::gauge!("agentenv_managed_layer_unreadable_layers", "mode" => mode)
         .set(report.unreadable_layers as f64);
+    metrics::gauge!("agentenv_managed_layer_unknown_layers", "mode" => mode)
+        .set(report.unknown_layers as f64);
     metrics::counter!("agentenv_managed_layer_collect_reclaimed_bytes_total", "mode" => mode)
         .increment(report.reclaimed_bytes);
     metrics::counter!("agentenv_managed_layer_collect_deleted_layers_total", "mode" => mode)
