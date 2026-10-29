@@ -959,7 +959,6 @@ mod tests {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
         let metadata = SandboxMetadata::default();
-        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
 
         // The first generation holds the artifact the child keeps open; every
         // later generation sees it with a link count above 1.

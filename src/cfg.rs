@@ -1928,6 +1928,74 @@ mod tests {
         );
     }
 
+    /// `chain_bytes_ceiling` is bound to its own env var, ships the provisional
+    /// 48 GiB default, and accepts `0` as the documented disabled value.
+    #[test]
+    fn chain_bytes_ceiling_default_env_binding_and_disabled_value() -> Result<()> {
+        fn find_leaf(
+            meta: &confique::meta::Meta,
+            prefix: &str,
+            wanted: &str,
+        ) -> Option<(Option<&'static str>, Option<confique::meta::Expr>)> {
+            for field in meta.fields {
+                let path = if prefix.is_empty() {
+                    field.name.to_string()
+                } else {
+                    format!("{prefix}.{}", field.name)
+                };
+                match field.kind {
+                    confique::meta::FieldKind::Leaf { env, kind } => {
+                        if path == wanted {
+                            let default = match kind {
+                                confique::meta::LeafKind::Required { default } => default,
+                                confique::meta::LeafKind::Optional => None,
+                            };
+                            return Some((env, default));
+                        }
+                    }
+                    confique::meta::FieldKind::Nested { meta } => {
+                        if let Some(found) = find_leaf(meta, &path, wanted) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let (env, default) = find_leaf(&AppConfig::META, "", "orchestrator.chain_bytes_ceiling")
+            .expect("orchestrator.chain_bytes_ceiling must exist in the schema");
+        assert_eq!(
+            env,
+            Some("AENV_CHAIN_BYTES_CEILING"),
+            "the knob must be overridable by its own documented env var"
+        );
+        assert_eq!(
+            default,
+            Some(confique::meta::Expr::Integer(confique::meta::Integer::U64(
+                48 * 1024 * 1024 * 1024
+            ))),
+            "the default must be the provisional 48 GiB ceiling in bytes"
+        );
+
+        // The shipped config file carries the same value, so a node reading
+        // `config/default.toml` and a node relying on the schema default agree.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert_eq!(
+            config.config().orchestrator.chain_bytes_ceiling,
+            48 * 1024 * 1024 * 1024
+        );
+
+        // `0` is a legal value: it is the kill switch, not a validation error.
+        let temp = tempdir()?;
+        let disabled_path = temp.path().join("disabled.toml");
+        std::fs::write(&disabled_path, "[orchestrator]\nchain_bytes_ceiling = 0\n")?;
+        let disabled = ConfigManager::new_from_path(&disabled_path)?;
+        assert_eq!(disabled.config().orchestrator.chain_bytes_ceiling, 0);
+        Ok(())
+    }
+
     #[test]
     fn resolve_path_joins_relative_paths_against_config_dir() -> Result<()> {
         let temp = tempdir()?;
