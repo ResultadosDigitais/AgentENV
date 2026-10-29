@@ -1105,6 +1105,65 @@ mod tests {
         assert_eq!(PathBuf::from(&managed[1].file), managed_base_lower);
     }
 
+    /// A runtime-owned root must be matched in its canonical form even when the
+    /// caller handed it over through a symlinked (or otherwise non-canonical)
+    /// prefix, and even when the root did not exist when the caller resolved it.
+    ///
+    /// This is the shape that strandded rootfs generations in the stable prefix
+    /// on the KVM suite: `split_runtime_suffix` canonicalized each lower but
+    /// compared it against a root captured raw, so no lower ever matched, the
+    /// whole chain looked immutable, and compaction only re-committed the newest
+    /// generation until the byte ceiling rejected the pause outright.
+    #[test]
+    fn split_runtime_suffix_matches_a_root_through_a_symlinked_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_root = temp.path().join("real").join("persisted-sandboxes");
+        let symlink = temp.path().join("link");
+        std::os::unix::fs::symlink(temp.path().join("real"), &symlink).expect("create symlink");
+
+        // The root is resolved before the directory exists, exactly like the
+        // process-wide roots cache filled at startup: canonicalization must
+        // degrade to the raw path instead of failing.
+        let unresolved_root = symlink.join("persisted-sandboxes");
+        assert!(
+            !unresolved_root.exists(),
+            "the root must not exist when the caller resolves it"
+        );
+
+        std::fs::create_dir_all(real_root.join("artifacts").join("sandbox-a").join("gen1"))
+            .expect("create runtime root");
+        let runtime_lower = real_root
+            .join("artifacts")
+            .join("sandbox-a")
+            .join("gen1")
+            .join("rootfs.commit");
+        std::fs::write(&runtime_lower, b"runtime lower").expect("write runtime lower");
+        let stable_lower = temp.path().join("image-cache").join("base.overlaybd.commit");
+        std::fs::create_dir_all(stable_lower.parent().unwrap()).expect("create cache root");
+        std::fs::write(&stable_lower, b"stable lower").expect("write stable lower");
+
+        let lowers = vec![
+            local_layer_config(&stable_lower),
+            local_layer_config(&runtime_lower),
+        ];
+        let runtime_owned_roots = [unresolved_root];
+
+        let (preserved, runtime_owned) = split_runtime_suffix(lowers, &runtime_owned_roots);
+
+        assert_eq!(
+            preserved.len(),
+            1,
+            "only the cache-owned layer is a stable lower, got {preserved:#?}"
+        );
+        assert_eq!(PathBuf::from(&preserved[0].file), stable_lower);
+        assert_eq!(
+            runtime_owned.len(),
+            1,
+            "the lower under the symlinked root must stay runtime-owned, got {runtime_owned:#?}"
+        );
+        assert_eq!(PathBuf::from(&runtime_owned[0].file), runtime_lower);
+    }
+
     #[tokio::test]
     async fn snapshot_adopts_persisted_runtime_suffix_by_link() {
         let temp = tempfile::tempdir().expect("tempdir");
