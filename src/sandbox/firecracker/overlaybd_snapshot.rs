@@ -620,9 +620,15 @@ async fn rewrite_lowers_with_runtime_roots(
         };
         // Measure the parts before compaction folds them into one layer: the
         // rejection has to state whether the bytes it refused live in an
-        // untouchable prefix or in a compacted layer that did not shrink.
-        let appended_bytes =
-            chain_allocated_bytes(appended_layer.iter().map(|layer| Path::new(&layer.file)));
+        // untouchable prefix or in a compacted layer that did not shrink. A
+        // ceiling of 0 keeps the pre-ceiling cost too, so nothing is measured
+        // when enforcement is disabled.
+        let ceiling_enforced = chain_bytes_ceiling != 0;
+        let appended_bytes = if ceiling_enforced {
+            chain_allocated_bytes(appended_layer.iter().map(|layer| Path::new(&layer.file)))
+        } else {
+            0
+        };
         let compacted_lowers = compactable.len() + usize::from(appended_layer.is_some());
         if let Some(layer) = appended_layer {
             compactable.push(layer);
@@ -630,8 +636,11 @@ async fn rewrite_lowers_with_runtime_roots(
         if compactable.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
         }
-        let stable_prefix_bytes =
-            chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)));
+        let stable_prefix_bytes = if ceiling_enforced {
+            chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)))
+        } else {
+            0
+        };
         let compacted_path = compact_layers(
             &compactable,
             &output_dir.join(compaction_output_name),
@@ -645,16 +654,20 @@ async fn rewrite_lowers_with_runtime_roots(
             stable_prefix_lowers: lowers.len(),
             stable_prefix_bytes,
             compacted_lowers,
-            compacted_bytes: compacted_path
-                .as_deref()
-                .map(|path| chain_allocated_bytes([path]))
-                .unwrap_or(0),
+            compacted_bytes: if ceiling_enforced {
+                compacted_path
+                    .as_deref()
+                    .map(|path| chain_allocated_bytes([path]))
+                    .unwrap_or(0)
+            } else {
+                0
+            },
             appended_bytes,
         };
         if let Some(compacted_path) = compacted_path.as_ref() {
             lowers.push(local_layer_config(compacted_path));
         }
-        if chain_bytes_ceiling != 0 {
+        if ceiling_enforced {
             // The stable prefix is immutable, so compaction cannot reclaim it.
             // Re-measure the result and refuse the pause by name when even the
             // compacted chain is still over the ceiling.
