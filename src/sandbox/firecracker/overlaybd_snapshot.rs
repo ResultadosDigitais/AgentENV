@@ -1499,27 +1499,37 @@ mod tests {
     ///
     /// These are the numbers the staging run of
     /// `ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling` rejected on:
-    /// a chain that compacts its runtime-owned lowers into a 2.30 GiB layer and
-    /// appends a 0.50 GiB layer, against a 2.64 GiB ceiling, still carried a
-    /// 0.64 GiB stable prefix. Charging the prefix as well put the total at
-    /// 2.81 GiB and refused the pause, although the part that grows pause by
-    /// pause was 0.59 GiB under the ceiling. The prefix is materialized once
-    /// from the image and shared by every sandbox of it, so counting it here
-    /// charged the node's disk once per sandbox and rejected a chain that had
-    /// already been brought under the ceiling by compaction.
+    /// a chain whose runtime-owned lowers compacted into a 2,408,116,224 byte
+    /// layer, against a 2,838,224,896 byte ceiling, whose chain also carried a
+    /// 690,716,672 byte stable prefix. Charging the prefix as well put the total
+    /// at 3,098,832,896 bytes and refused the pause, although the part that
+    /// grows pause by pause was 430,108,672 bytes under the ceiling. The prefix
+    /// is materialized once from the image and shared by every sandbox of it, so
+    /// counting it here charged the node's disk once per sandbox and rejected a
+    /// chain that had already been brought under the ceiling by compaction.
     #[test]
     fn chain_ceiling_charges_the_reclaimable_part_and_not_the_shared_prefix() {
-        // Verbatim from the rejected staging pause. The rule before this change
-        // charged the prefix too, so it computed 3_098_832_896 bytes — the exact
-        // figure the fork CI reported — against a 2_838_224_896 byte ceiling.
+        // Verbatim from the rejected staging pause.
         let stable_prefix_bytes = 690_716_672u64;
         let compacted_bytes = 2_408_116_224u64;
         let appended_bytes = 536_989_696u64;
         let ceiling_bytes = 2_838_224_896u64;
-        // The old rule, kept as the red case: it refuses the pause.
+
+        // The rule before this change charged every lower after compaction, and
+        // the compacted layer already contains the appended one, so it computed
+        // exactly the figure the fork CI reported.
+        let old_total = stable_prefix_bytes + compacted_bytes;
+        assert_eq!(
+            old_total, 3_098_832_896,
+            "the red case must reproduce the rejected total verbatim"
+        );
         assert!(
-            stable_prefix_bytes + compacted_bytes + appended_bytes > ceiling_bytes,
+            old_total > ceiling_bytes,
             "the fixture must be the rejected shape: total above the ceiling"
+        );
+        assert!(
+            appended_bytes < compacted_bytes,
+            "the appended layer is folded into the compacted one, never added beside it"
         );
 
         // Compaction folds the appended layer into the generation it writes, so
