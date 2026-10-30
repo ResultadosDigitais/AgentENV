@@ -1422,6 +1422,76 @@ mod tests {
         super::chain_allocated_bytes(paths.iter().map(PathBuf::as_path))
     }
 
+    /// A chain whose every lower is runtime-owned must be compacted, not
+    /// refused, when it crosses the ceiling.
+    ///
+    /// The ceiling path has to classify with the very predicate the diagnostic
+    /// reports. When it instead measured a "stable prefix" the diagnostic never
+    /// printed (the chain is runtime-owned end to end), the projection was the
+    /// whole chain plus the appended layer, no suffix was left to compact, and
+    /// the pause was refused by name although compaction would have fit.
+    #[tokio::test]
+    async fn rewrite_all_runtime_owned_chain_above_ceiling_compacts_and_succeeds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // Four runtime-owned generations, each rewriting the same two pages, so
+        // one compacted generation deduplicates them and lands below the chain.
+        let mut lowers = Vec::new();
+        for (index, byte) in [0xAAu8, 0xBB, 0xCC, 0xDD].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("gen-{index}"),
+                8192,
+                &[(0, byte), (4096, byte)],
+            )
+            .await;
+            lowers.push(local_layer_config(&path));
+        }
+        // The layer this pause appends. Its bytes belong to the chain, so the
+        // ceiling has to account for it without it being compactable on its own.
+        let appended = seal_raw_test_layer(&runtime_root, "appended", 8192, &[(0, 0xEE)]).await;
+        let chain: Vec<PathBuf> = lowers
+            .iter()
+            .map(|lower| PathBuf::from(&lower.file))
+            .chain(std::iter::once(appended.clone()))
+            .collect();
+        let chain_bytes = chain_allocated_bytes(&chain);
+        assert!(chain_bytes > 0, "sealed layers must allocate bytes");
+        // Above one compacted generation, below the chain: compaction fits, the
+        // raw chain does not. Every lower is runtime-owned, so there is no
+        // stable prefix to blame.
+        let ceiling = chain_bytes * 3 / 4;
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            Some(local_layer_config(&appended)),
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ceiling,
+        )
+        .await
+        .expect("a fully runtime-owned chain above the ceiling must compact, not fail");
+
+        assert_eq!(
+            rewritten.len(),
+            1,
+            "the whole runtime-owned chain must collapse into one generation, got {rewritten:#?}"
+        );
+        let compacted = PathBuf::from(&rewritten[0].file);
+        assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
+        assert!(
+            chain_allocated_bytes(std::slice::from_ref(&compacted)) <= ceiling,
+            "the compacted generation must fit under the ceiling"
+        );
+    }
+
     /// A chain above the byte ceiling must collapse the runtime-owned suffix
     /// into one complete generation even though the layer-count budget alone
     /// would keep adopting it layer by layer.
