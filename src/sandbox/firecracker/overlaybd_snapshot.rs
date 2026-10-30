@@ -92,13 +92,19 @@ impl ChainByteAccounting {
     ) -> Self {
         let (stable_prefix, runtime_owned) =
             split_chain_by_classification(chain, runtime_owned_roots);
-        let stable_prefix_bytes =
-            chain_allocated_bytes(stable_prefix.iter().map(|lower| Path::new(&lower.file)));
-        let reclaimable_bytes = chain_allocated_bytes(
+        // One inode set for both parts: a layer hardlinked into the prefix and
+        // the suffix belongs to the chain once, not once per part.
+        let mut seen = std::collections::HashSet::new();
+        let stable_prefix_bytes = chain_allocated_bytes_deduped(
+            stable_prefix.iter().map(|lower| Path::new(&lower.file)),
+            &mut seen,
+        );
+        let reclaimable_bytes = chain_allocated_bytes_deduped(
             runtime_owned
                 .iter()
                 .chain(appended_layer)
                 .map(|lower| Path::new(&lower.file)),
+            &mut seen,
         );
         Self {
             reclaimable_bytes,
@@ -227,6 +233,20 @@ mod chain_metrics {
 /// chain and therefore never triggers a spurious compaction.
 fn chain_allocated_bytes<'a>(paths: impl IntoIterator<Item = &'a Path>) -> u64 {
     let mut seen = std::collections::HashSet::new();
+    chain_allocated_bytes_deduped(paths, &mut seen)
+}
+
+/// [`chain_allocated_bytes`] against a caller-owned inode set.
+///
+/// The two parts of a chain are measured separately, so a layer that is
+/// hardlinked into both — the prefix and the runtime suffix can share an inode
+/// when a pause adopts a prefix layer by link — would be counted once in each
+/// part and twice in their sum. Sharing one `seen` set across the parts keeps
+/// the chain-wide deduplication the single-call form already guarantees.
+fn chain_allocated_bytes_deduped<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    seen: &mut std::collections::HashSet<(u64, u64)>,
+) -> u64 {
     let mut total = 0u64;
     for path in paths {
         if path.as_os_str().is_empty() {
@@ -1569,6 +1589,60 @@ mod tests {
             Some(ceiling_bytes + 1),
             "a shared prefix above the ceiling is still a breach, judged on its own"
         );
+    }
+
+    /// A layer hardlinked into both parts of a chain must be charged once.
+    ///
+    /// The parts are measured separately, so a shared inode set is what stops
+    /// the same layer appearing in the prefix total and in the reclaimable
+    /// total. Without it the chain over-reports by that layer's bytes and the
+    /// ceiling refuses a pause the node's disk would have tolerated.
+    #[test]
+    fn chain_accounting_counts_a_layer_hardlinked_into_both_parts_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let cache_root = temp.path().join("image-cache");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&cache_root).expect("create cache root");
+
+        let layer = cache_root.join("sha256-shared.overlaybd.commit");
+        std::fs::write(&layer, vec![0x5Au8; 65536]).expect("write shared layer");
+        // The same inode reachable from the runtime-owned tree.
+        let adopted = runtime_root.join("inherited-layers").join("0000");
+        std::fs::create_dir_all(&adopted).expect("create adopted dir");
+        let adopted = adopted.join("overlaybd.commit");
+        std::fs::hard_link(&layer, &adopted).expect("hardlink the layer into the suffix");
+
+        let chain = vec![
+            local_layer_config(&layer),
+            local_layer_config(&adopted),
+            LayerConfig {
+                file: String::new(),
+                digest: "sha256:remote".to_string(),
+                size: 4096,
+                ..Default::default()
+            },
+        ];
+        let roots = [runtime_root.canonicalize().unwrap()];
+        let accounting = super::ChainByteAccounting::measure(chain.clone(), None, &roots);
+
+        let chain_bytes = chain_allocated_bytes(
+            &chain
+                .iter()
+                .map(|lower| PathBuf::from(&lower.file))
+                .collect::<Vec<_>>(),
+        );
+        assert!(chain_bytes > 0);
+        assert_eq!(
+            accounting.stable_prefix_bytes + accounting.reclaimable_bytes,
+            chain_bytes,
+            "the two parts must sum to the chain, so the shared inode is charged once"
+        );
+        // The prefix is measured first, so the shared inode lands there: the
+        // bytes already exist for the image, and leaving them out of the
+        // reclaimable part keeps the ceiling from charging them as pause growth.
+        assert_eq!(accounting.stable_prefix_bytes, chain_bytes);
+        assert_eq!(accounting.reclaimable_bytes, 0);
     }
 
     /// The same rejected shape through the rewrite: a runtime-owned suffix that
