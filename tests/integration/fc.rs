@@ -963,40 +963,70 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
         output.stderr
     );
 
-    // One pause carrying one unique region sizes the ceiling from measurement
-    // instead of a guess. The ceiling HOLDS one generation — the chain of this
-    // pause fits it — and does not hold two, which is what makes the next pause's
-    // rejection a statement about compaction rather than about a ceiling that was
-    // simply too small.
+    // Two measured pauses, because the number the rejection depends on is the
+    // MARGINAL growth of a unique region, not the size of the base chain: the base
+    // chain of a freshly booted guest already carries everything the boot touched,
+    // so a ceiling derived from it would sit far above any single extra region and
+    // the pause would never be refused.
+    //
+    // Pause A carries one unique region and defines the base chain. Pause B adds a
+    // second one; the difference between their reclaimable parts is what one more
+    // disjoint region costs this chain, and compaction can never reclaim it.
     write_unique_chain_data(&mut sandbox, unique_mib, 0).await?;
-    let current = FirecrackerSandbox::pause(&mut sandbox).await?;
-    let (base_mem_reclaimable, base_mem_prefix) = memory_chain_parts(&sandbox, &current)?;
-    let (base_rootfs_reclaimable, base_rootfs_prefix) = rootfs_chain_parts(&sandbox, &current)?;
+    let base_snapshot = FirecrackerSandbox::pause(&mut sandbox).await?;
+    let (base_mem_reclaimable, base_mem_prefix) = memory_chain_parts(&sandbox, &base_snapshot)?;
+    let (base_rootfs_reclaimable, base_rootfs_prefix) =
+        rootfs_chain_parts(&sandbox, &base_snapshot)?;
     assert!(
         base_mem_reclaimable > 0,
         "the unique region must allocate a memory generation to bound"
     );
+    let mut measure_sandbox =
+        FirecrackerSandbox::from_snapshot_config(&base_snapshot)?.with_chain_bytes_ceiling(0);
+    measure_sandbox.start().await?;
+    write_unique_chain_data(&mut measure_sandbox, unique_mib, 1).await?;
+    let grown_snapshot = measure_sandbox.pause().await?;
+    let (grown_mem_reclaimable, _) = memory_chain_parts(&measure_sandbox, &grown_snapshot)?;
+    drop(measure_sandbox);
+    let marginal_bytes = grown_mem_reclaimable.saturating_sub(base_mem_reclaimable);
+    assert!(
+        marginal_bytes > 0,
+        "a second disjoint region must grow the reclaimable part: base \
+         {base_mem_reclaimable} bytes, grown {grown_mem_reclaimable}"
+    );
+    // The ceiling holds the base chain and half of one more region: the base chain
+    // fits on its own, and the next disjoint region cannot. That is the statement
+    // the rejection makes — compaction ran and could not reclaim a byte of it.
     let fixed_bytes = base_mem_prefix
         .max(base_rootfs_prefix)
         .max(base_rootfs_reclaimable);
     let ceiling = fixed_bytes
-        .saturating_add(base_mem_reclaimable)
-        .saturating_add(base_mem_reclaimable / 4);
+        .max(base_mem_reclaimable)
+        .saturating_add(marginal_bytes / 2);
+    // `0` is the documented disabled value; a degenerate fixture must not select
+    // it and then pass because enforcement was off.
     assert!(
-        ceiling >= base_mem_reclaimable,
-        "the ceiling must hold this pause's own generation: {base_mem_reclaimable} > {ceiling}"
+        ceiling > 0 && ceiling >= base_mem_reclaimable,
+        "the ceiling must hold the base chain and still be a real bound: \
+         {base_mem_reclaimable} vs {ceiling}"
+    );
+    assert!(
+        ceiling < base_mem_reclaimable.saturating_add(marginal_bytes),
+        "the ceiling must be below the base chain plus one more region, or nothing would be \
+         refused: {ceiling} vs {base_mem_reclaimable} + {marginal_bytes}"
     );
     eprintln!(
         "unique-growth base: memory {base_mem_reclaimable} reclaimable over a \
          {base_mem_prefix} byte prefix, rootfs {base_rootfs_reclaimable} reclaimable over a \
-         {base_rootfs_prefix} byte prefix, unique region {unique_mib} MiB, ceiling {ceiling} bytes"
+         {base_rootfs_prefix} byte prefix, marginal growth per region {marginal_bytes} bytes, \
+         unique region {unique_mib} MiB, ceiling {ceiling} bytes (floor {fixed_bytes})"
     );
 
-    // Resume the same chain under the tight ceiling and add another unique
-    // region. The next chain carries both regions, and compaction cannot drop
-    // either, so the pause must be refused by name.
+    // Resume the base chain — the one that fits — under the tight ceiling and add
+    // one more unique region. The next chain carries both regions, and compaction
+    // cannot drop either, so the pause must be refused by name.
     let mut resumed =
-        FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(ceiling);
+        FirecrackerSandbox::from_snapshot_config(&base_snapshot)?.with_chain_bytes_ceiling(ceiling);
     resumed.start().await?;
     write_unique_chain_data(&mut resumed, unique_mib, 1).await?;
     let error = SandboxBackend::pause(&mut resumed, None)
