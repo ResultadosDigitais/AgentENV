@@ -936,9 +936,10 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
 
     let sandbox_config = common::default_sandbox_config()?;
     let mem_size_mib = u64::from(sandbox_config.mem_size_mib);
-    // Two unique regions per generation's worth of ceiling: the second pause's
-    // chain alone is the ceiling, and compaction cannot bring it under.
-    let unique_mib = (mem_size_mib / 4).max(1);
+    // An eighth of guest memory per region. Two are written in total, so the
+    // fixture uses a quarter of RAM: the guest tmpfs default is half of RAM, so
+    // the writes cannot hit ENOSPC and turn the assertion into a storage failure.
+    let unique_mib = (mem_size_mib / 8).max(1);
 
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
@@ -1097,8 +1098,22 @@ const CHAIN_UNIQUE_DIR: &str = "/dev/shm/aenv-chain-unique";
 /// terminal, so the assertion would test the wrong device and the wrong error
 /// classification.
 async fn chain_ballast_dir_is_tmpfs(sandbox: &mut FirecrackerSandbox) -> Result<bool> {
+    // Pure shell against `/proc/mounts`: the guest carries no guaranteed
+    // `stat`/`findmnt`/`awk`, and the guest image is free to change.
     let output = sandbox
-        .run_command("sh", &["-c", &format!("stat -f -c %T {CHAIN_TMPFS_DIR}")])
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "while read -r _ mount type _; do \
+                       if [ \"$mount\" = {CHAIN_TMPFS_DIR} ] && [ \"$type\" = tmpfs ]; then \
+                         echo tmpfs; break; \
+                       fi; \
+                     done < /proc/mounts"
+                ),
+            ],
+        )
         .await
         .context("inspect the guest filesystem type of /dev/shm")?;
     Ok(output.exit_code == 0 && output.stdout.trim() == "tmpfs")
