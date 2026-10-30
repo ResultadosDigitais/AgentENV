@@ -616,7 +616,10 @@ impl<T: Send> WarmPool<T> {
                 // `request_maintenance_after`, whose earliest-wins `min`
                 // would then fire an immediate extra cycle and defeat the
                 // new backoff.
-                if signal.wake_at.is_some_and(|wake_at| wake_at <= Instant::now()) {
+                if signal
+                    .wake_at
+                    .is_some_and(|wake_at| wake_at <= Instant::now())
+                {
                     signal.wake_at = None;
                 }
             }
@@ -1282,9 +1285,7 @@ mod tests {
             idle_ttl: Some(Duration::from_millis(50)),
         })));
         pool.start_maintenance_worker(move || {
-            if let PoolMaintenanceAction::Drain(to_drain) =
-                pool.compute_maintenance_action()
-            {
+            if let PoolMaintenanceAction::Drain(to_drain) = pool.compute_maintenance_action() {
                 for _ in 0..to_drain {
                     if pool.try_drain_one_for_maintenance().is_none() {
                         break;
