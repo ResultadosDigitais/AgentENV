@@ -650,13 +650,14 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
 /// charge the same bytes; the total footprint is printed beside it for the
 /// staging measurement.
 ///
-/// The ceiling itself is measured, never guessed: a warm-up pause with the
-/// ballast already written produces exactly one generation of the rewritten
-/// region, and the ceiling is that size plus a quarter. That is above what
-/// compaction has to leave behind and below the two uncompacted generations the
-/// next pause would otherwise carry, so the parity between "the ceiling fires"
-/// and "compaction is what brings the chain back under it" is what the assertions
-/// observe.
+/// The ceiling itself is measured, never guessed, and is measured in the same
+/// bytes it charges. A warm-up pause with the ballast already written produces
+/// exactly one generation of the rewritten region, a steady pause adds one more,
+/// and the ceiling is the warm-up generation plus three steady ones: above what
+/// compaction has to leave behind, and low enough that ten pauses cross it
+/// several times. The two shared prefixes take no part in it — they are reported
+/// and never charged, and folding them into the ceiling is what once put it at
+/// the rootfs image prefix, out of reach of any pause of a rewritten region.
 ///
 /// The ceiling is injected into each sandbox handle instead of being read from
 /// the process-wide config: the pause path takes it from the sandbox, and only
@@ -742,20 +743,21 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
         "a pause that rewrites {ballast_mib} MiB must add a generation to the chain: \
          {before} bytes before, {after} after"
     );
-    // One value bounds both chains, so it has to clear everything either of them
-    // carries that the workload cannot shrink: both shared prefixes and the
-    // rootfs chain's restacked part.
-    let fixed_bytes = base_mem_prefix
-        .max(base_rootfs_prefix)
-        .max(base_rootfs_reclaimable);
+    // The ceiling charges only the reclaimable part, so its floor is a
+    // reclaimable part as well: the rootfs chain is restacked under this same
+    // ceiling on every pause and shares nothing with the memory chain. The two
+    // shared prefixes are deliberately excluded. They are never charged, and
+    // including them is what put the floor at the 690,712,576 byte rootfs image
+    // prefix — above anything ten pauses of a rewritten region can reach, which
+    // is why the fixture never crossed the ceiling.
+    let fixed_bytes = base_rootfs_reclaimable;
     // The memory chain's budget: room for the warm-up generation (the most a
-    // compaction of this chain can leave behind), plus one steady generation and
-    // half of another. The second pause then still fits, the third does not, and
-    // from there every pause above the ceiling has a fitting compacted result —
-    // so the trigger fires repeatedly inside ten pauses and never rejects one.
-    let memory_budget = warmup_bytes
-        .saturating_add(generation_bytes)
-        .saturating_add(generation_bytes / 2);
+    // compaction of this chain can leave behind), plus three steady generations.
+    // A steady pause adds one generation per cycle, so the chain crosses the
+    // ceiling around the fourth pause, compaction folds it back to roughly the
+    // warm-up generation, and it crosses again a few pauses later: several
+    // compactions inside ten pauses, and every compacted result fits.
+    let memory_budget = warmup_bytes.saturating_add(3 * generation_bytes);
     let ceiling = fixed_bytes.max(memory_budget);
     // `0` means "ceiling disabled", so a degenerate fixture must not silently
     // turn enforcement off and pass every assertion for the wrong reason.
@@ -767,25 +769,25 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     // says which one broke instead of failing later on a missing compaction. A
     // compacted memory chain is at most the warm-up generation, so the ceiling has
     // to hold that much; and the chain grows by one generation per pause, so the
-    // ceiling has to be below two generations' growth or ten pauses never reach it.
+    // ceiling has to be reachable inside the ten pauses or nothing ever compacts.
     assert!(
         ceiling >= warmup_bytes,
         "the ceiling must hold a compacted memory chain: {ceiling} < warm-up {warmup_bytes}"
     );
     assert!(
-        ceiling < warmup_bytes.saturating_add(2 * generation_bytes),
-        "the chain must reach the ceiling within ten pauses, or nothing compacts: ceiling \
-         {ceiling} vs warm-up {warmup_bytes} plus two {generation_bytes} byte generations; the \
-         fixed floor that could push it out of reach is {fixed_bytes} (memory prefix \
-         {base_mem_prefix}, rootfs prefix {base_rootfs_prefix}, rootfs reclaimable \
-         {base_rootfs_reclaimable})"
+        ceiling < warmup_bytes.saturating_add(pause_count as u64 * generation_bytes),
+        "the chain must reach the ceiling within {pause_count} pauses, or nothing compacts: \
+         ceiling {ceiling} vs warm-up {warmup_bytes} plus {pause_count} x {generation_bytes} byte \
+         generations; the reclaimable floor that could push it out of reach is {fixed_bytes} \
+         (rootfs reclaimable {base_rootfs_reclaimable}, memory reclaimable {warmup_bytes})"
     );
     eprintln!(
         "measured: warm-up generation {warmup_bytes} bytes, a steady-state pause adds \
          {generation_bytes} bytes ({before} -> {after}); shared prefixes memory \
-         {base_mem_prefix} / rootfs {base_rootfs_prefix} bytes, rootfs reclaimable \
-         {base_rootfs_reclaimable} bytes, ceiling {ceiling} bytes ({warmup_bytes} warm-up + \
-         1.5 x {generation_bytes} steady, floor {fixed_bytes}), ballast {ballast_mib} MiB"
+         {base_mem_prefix} / rootfs {base_rootfs_prefix} bytes (reported, never charged), rootfs \
+         reclaimable {base_rootfs_reclaimable} bytes, ceiling {ceiling} bytes ({warmup_bytes} \
+         warm-up + 3 x {generation_bytes} steady, reclaimable floor {fixed_bytes}), ballast \
+         {ballast_mib} MiB"
     );
     current = steady_second;
 
@@ -998,9 +1000,14 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
     // The ceiling holds the base chain and half of one more region: the base chain
     // fits on its own, and the next disjoint region cannot. That is the statement
     // the rejection makes — compaction ran and could not reclaim a byte of it.
-    let fixed_bytes = base_mem_prefix
-        .max(base_rootfs_prefix)
-        .max(base_rootfs_reclaimable);
+    //
+    // The floor is the rootfs chain's reclaimable part, not its shared prefix and
+    // not the memory prefix: the rootfs chain is restacked under this same ceiling
+    // on every pause, so it has to fit, while no prefix is ever charged. Taking
+    // the prefixes into the floor put it at 770,994,176 bytes against a
+    // 218,996,736 byte base chain and a 160,563,200 byte region, so the ceiling sat
+    // above base plus one region and nothing was ever refused.
+    let fixed_bytes = base_rootfs_reclaimable;
     let ceiling = fixed_bytes
         .max(base_mem_reclaimable)
         .saturating_add(marginal_bytes / 2);
@@ -1014,13 +1021,16 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
     assert!(
         ceiling < base_mem_reclaimable.saturating_add(marginal_bytes),
         "the ceiling must be below the base chain plus one more region, or nothing would be \
-         refused: {ceiling} vs {base_mem_reclaimable} + {marginal_bytes}"
+         refused: {ceiling} vs {base_mem_reclaimable} + {marginal_bytes}; the reclaimable floor \
+         that could push it out of reach is {fixed_bytes} (rootfs reclaimable, with the memory \
+         prefix {base_mem_prefix} and rootfs prefix {base_rootfs_prefix} reported but never \
+         charged)"
     );
     eprintln!(
         "unique-growth base: memory {base_mem_reclaimable} reclaimable over a \
          {base_mem_prefix} byte prefix, rootfs {base_rootfs_reclaimable} reclaimable over a \
          {base_rootfs_prefix} byte prefix, marginal growth per region {marginal_bytes} bytes, \
-         unique region {unique_mib} MiB, ceiling {ceiling} bytes (floor {fixed_bytes})"
+         unique region {unique_mib} MiB, ceiling {ceiling} bytes (reclaimable floor {fixed_bytes})"
     );
 
     // Resume the base chain — the one that fits — under the tight ceiling and add
