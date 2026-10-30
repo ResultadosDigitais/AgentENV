@@ -64,6 +64,32 @@ pub(crate) struct NetworkManager {
 
     /// Rejects new allocations once shutdown cleanup starts.
     shutting_down: AtomicBool,
+
+    /// Test hook: when set, the next
+    /// `cleanup_allocated_slot_retain_bit_on_failure` call fails before
+    /// touching slot resources, so tests can exercise a genuine teardown
+    /// failure while the allocation bit stays held.
+    #[cfg(test)]
+    pub(crate) fail_slot_teardown: AtomicBool,
+}
+
+/// Failure of `cleanup_allocated_slot_retain_bit_on_failure`, typed so the
+/// caller can tell a retryable teardown failure from a terminal
+/// post-teardown bitmap error.
+pub(crate) enum SlotTeardownError {
+    /// `Slot::cleanup` failed: the allocation bit is still held, so the
+    /// caller must retain the slot and retry — the index cannot be
+    /// reallocated in between, and the retry still owns the index-derived
+    /// resources (`veth-<idx>`) it tears down. Ownership of the slot is
+    /// returned together with the error so it can be queued for retry.
+    Teardown { slot: Slot, error: anyhow::Error },
+    /// Teardown succeeded but releasing the allocation bit failed: the slot
+    /// is already disarmed and the bit is already clear, so the index may be
+    /// reallocated immediately. Retrying would be a no-op cleanup followed
+    /// by `release_slot_bit` against an index that can now belong to a
+    /// different sandbox, so this failure is terminal: report it, never
+    /// retain the slot for retry.
+    BitRelease(anyhow::Error),
 }
 
 impl NetworkManager {
@@ -116,6 +142,7 @@ impl NetworkManager {
                 high_watermark,
                 maintenance_enabled,
                 startup_prewarm: true,
+                idle_ttl: None,
             },
             address_plan: NetworkAddressPlan::default(),
             netns_dir: std::env::temp_dir().join("aenv-network-tests/netns"),
@@ -131,6 +158,8 @@ impl NetworkManager {
             netns_dir: config.netns_dir,
             egress_proxy,
             shutting_down: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_slot_teardown: AtomicBool::new(false),
         };
 
         // Reserve slot 0 (invalid for IP addresses)
@@ -193,7 +222,7 @@ impl NetworkManager {
     }
 
     /// Release only the bitmap bit for a slot index.
-    fn release_slot_bit(&self, idx: u32) -> Result<()> {
+    pub(crate) fn release_slot_bit(&self, idx: u32) -> Result<()> {
         if idx == 0 || idx as usize >= MAX_SLOTS {
             return Err(anyhow!("Slot index {} out of range", idx));
         }
@@ -227,6 +256,53 @@ impl NetworkManager {
 
     pub(crate) fn cleanup_allocated_slot(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
         self.cleanup_slot_and_release_bit_inner(slot, sync_cleanup)
+    }
+
+    /// Tear down an allocated slot, releasing the allocation bit only after
+    /// the resource teardown succeeds.
+    ///
+    /// Unlike `cleanup_allocated_slot`, a teardown failure keeps the bit set:
+    /// the index then cannot be reallocated while the caller retains the slot
+    /// for retry, so a later retry still owns the index-derived resources
+    /// (`veth-<idx>`) it tears down and can never delete networking that was
+    /// recreated for a different sandbox.
+    ///
+    /// The slot is consumed by value to enforce exclusive ownership: after a
+    /// successful call the cleanup is disarmed and the bit is clear, so a
+    /// caller retaining the `Slot` could otherwise re-invoke this method and
+    /// `release_slot_bit` would clear a NEW owner's bit once the index is
+    /// reallocated. On a retryable teardown failure, ownership is returned
+    /// inside `SlotTeardownError::Teardown` so the caller can queue the slot
+    /// for retry. The `cleanup_armed` flag inside `Slot::cleanup` only
+    /// provides idempotency against a repeated teardown by the same owner —
+    /// it is not a guard against concurrent owners, which the type's
+    /// ownership rules exclude.
+    ///
+    /// The error is typed (`SlotTeardownError`) so callers can distinguish a
+    /// retryable teardown failure (bit still held) from a terminal
+    /// post-teardown bitmap error (slot already disarmed, bit already
+    /// clear), which must be reported but never retained for retry.
+    pub(crate) fn cleanup_allocated_slot_retain_bit_on_failure(
+        &self,
+        mut slot: Slot,
+        sync_cleanup: bool,
+    ) -> std::result::Result<(), SlotTeardownError> {
+        #[cfg(test)]
+        if self.fail_slot_teardown.swap(false, Ordering::AcqRel) {
+            return Err(SlotTeardownError::Teardown {
+                slot,
+                error: anyhow!("injected slot teardown failure"),
+            });
+        }
+        let idx = slot.idx;
+        if let Err(e) = slot.cleanup(sync_cleanup) {
+            return Err(SlotTeardownError::Teardown {
+                slot,
+                error: Into::<anyhow::Error>::into(e),
+            });
+        }
+        self.release_slot_bit(idx)
+            .map_err(SlotTeardownError::BitRelease)
     }
 
     /// Find and allocate the next available slot.
@@ -300,12 +376,12 @@ impl NetworkManager {
     }
 
     #[cfg(test)]
-    fn compute_maintenance_action(&self, pool_len: usize) -> PoolMaintenanceAction {
-        self.pool.compute_maintenance_action(pool_len)
+    fn compute_maintenance_action(&self) -> PoolMaintenanceAction {
+        self.pool.compute_maintenance_action()
     }
 
     fn run_pool_maintenance_cycle(&self) -> Result<()> {
-        let action = self.pool.compute_maintenance_action(self.pool.len());
+        let action = self.pool.compute_maintenance_action();
 
         match action {
             PoolMaintenanceAction::Fill(to_fill) => {
@@ -339,7 +415,10 @@ impl NetworkManager {
             }
             PoolMaintenanceAction::Drain(to_drain) => {
                 for _ in 0..to_drain {
-                    let maybe_slot = self.pool.try_drain_one();
+                    // Re-validate each removal at execution time: the computed
+                    // drain count can be stale if an acquisition cancelled an
+                    // in-progress decay or the pool length changed.
+                    let maybe_slot = self.pool.try_drain_one_for_maintenance();
                     let Some(slot) = maybe_slot else {
                         break;
                     };
@@ -944,12 +1023,22 @@ mod tests {
     #[test]
     fn maintenance_action_fills_to_current_target() {
         let manager = NetworkManager::new(true, 4, 10);
+        // Two warm slots below the low watermark: fill the missing two.
+        for idx in 1..=2u32 {
+            manager.allocated.insert(idx as usize);
+            manager.pool.release(test_slot(idx)).unwrap();
+        }
         assert_eq!(
-            manager.compute_maintenance_action(2),
+            manager.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(2)
         );
+        // Seven warm slots within the watermarks: no action.
+        for idx in 3..=7u32 {
+            manager.allocated.insert(idx as usize);
+            manager.pool.release(test_slot(idx)).unwrap();
+        }
         assert_eq!(
-            manager.compute_maintenance_action(7),
+            manager.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }
@@ -957,12 +1046,21 @@ mod tests {
     #[test]
     fn maintenance_action_drains_above_high_watermark() {
         let manager = NetworkManager::new(true, 2, 4);
+        // Eight warm slots above the high watermark: drain the excess.
+        for idx in 1..=8u32 {
+            manager.allocated.insert(idx as usize);
+            manager.pool.release(test_slot(idx)).unwrap();
+        }
         assert_eq!(
-            manager.compute_maintenance_action(8),
+            manager.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(4)
         );
+        // At the high watermark: no action.
+        for _ in 0..4 {
+            assert!(manager.pool.try_drain_one().is_some());
+        }
         assert_eq!(
-            manager.compute_maintenance_action(4),
+            manager.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }

@@ -18,6 +18,7 @@ use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
     DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
 };
+use super::super::resize::NodeCapacity;
 use super::super::types::SandboxLaunchSource;
 use super::sandbox_metrics::metrics_concurrency;
 use super::*;
@@ -36,7 +37,7 @@ use crate::sandbox::{
     SandboxLogEntry, SandboxMetric, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
     SandboxRuntimeInfo,
 };
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -127,6 +128,8 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         volume_manager: None,
+        resize_policy: std::sync::RwLock::new(ResizePolicy::disabled()),
+        resize_admission: tokio::sync::Mutex::new(()),
     })
 }
 
@@ -834,6 +837,7 @@ fn resume_launch_plan(sandbox_id: SandboxId) -> LaunchPlan {
         NewTimeout::None,
         SandboxResources::default(),
         None,
+        None,
     )
 }
 
@@ -1182,6 +1186,7 @@ fn create_request(
         volume_mounts: HashMap::new(),
         auto_resume: false,
         secure: false,
+        resources: ResourceRequest::default(),
     }
 }
 
@@ -1219,6 +1224,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
         cpu_count: 2,
         memory_mib: 512,
         disk_size_mib: 1024,
+        memory_request_mib: None,
     };
     let expected_resources = SandboxResources {
         disk_size_mib: 4,
@@ -1246,6 +1252,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             volume_mounts: HashMap::new(),
             auto_resume: false,
             secure: false,
+            resources: ResourceRequest::default(),
         })
         .await?;
 
@@ -5985,5 +5992,330 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     );
     release.notify_one();
     assert!(task.await.unwrap()?.is_empty());
+    Ok(())
+}
+
+// ── Per-sandbox resources and live resize ─────────────────────────────────
+
+fn resize_policy() -> ResizePolicy {
+    ResizePolicy {
+        enabled: true,
+        cpu_quota_available: true,
+        min_memory_mib: 512,
+        max_cpu_allocated_percent: None,
+        max_memory_allocated_percent: None,
+        node: None,
+    }
+}
+
+fn shaped_snapshot(cpu_count: u32, memory_mib: u32) -> RunnableSnapshot {
+    let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+    record.resources = SandboxResources {
+        cpu_count,
+        memory_mib,
+        disk_size_mib: 1024,
+        memory_request_mib: None,
+    };
+    RunnableSnapshot::from_test_manifest(record, Vec::new())
+}
+
+fn shaped_request(
+    cpu_count: u32,
+    memory_mib: u32,
+    resources: ResourceRequest,
+) -> CreateSandboxRequest {
+    let mut request = create_request(Some(60), &[]);
+    request.source =
+        SandboxLaunchSource::Snapshot(Box::new(shaped_snapshot(cpu_count, memory_mib)));
+    request.resources = resources;
+    request
+}
+
+fn resources(cpu_count: Option<u32>, memory_mib: Option<u32>) -> ResourceRequest {
+    ResourceRequest {
+        cpu_count,
+        memory_mib,
+    }
+}
+
+fn limits(cpu_count: u32, memory_mib: u32) -> ResourceLimits {
+    ResourceLimits {
+        cpu_count,
+        memory_mib,
+    }
+}
+
+fn plan(vm_cpu_count: u32, vm_memory_mib: u32, limits: ResourceLimits) -> ResourceLimitPlan {
+    ResourceLimitPlan {
+        vm_cpu_count,
+        vm_memory_mib,
+        limits,
+    }
+}
+
+async fn resize_orchestrator(policy: ResizePolicy) -> (Arc<TestOrchestrator>, Arc<MockBehavior>) {
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    orchestrator.set_resize_policy_for_test(policy);
+    (orchestrator, behavior)
+}
+
+#[tokio::test]
+async fn create_below_the_template_shape_enforces_limits() -> Result<()> {
+    setup();
+    let (orchestrator, behavior) = resize_orchestrator(resize_policy()).await;
+
+    let created = orchestrator
+        .create_sandbox(shaped_request(8, 16384, resources(Some(4), Some(8192))))
+        .await?;
+
+    assert_eq!(
+        created.resources.cpu_count, 8,
+        "the VM shape is the template's"
+    );
+    assert_eq!(created.resource_limits, Some(limits(4, 8192)));
+    assert_eq!(created.allocated_resources().cpu_count, 4);
+    assert_eq!(created.allocated_resources().memory_mib, 8192);
+    assert_eq!(
+        behavior.applied_resource_limits(),
+        vec![plan(8, 16384, limits(4, 8192))]
+    );
+    let metrics = orchestrator.metrics_snapshot().await?;
+    assert_eq!(metrics.allocated_cpu, 4);
+    assert_eq!(metrics.allocated_memory_bytes, 8192 * 1024 * 1024);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_at_the_template_shape_deflates_an_inherited_balloon() -> Result<()> {
+    setup();
+    let (orchestrator, behavior) = resize_orchestrator(resize_policy()).await;
+
+    let created = orchestrator
+        .create_sandbox(shaped_request(8, 16384, ResourceRequest::default()))
+        .await?;
+
+    assert_eq!(created.resource_limits, None);
+    assert_eq!(
+        behavior.applied_resource_limits(),
+        vec![plan(8, 16384, limits(8, 16384))],
+        "a snapshot of a resized sandbox carries its balloon target"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_below_the_template_shape_needs_resize_enabled() -> Result<()> {
+    setup();
+    let (orchestrator, behavior) = resize_orchestrator(ResizePolicy::disabled()).await;
+
+    let error = orchestrator
+        .create_sandbox(shaped_request(8, 16384, resources(Some(4), None)))
+        .await
+        .expect_err("limits below the shape need [resize].enabled");
+    assert!(
+        matches!(&error, OrchestratorError::UnsupportedResources(message) if message.contains("[resize].enabled")),
+        "{error}"
+    );
+    assert!(orchestrator.list_sandboxes().await?.is_empty());
+
+    // Asking for exactly the template's shape is always accepted.
+    let created = orchestrator
+        .create_sandbox(shaped_request(8, 16384, resources(Some(8), Some(16384))))
+        .await?;
+    assert_eq!(created.resource_limits, None);
+    assert!(
+        behavior.applied_resource_limits().is_empty(),
+        "nothing is enforced while resize is disabled"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_beyond_the_template_shape_is_rejected() -> Result<()> {
+    setup();
+    let (orchestrator, _behavior) = resize_orchestrator(resize_policy()).await;
+
+    let error = orchestrator
+        .create_sandbox(shaped_request(8, 16384, resources(None, Some(32768))))
+        .await
+        .expect_err("memory cannot grow past the template's VM");
+    assert!(
+        matches!(&error, OrchestratorError::UnsupportedResources(message) if message.contains("16384 MiB")),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resize_moves_limits_inside_the_vm_shape() -> Result<()> {
+    setup();
+    let (orchestrator, behavior) = resize_orchestrator(resize_policy()).await;
+    let created = orchestrator
+        .create_sandbox(shaped_request(8, 16384, ResourceRequest::default()))
+        .await?;
+
+    let status = orchestrator
+        .resize_sandbox(created.id, resources(Some(2), Some(4096)))
+        .await?;
+    assert_eq!(status.limits, limits(2, 4096));
+    assert_eq!(status.shape, created.resources);
+    let enforcement = status
+        .enforcement
+        .expect("running sandboxes report enforcement");
+    assert_eq!(enforcement.cpu_quota, Some(2));
+    assert_eq!(enforcement.balloon_target_mib, Some(12288));
+    assert_eq!(status.memory_state(), MemoryLimitState::Unobservable);
+
+    let resized = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("sandbox exists");
+    assert_eq!(resized.resource_limits, Some(limits(2, 4096)));
+    let metrics = orchestrator.metrics_snapshot().await?;
+    assert_eq!(metrics.allocated_cpu, 2);
+    assert_eq!(metrics.allocated_memory_bytes, 4096 * 1024 * 1024);
+
+    // Growing back to the whole VM clears the limits.
+    let status = orchestrator
+        .resize_sandbox(created.id, resources(Some(8), Some(16384)))
+        .await?;
+    assert_eq!(status.memory_state(), MemoryLimitState::Converged);
+    let restored = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("sandbox exists");
+    assert_eq!(restored.resource_limits, None);
+    assert_eq!(
+        behavior.applied_resource_limits().last(),
+        Some(&plan(8, 16384, limits(8, 16384)))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resize_requires_a_running_sandbox() -> Result<()> {
+    setup();
+    let (orchestrator, _behavior) = resize_orchestrator(resize_policy()).await;
+    let created = orchestrator
+        .create_sandbox(shaped_request(8, 16384, ResourceRequest::default()))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    let error = orchestrator
+        .resize_sandbox(created.id, resources(Some(2), None))
+        .await
+        .expect_err("a paused sandbox has no VMM to resize");
+    assert!(matches!(
+        error,
+        OrchestratorError::InvalidSandboxState {
+            state: SandboxState::Paused,
+            ..
+        }
+    ));
+
+    let status = orchestrator.sandbox_resource_status(created.id).await?;
+    assert_eq!(status.enforcement, None);
+    assert_eq!(status.memory_state(), MemoryLimitState::Unobservable);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resize_rejects_growth_beyond_node_admission() -> Result<()> {
+    setup();
+    let (orchestrator, _behavior) = resize_orchestrator(ResizePolicy {
+        max_memory_allocated_percent: Some(100),
+        node: Some(NodeCapacity {
+            cpu_count: 16,
+            memory_mib: 10240,
+        }),
+        ..resize_policy()
+    })
+    .await;
+    let created = orchestrator
+        .create_sandbox(shaped_request(8, 16384, resources(None, Some(4096))))
+        .await?;
+
+    let error = orchestrator
+        .resize_sandbox(created.id, resources(None, Some(12288)))
+        .await
+        .expect_err("12 GiB does not fit a 10 GiB node");
+    assert!(
+        matches!(error, OrchestratorError::InsufficientCapacity(_)),
+        "{error}"
+    );
+
+    let status = orchestrator
+        .resize_sandbox(created.id, resources(None, Some(8192)))
+        .await?;
+    assert_eq!(status.limits, limits(8, 8192));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_resize_restores_the_previous_limits() -> Result<()> {
+    setup();
+    let (orchestrator, behavior) = resize_orchestrator(resize_policy()).await;
+    let created = orchestrator
+        .create_sandbox(shaped_request(8, 16384, resources(Some(4), Some(8192))))
+        .await?;
+    behavior.push_action(
+        MockOperation::ApplyResourceLimits,
+        MockAction::Fail {
+            message: "balloon update rejected".to_string(),
+        },
+    );
+
+    let error = orchestrator
+        .resize_sandbox(created.id, resources(Some(2), None))
+        .await
+        .expect_err("the backend rejected the new limits");
+    assert!(matches!(
+        error,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::ApplyResourceLimits,
+            ..
+        }
+    ));
+    assert_eq!(
+        behavior.applied_resource_limits().last(),
+        Some(&plan(8, 16384, limits(4, 8192))),
+        "the previous limits are applied again"
+    );
+    let unchanged = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("sandbox exists");
+    assert_eq!(unchanged.resource_limits, Some(limits(4, 8192)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_and_fork_reapply_limits() -> Result<()> {
+    setup();
+    let (orchestrator, behavior) = resize_orchestrator(resize_policy()).await;
+    let created = orchestrator
+        .create_sandbox(shaped_request(8, 16384, resources(Some(2), Some(4096))))
+        .await?;
+    let limited = plan(8, 16384, limits(2, 4096));
+
+    orchestrator.pause_sandbox(created.id).await?;
+    let resumed = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    assert_eq!(resumed.resource_limits, Some(limits(2, 4096)));
+    assert_eq!(behavior.applied_resource_limits(), vec![limited, limited]);
+
+    let outcomes = orchestrator
+        .fork_sandbox(created.id, 1, NewTimeout::UseExisting)
+        .await?;
+    let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
+    assert_eq!(children[0].resource_limits, Some(limits(2, 4096)));
+    assert_eq!(
+        behavior.applied_resource_limits(),
+        vec![limited, limited, limited]
+    );
     Ok(())
 }

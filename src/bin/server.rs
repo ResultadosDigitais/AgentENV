@@ -81,6 +81,13 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
+    // Terminate firecracker/uvm-ublk-daemon processes orphaned by a previous
+    // server incarnation before they can wedge startup: they hold ublk devices
+    // and inherited fds that pin the RocksDB LOCK of the persisted-sandbox
+    // store.
+    agentenv::setup::reap_orphaned_runtime_processes(config).await?;
+    // Per-sandbox CPU quota cgroups; after the reap so stale ones are empty.
+    agentenv::sandbox::CpuQuota::init_global(config.resize.enabled && config.resize.cpu_quota);
     let api_key = ApiKey::resolve(config)?;
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());

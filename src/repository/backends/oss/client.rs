@@ -6,9 +6,9 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::{stream, TryStreamExt};
 use object_store_operator::{
-    build_object_store_operator, run_with_refresh, AddressingStyle, CachedCredentialSource,
-    CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError, ObjectStoreService,
-    OperatorWithCredential,
+    build_object_store_operator, gcs_object_key, gcs_object_key_decode, run_with_refresh,
+    AddressingStyle, CachedCredentialSource, CredentialSource, GcsAuth, ObjectStoreOperatorConfig,
+    ObjectStoreOperatorError, ObjectStoreService, OperatorWithCredential,
 };
 use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};
 use overlaybd::backend::oss::upload_file_streaming;
@@ -81,6 +81,28 @@ pub(crate) struct OssListedObject {
     pub(crate) last_modified: Option<SystemTime>,
 }
 
+/// How writers of one shared document exclude each other, which depends on
+/// what the object store can do in a single request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentLocking {
+    /// The store replaces an object only if its ETag is unchanged (S3 and
+    /// compatible stores, MinIO among them), so no lock is needed.
+    IfMatch,
+    /// The store appends to an object only at its current length (Alibaba OSS);
+    /// see the `lease` module.
+    AppendLease,
+    /// The store can only create an object that is absent (Google Cloud
+    /// Storage); see the `epoch_lease` module.
+    CreateOnlyLease,
+}
+
+impl DocumentLocking {
+    /// Whether writers must hold a lease to write a document.
+    pub(crate) fn needs_lease(self) -> bool {
+        !matches!(self, Self::IfMatch)
+    }
+}
+
 /// An operator configuration and the operator last built from it.
 #[derive(Clone, Debug)]
 struct CachedOperator {
@@ -102,7 +124,10 @@ impl CachedOperator {
 pub(crate) struct OssClient {
     operator_config: ObjectStoreOperatorConfig,
     prefix: String,
-    credentials: Arc<CachedCredentialSource>,
+    /// `None` on stores that authenticate without access keys (Google Cloud
+    /// Storage resolves and refreshes its own tokens).
+    credentials: Option<Arc<CachedCredentialSource>>,
+    locking: DocumentLocking,
     cached_operator: Arc<RwLock<Option<OperatorWithCredential>>>,
     /// Writes in one attempt of at most [`WRITE_ATTEMPT_TIMEOUT`].
     single_attempt: CachedOperator,
@@ -128,6 +153,7 @@ impl OssClient {
             CachedOperator::new(ObjectStoreOperatorConfig {
                 service: ObjectStoreService::AliyunOss,
                 addressing_style: AddressingStyle::Virtual,
+                gcs_auth: GcsAuth::default(),
                 bucket: bucket.clone(),
                 endpoint,
                 region: region.clone(),
@@ -138,33 +164,84 @@ impl OssClient {
         let operator_config = ObjectStoreOperatorConfig {
             service: ObjectStoreService::S3,
             addressing_style,
+            gcs_auth: GcsAuth::default(),
             bucket,
             endpoint,
             region,
             timeout: None,
             max_retries: None,
         };
+        let locking = if native_oss.is_some() {
+            DocumentLocking::AppendLease
+        } else {
+            DocumentLocking::IfMatch
+        };
+        Ok(Self::assemble(
+            operator_config,
+            prefix,
+            Some(Arc::new(CachedCredentialSource::new(credential_source))),
+            locking,
+            native_oss,
+        ))
+    }
+
+    /// A client for a Google Cloud Storage bucket. `endpoint` is empty except
+    /// for emulators.
+    pub(crate) fn new_gcs(bucket: String, endpoint: String, prefix: String, auth: GcsAuth) -> Self {
+        let operator_config = ObjectStoreOperatorConfig {
+            service: ObjectStoreService::Gcs,
+            addressing_style: AddressingStyle::Path,
+            gcs_auth: auth,
+            bucket,
+            endpoint,
+            region: String::new(),
+            timeout: None,
+            max_retries: None,
+        };
+        Self::assemble(
+            operator_config,
+            prefix,
+            None,
+            DocumentLocking::CreateOnlyLease,
+            None,
+        )
+    }
+
+    fn assemble(
+        operator_config: ObjectStoreOperatorConfig,
+        prefix: String,
+        credentials: Option<Arc<CachedCredentialSource>>,
+        locking: DocumentLocking,
+        native_oss: Option<CachedOperator>,
+    ) -> Self {
         let single_attempt = CachedOperator::new(ObjectStoreOperatorConfig {
             timeout: Some(WRITE_ATTEMPT_TIMEOUT),
             max_retries: Some(0),
             ..operator_config.clone()
         });
-        Ok(Self {
+        Self {
             operator_config,
             prefix,
-            credentials: Arc::new(CachedCredentialSource::new(credential_source)),
+            credentials,
+            locking,
             cached_operator: Arc::new(RwLock::new(None)),
             single_attempt,
             native_oss,
-        })
+        }
     }
 
-    /// Whether [`Self::append`] works: only Alibaba OSS appends to objects.
-    pub(crate) fn can_append(&self) -> bool {
-        self.native_oss.is_some()
+    /// How writers of one document exclude each other on this store.
+    pub(crate) fn document_locking(&self) -> DocumentLocking {
+        self.locking
     }
 
+    /// The repository-relative `key` under the configured prefix, as the
+    /// store names it.
     fn full_key(&self, key: &str) -> String {
+        self.wire(&self.unwired_full_key(key))
+    }
+
+    fn unwired_full_key(&self, key: &str) -> String {
         if self.prefix.is_empty() {
             key.to_string()
         } else {
@@ -172,13 +249,46 @@ impl OssClient {
         }
     }
 
-    /// The `s3://` URL overlaybd reads an object or prefix from. overlaybd
-    /// expects S3-compatible URLs, including for Alibaba OSS.
+    /// `name` as the store spells it. GCS object names are restricted to
+    /// characters OpenDAL encodes consistently; see [`gcs_object_key`].
+    fn wire(&self, name: &str) -> String {
+        match self.operator_config.service {
+            ObjectStoreService::Gcs => gcs_object_key(name),
+            ObjectStoreService::S3 | ObjectStoreService::AliyunOss => name.to_string(),
+        }
+    }
+
+    /// Store object names as repository-relative keys: the inverse of
+    /// [`Self::full_key`].
+    fn relative_keys(&self, keys: Vec<String>) -> Vec<String> {
+        let strip = (!self.prefix.is_empty()).then(|| format!("{}/", self.wire(&self.prefix)));
+        keys.into_iter()
+            .map(|key| {
+                let relative = strip
+                    .as_deref()
+                    .and_then(|strip| key.strip_prefix(strip))
+                    .unwrap_or(&key);
+                match self.operator_config.service {
+                    ObjectStoreService::Gcs => gcs_object_key_decode(relative),
+                    ObjectStoreService::S3 | ObjectStoreService::AliyunOss => relative.to_string(),
+                }
+            })
+            .collect()
+    }
+
+    /// The URL overlaybd reads an object or prefix from: `s3://` for S3-
+    /// compatible stores, including Alibaba OSS, and `gs://` for Google Cloud
+    /// Storage.
     pub(crate) fn object_url(&self, key: &str) -> String {
+        let scheme = match self.operator_config.service {
+            ObjectStoreService::Gcs => "gs",
+            ObjectStoreService::S3 | ObjectStoreService::AliyunOss => "s3",
+        };
+        // overlaybd maps the name to the store's spelling itself.
         format!(
-            "s3://{}/{}",
+            "{scheme}://{}/{}",
             self.operator_config.bucket,
-            self.full_key(key)
+            self.unwired_full_key(key)
         )
     }
 
@@ -297,28 +407,18 @@ impl OssClient {
             .await
             .with_context(|| format!("oss list '{prefix}'"))?;
 
-        Ok(self.strip_prefix(keys))
-    }
-
-    /// Makes listed keys relative to the configured backend prefix.
-    fn strip_prefix(&self, keys: Vec<String>) -> Vec<String> {
-        if self.prefix.is_empty() {
-            return keys;
-        }
-        let strip = format!("{}/", self.prefix);
-        keys.into_iter()
-            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
-            .collect()
+        Ok(self.relative_keys(keys))
     }
 
     /// Lists every object under `prefix` recursively, with the size and
     /// modification time the store reports for each. Keys come back relative to
-    /// the configured backend prefix, like [`Self::list_keys_recursive`].
+    /// the configured backend prefix, like [`Self::list_keys_recursive`], and
+    /// decoded the same way — so a GCS-stored managed layer lists back under
+    /// the name the repository addresses it by.
     pub(crate) async fn list_entries_recursive(
         &self,
         prefix: &str,
     ) -> Result<Vec<OssListedObject>> {
-        let strip = (!self.prefix.is_empty()).then(|| format!("{}/", self.prefix));
         let entries = self
             .run_with_key(prefix, |operator, prefix| async move {
                 let entries = operator.list_with(&prefix).recursive(true).await?;
@@ -337,17 +437,12 @@ impl OssClient {
             })
             .await
             .with_context(|| format!("oss list '{prefix}'"))?;
-        let Some(strip) = strip else {
-            return Ok(entries);
-        };
+        let mut keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+        keys = self.relative_keys(keys);
         Ok(entries
             .into_iter()
-            .map(|mut entry| {
-                if let Some(relative) = entry.key.strip_prefix(&strip) {
-                    entry.key = relative.to_owned();
-                }
-                entry
-            })
+            .zip(keys)
+            .map(|(entry, key)| OssListedObject { key, ..entry })
             .collect())
     }
 
@@ -388,14 +483,7 @@ impl OssClient {
             .await
             .with_context(|| format!("oss list page '{prefix}'"))?;
 
-        if self.prefix.is_empty() {
-            return Ok(keys);
-        }
-        let strip = format!("{}/", self.prefix);
-        Ok(keys
-            .into_iter()
-            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
-            .collect())
+        Ok(self.relative_keys(keys))
     }
 
     /// Write small data (catalog JSON, alias JSON, etc.).
@@ -529,7 +617,7 @@ impl OssClient {
 
     /// Appends `data` to the object at `key`, creating it if absent. Returns
     /// the offset `data` landed at, or `None` when the object grew while the
-    /// append was in flight. Only Alibaba OSS appends; see [`Self::can_append`].
+    /// append was in flight. Only Alibaba OSS appends; see [`DocumentLocking::AppendLease`].
     pub(crate) async fn append(&self, key: &str, data: impl Into<Bytes>) -> Result<Option<u64>> {
         let native_oss = self
             .native_oss
@@ -712,7 +800,7 @@ impl OssClient {
         // reason about cached credentials and operator replacement.
         let current = self.ensure_fresh_operator(config, cached_operator).await?;
         let (value, refreshed) =
-            run_with_refresh(&current, Some(self.credentials.as_ref()), config, operation)
+            run_with_refresh(&current, self.credentials.as_deref(), config, operation)
                 .await
                 .map_err(anyhow::Error::from)?;
         if let Some(refreshed) = refreshed {
@@ -726,22 +814,25 @@ impl OssClient {
         config: &ObjectStoreOperatorConfig,
         cached_operator: &RwLock<Option<OperatorWithCredential>>,
     ) -> Result<OperatorWithCredential> {
-        let credential = self.credentials.current().await?.ok_or_else(|| {
-            anyhow::anyhow!("snapshot OSS client requires non-anonymous credentials")
-        })?;
+        let credential = match &self.credentials {
+            Some(credentials) => Some(credentials.current().await?.ok_or_else(|| {
+                anyhow::anyhow!("snapshot OSS client requires non-anonymous credentials")
+            })?),
+            None => None,
+        };
 
         {
             let cached = cached_operator.read().await;
             if let Some(state) = cached.as_ref() {
-                if state.credential() == Some(&credential) {
+                if state.credential() == credential.as_ref() {
                     return Ok(state.clone());
                 }
             }
         }
 
         let entry = OperatorWithCredential::new(
-            build_object_store_operator(config, Some(&credential))?,
-            Some(credential),
+            build_object_store_operator(config, credential.as_ref())?,
+            credential,
         );
         *cached_operator.write().await = Some(entry.clone());
         Ok(entry)
