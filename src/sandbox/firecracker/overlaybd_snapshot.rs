@@ -49,6 +49,28 @@ const ALLOCATION_BLOCK_SIZE: u64 = 512;
 /// the chain, and the sandbox keeps its runtime state.
 pub(crate) const CHAIN_BYTES_CEILING_EXCEEDED: &str = "CHAIN_BYTES_CEILING_EXCEEDED";
 
+/// Measured shape of a chain that the byte ceiling rejected.
+///
+/// The totals alone cannot tell a ceiling that was set too low from a
+/// compaction that did not shrink the chain: a chain whose runtime-owned lowers
+/// compacted into a layer the size of their sum reports exactly the same total
+/// as a chain whose immutable prefix alone is over. Carrying the parts makes
+/// the rejection say which of the two happened, so the operator reads a cause
+/// instead of a suspicion.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ChainCeilingBreakdown {
+    /// Lowers left untouched by compaction, and their allocated bytes.
+    pub stable_prefix_lowers: usize,
+    pub stable_prefix_bytes: u64,
+    /// Lowers compaction rewrote, and the allocated bytes of the layer it
+    /// produced from them (0 when compaction produced nothing).
+    pub compacted_lowers: usize,
+    pub compacted_bytes: u64,
+    /// Allocated bytes of the layer the pause itself appended, before it was
+    /// folded into the compacted layer.
+    pub appended_bytes: u64,
+}
+
 /// Ceiling rejection for one sandbox's paused artifact chain.
 ///
 /// Kept as a concrete error so the pause path can classify it as recoverable
@@ -57,25 +79,39 @@ pub(crate) const CHAIN_BYTES_CEILING_EXCEEDED: &str = "CHAIN_BYTES_CEILING_EXCEE
 pub(crate) struct ChainBytesCeilingExceeded {
     pub observed_bytes: u64,
     pub ceiling_bytes: u64,
+    pub breakdown: ChainCeilingBreakdown,
 }
 
 impl std::fmt::Display for ChainBytesCeilingExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let breakdown = &self.breakdown;
         write!(
             f,
-            "{CHAIN_BYTES_CEILING_EXCEEDED}: paused sandbox chain needs {} bytes with a stable \
-             prefix that already exceeds the {} byte ceiling",
-            self.observed_bytes, self.ceiling_bytes
+            "{CHAIN_BYTES_CEILING_EXCEEDED}: paused sandbox chain needs {} bytes against the {} \
+             byte ceiling (stable prefix: {} lowers, {} bytes; compacted {} lowers into {} bytes; \
+             appended layer: {} bytes)",
+            self.observed_bytes,
+            self.ceiling_bytes,
+            breakdown.stable_prefix_lowers,
+            breakdown.stable_prefix_bytes,
+            breakdown.compacted_lowers,
+            breakdown.compacted_bytes,
+            breakdown.appended_bytes
         )
     }
 }
 
 impl std::error::Error for ChainBytesCeilingExceeded {}
 
-fn chain_ceiling_exceeded(observed_bytes: u64, ceiling_bytes: u64) -> anyhow::Error {
+fn chain_ceiling_exceeded(
+    observed_bytes: u64,
+    ceiling_bytes: u64,
+    breakdown: ChainCeilingBreakdown,
+) -> anyhow::Error {
     anyhow::Error::new(ChainBytesCeilingExceeded {
         observed_bytes,
         ceiling_bytes,
+        breakdown,
     })
 }
 
@@ -582,12 +618,20 @@ async fn rewrite_lowers_with_runtime_roots(
         } else {
             std::mem::take(&mut runtime_owned_lowers)
         };
+        // Measure the parts before compaction folds them into one layer: the
+        // rejection has to state whether the bytes it refused live in an
+        // untouchable prefix or in a compacted layer that did not shrink.
+        let appended_bytes =
+            chain_allocated_bytes(appended_layer.iter().map(|layer| Path::new(&layer.file)));
+        let compacted_lowers = compactable.len() + usize::from(appended_layer.is_some());
         if let Some(layer) = appended_layer {
             compactable.push(layer);
         }
         if compactable.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
         }
+        let stable_prefix_bytes =
+            chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)));
         let compacted_path = compact_layers(
             &compactable,
             &output_dir.join(compaction_output_name),
@@ -597,6 +641,16 @@ async fn rewrite_lowers_with_runtime_roots(
         if compacted_path.is_some() {
             chain_metrics::record_compaction(compaction_output_name);
         }
+        let breakdown = ChainCeilingBreakdown {
+            stable_prefix_lowers: lowers.len(),
+            stable_prefix_bytes,
+            compacted_lowers,
+            compacted_bytes: compacted_path
+                .as_deref()
+                .map(|path| chain_allocated_bytes([path]))
+                .unwrap_or(0),
+            appended_bytes,
+        };
         if let Some(compacted_path) = compacted_path.as_ref() {
             lowers.push(local_layer_config(compacted_path));
         }
@@ -607,6 +661,16 @@ async fn rewrite_lowers_with_runtime_roots(
             let chain_bytes =
                 chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)));
             if chain_bytes > chain_bytes_ceiling {
+                warn!(
+                    ceiling_bytes = chain_bytes_ceiling,
+                    observed_bytes = chain_bytes,
+                    stable_prefix_lowers = breakdown.stable_prefix_lowers,
+                    stable_prefix_bytes = breakdown.stable_prefix_bytes,
+                    compacted_lowers = breakdown.compacted_lowers,
+                    compacted_bytes = breakdown.compacted_bytes,
+                    appended_bytes = breakdown.appended_bytes,
+                    "paused sandbox chain is still above the byte ceiling after compaction"
+                );
                 // The pause is rejected, so this generation must not survive:
                 // leave the output directory exactly as the caller will clean
                 // it, without the compacted layer the failed rewrite produced.
@@ -628,7 +692,11 @@ async fn rewrite_lowers_with_runtime_roots(
                     chain_bytes_ceiling,
                 );
                 chain_metrics::record_ceiling_exceeded(compaction_output_name);
-                return Err(chain_ceiling_exceeded(chain_bytes, chain_bytes_ceiling));
+                return Err(chain_ceiling_exceeded(
+                    chain_bytes,
+                    chain_bytes_ceiling,
+                    breakdown,
+                ));
             }
         }
         return Ok(lowers);
