@@ -24,7 +24,7 @@ use crate::snapshot::{
     RunnableSnapshot, SandboxSnapshotManifest, SnapshotManager, SnapshotPublishMetadata,
     SnapshotRecord, StartupRecording,
 };
-use crate::types::{RuntimeArtifactSet, SandboxId};
+use crate::types::{ResourceLimits, RuntimeArtifactSet, SandboxId, SandboxResources};
 
 /// A concrete sandbox backend's paused state.
 ///
@@ -101,6 +101,48 @@ pub struct SandboxForkSpec {
 pub struct SandboxRuntimeInfo {
     pub rootfs_virtual_size: Option<u64>,
     pub runtime_artifacts: RuntimeArtifactSet,
+}
+
+/// Effective CPU and memory to enforce inside a running VM's shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceLimitPlan {
+    /// The VM shape: vCPUs and guest memory the VM was booted with.
+    pub vm_cpu_count: u32,
+    pub vm_memory_mib: u32,
+    /// The effective limits; never above the VM shape.
+    pub limits: ResourceLimits,
+}
+
+impl ResourceLimitPlan {
+    pub fn new(vm: SandboxResources, limits: ResourceLimits) -> Self {
+        Self {
+            vm_cpu_count: vm.cpu_count,
+            vm_memory_mib: vm.memory_mib,
+            limits,
+        }
+    }
+
+    /// Memory the virtio-balloon must hold so the guest keeps `limits.memory_mib`.
+    pub fn balloon_target_mib(&self) -> u32 {
+        self.vm_memory_mib.saturating_sub(self.limits.memory_mib)
+    }
+
+    /// The CPU quota in vCPUs, or `None` when the VM may use every vCPU.
+    pub fn cpu_quota(&self) -> Option<u32> {
+        (self.limits.cpu_count < self.vm_cpu_count).then_some(self.limits.cpu_count)
+    }
+}
+
+/// How a running sandbox's resource limits are currently enforced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceLimitStatus {
+    /// Balloon target in MiB, or `None` when the VM has no balloon device.
+    pub balloon_target_mib: Option<u32>,
+    /// Memory the balloon holds in MiB, or `None` when the VM's balloon was
+    /// booted without statistics.
+    pub balloon_actual_mib: Option<u32>,
+    /// CPU quota in vCPUs, or `None` when the VMM may use every vCPU.
+    pub cpu_quota: Option<u32>,
 }
 
 /// Opaque captured snapshot artifacts produced from a running sandbox.
@@ -312,6 +354,13 @@ pub trait SandboxBackend: Send + 'static {
     /// patch-params hook is invoked by the caller (orchestrator layer), not
     /// by the backend. Cannot fail.
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>);
+
+    /// Enforce effective CPU and memory limits inside the VM shape of a
+    /// running sandbox. Idempotent; the caller validates the plan.
+    async fn apply_resource_limits(&mut self, plan: &ResourceLimitPlan) -> Result<()>;
+
+    /// Report how the limits of a running sandbox are currently enforced.
+    async fn resource_limit_status(&self) -> Result<ResourceLimitStatus>;
 }
 
 /// Factory interface for creating and restoring sandbox backend instances.

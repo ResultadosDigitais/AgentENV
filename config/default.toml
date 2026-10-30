@@ -180,6 +180,29 @@ vcpu_count = 2
 # iops = 3000                          # 3000 sustained IOPS
 # iops_burst = 500                     # 500 startup IOPS; not replenished
 
+[machine.balloon]
+# virtio-balloon device given to VMs at first boot (cold starts, template
+# builds). Restored VMs keep the device their snapshot was taken with.
+# false enforces memory limits below the VM shape; true lets the guest take
+# balloon memory back under pressure, which makes them advisory.
+deflate_on_oom = true
+# Balloon statistics interval in seconds; 0 disables them. Statistics let
+# GET /sandboxes/{sandboxID}/resources report the memory the balloon holds.
+stats_polling_interval_s = 0
+
+[resize]
+# Per-sandbox cpuCount/memoryMB below the VM shape on snapshot-based creates,
+# and live resize through PATCH /sandboxes/{sandboxID}/resources.
+enabled = false
+# Enforce CPU limits with a cgroup v2 cpu.max quota on the VMM process.
+cpu_quota = true
+# Smallest effective guest memory in MiB.
+min_memory_mib = 512
+# Optional node admission for resizes that grow a sandbox, as a percentage of
+# the node's CPUs / memory allocated to running sandboxes.
+# max_cpu_allocated_percent = 400
+# max_memory_allocated_percent = 90
+
 [envd]
 # Expected envd version baked into the tools drive.
 version = "0.5.15"
@@ -225,6 +248,7 @@ chain_bytes_ceiling = 51539607552
 # Durable repository backend:
 # - "posix_fs" stores snapshots on a local or shared filesystem.
 # - "oss" stores snapshots in S3-compatible object storage.
+# - "gcs" stores snapshots in Google Cloud Storage.
 repository_backend = "posix_fs"
 
 # EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
@@ -291,6 +315,20 @@ workers = 1
 # security_token = "..."
 # cache_max_size_gb = 10              # 10 GiB node-local artifact cache
 
+# Google Cloud Storage requires a bucket and exactly one way to authenticate.
+# credential_path is recommended: a service-account key or an external_account
+# (Workload Identity Federation) JSON file, the only source consulted. The
+# metadata server is never used unless allow_application_default_credentials
+# is set, because guests that share the host's network can reach it too.
+# [backend.gcs]
+# bucket = "your-snapshot-bucket"
+# prefix = "snapshots/"
+# credential_path = "/etc/agentenv/gcp/credential.json"
+# allow_application_default_credentials = false  # opt in to ADC/metadata server
+# allow_anonymous = false                # emulators and public buckets only
+# endpoint = "http://127.0.0.1:4443"     # emulators only
+# cache_max_size_gb = 10                 # 10 GiB node-local artifact cache
+
 [ublk]
 # Explicit daemon executable. The default is under $AENV_HOME/ublk.
 # daemon_binary_path = "$AENV_HOME/ublk/uvm-ublk-daemon"
@@ -347,6 +385,10 @@ enabled = true
 startup_prewarm = true
 # Maximum concurrent process creations in one refill batch.
 fill_concurrency = 4
+# Seconds without warm-process acquisitions before the pool decays its refill
+# target back to the low watermark and drains the excess warm processes
+# (0 = never decay).
+idle_ttl_secs = 600
 
 [memory_snapshot]
 # Generated OverlayBD config dedicated to memory snapshot devices.

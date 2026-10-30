@@ -10,7 +10,7 @@ use crate::orchestrator::SandboxState;
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
 use crate::snapshot::{CommandContext, SnapshotRuntimeVersions, StartupCommand};
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{ImageConfigs, ResourceLimits, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -45,7 +45,12 @@ pub struct SandboxMetadata {
     #[serde(default)]
     pub virtualization_mode: VirtualizationMode,
     pub runtime_versions: SnapshotRuntimeVersions,
+    /// VM shape. Snapshots captured from this sandbox record it unchanged.
     pub resources: SandboxResources,
+    /// Effective CPU and memory inside the VM shape, set when the sandbox was
+    /// created or resized below it. `None` means the whole VM shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<ResourceLimits>,
     pub context: CommandContext,
     pub startup: Option<StartupCommand>,
     #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
@@ -91,6 +96,7 @@ impl Default for SandboxMetadata {
                 "unknown".to_string(),
             ),
             resources: SandboxResources::default(),
+            resource_limits: None,
             context: CommandContext::default(),
             startup: None,
             image_configs: ImageConfigs::new(),
@@ -105,6 +111,18 @@ impl Default for SandboxMetadata {
 }
 
 impl SandboxMetadata {
+    /// Resources the sandbox may use: its VM shape narrowed by its limits.
+    /// Node accounting, lifecycle events, and the public API report these.
+    pub fn allocated_resources(&self) -> SandboxResources {
+        self.resources.limited_by(self.resource_limits)
+    }
+
+    /// Effective CPU and memory, defaulting to the whole VM shape.
+    pub fn effective_limits(&self) -> ResourceLimits {
+        self.resource_limits
+            .unwrap_or_else(|| ResourceLimits::whole(self.resources))
+    }
+
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self._set_timeout(timeout, SystemTime::now());
     }

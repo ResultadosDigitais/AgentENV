@@ -17,8 +17,9 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
-    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxState, ResourceLimitPlan, ResourceLimitStatus,
+    SandboxBackend, SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
@@ -58,6 +59,7 @@ pub enum MockOperation {
     ForkChild,
     Stop,
     UpdateNetwork,
+    ApplyResourceLimits,
 }
 
 #[derive(Clone, Debug)]
@@ -78,9 +80,18 @@ pub struct MockBehavior {
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
+    applied_resource_limits: Mutex<Vec<ResourceLimitPlan>>,
 }
 
 impl MockBehavior {
+    /// Every plan passed to `apply_resource_limits`, in call order.
+    pub fn applied_resource_limits(&self) -> Vec<ResourceLimitPlan> {
+        self.applied_resource_limits
+            .lock()
+            .expect("applied_resource_limits mutex poisoned")
+            .clone()
+    }
+
     pub fn set_envd(&self, envd: Arc<dyn super::EnvdApi>) {
         *self.envd.lock().unwrap() = Some(envd);
     }
@@ -253,6 +264,7 @@ pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
     volumes_frozen: bool,
+    resource_limits: Option<ResourceLimitPlan>,
 }
 
 impl MockSandboxBackend {
@@ -268,6 +280,7 @@ impl MockSandboxBackend {
             behavior,
             host_ip,
             volumes_frozen: false,
+            resource_limits: None,
         }
     }
 }
@@ -417,6 +430,28 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     fn update_custom_extension_params(&mut self, _params: Option<CustomExtensionParams>) {}
+
+    async fn apply_resource_limits(&mut self, plan: &ResourceLimitPlan) -> Result<()> {
+        self.behavior
+            .apply_async(MockOperation::ApplyResourceLimits)
+            .await?;
+        self.behavior
+            .applied_resource_limits
+            .lock()
+            .expect("applied_resource_limits mutex poisoned")
+            .push(*plan);
+        self.resource_limits = Some(*plan);
+        Ok(())
+    }
+
+    async fn resource_limit_status(&self) -> Result<ResourceLimitStatus> {
+        let plan = self.resource_limits;
+        Ok(ResourceLimitStatus {
+            balloon_target_mib: Some(plan.map_or(0, |plan| plan.balloon_target_mib())),
+            balloon_actual_mib: None,
+            cpu_quota: plan.and_then(|plan| plan.cpu_quota()),
+        })
+    }
 }
 
 // ── MockBackendFactory ────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ mod launch_plan;
 mod metrics;
 mod persistence;
 mod proxy;
+mod resize;
 mod service;
 mod store;
 mod types;
@@ -15,7 +16,8 @@ pub use persistence::{
     SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};
-pub use service::Orchestrator;
+pub use resize::{NodeCapacity, ResizePolicy, ResourceRequest};
+pub use service::{MemoryLimitState, Orchestrator, SandboxResourceStatus};
 pub use store::{
     InMemoryMetadataStore, MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata,
     SandboxTimeoutAction,
@@ -40,6 +42,7 @@ pub enum SandboxOperation {
     Fork,
     UpdateNetwork,
     PatchCustomExtensionParams,
+    ApplyResourceLimits,
     Stop,
 }
 
@@ -94,6 +97,15 @@ pub enum OrchestratorError {
         sandbox_id: SandboxId,
         timeout: String,
     },
+
+    /// The requested CPU/memory is invalid or cannot be provided by the VM
+    /// shape or this node; retrying the same request will not succeed.
+    #[error("unsupported sandbox resources: {0}")]
+    UnsupportedResources(String),
+
+    /// The node lacks free capacity for the requested growth right now.
+    #[error("insufficient node capacity: {0}")]
+    InsufficientCapacity(String),
 
     #[error("internal error: {0}")]
     InternalError(String),

@@ -30,13 +30,13 @@ use super::documents::Backoff;
 use crate::repository::{RepositoryError, RepositoryResult};
 
 /// How long a contender waits on one holder before taking its lock over.
-const LEASE: Duration = Duration::from_secs(30);
+pub(super) const LEASE: Duration = Duration::from_secs(30);
 /// How long before a contender may take over a holder's writes must start.
-const MARGIN: Duration = Duration::from_secs(10);
+pub(super) const MARGIN: Duration = Duration::from_secs(10);
 // A write may take a second attempt after refreshing credentials.
 const _: () = assert!(MARGIN.as_secs() > 2 * WRITE_ATTEMPT_TIMEOUT.as_secs());
 /// Long enough to outwait one holder that died, and contention after it.
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(75);
+pub(super) const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(75);
 const LOCKS_PREFIX: &str = "locks/";
 
 /// The lock object operations a lease needs.

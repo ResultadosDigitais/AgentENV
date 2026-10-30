@@ -48,6 +48,8 @@ var pathRoutes = []pathRoute{
 	{http.MethodPost, "/sandboxes/{id}/refreshes", ownerSandbox},
 	{http.MethodPost, "/sandboxes/{id}/snapshots", ownerSandbox},
 	{http.MethodPut, "/sandboxes/{id}/network", ownerSandbox},
+	{http.MethodGet, "/sandboxes/{id}/resources", ownerSandbox},
+	{http.MethodPatch, "/sandboxes/{id}/resources", ownerSandbox},
 	{http.MethodGet, "/sandboxes/{id}/custom-extension-params", ownerSandbox},
 	{http.MethodPatch, "/sandboxes/{id}/custom-extension-params", ownerSandbox},
 	{http.MethodGet, "/v2/sandboxes/{id}/logs", ownerSandbox},
