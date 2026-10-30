@@ -1616,8 +1616,8 @@ mod tests {
         let runtime_only = runtime_root.join("gen-runtime.overlaybd.commit");
         std::fs::write(&runtime_only, vec![0xA5u8; 32768]).expect("write runtime layer");
         assert_ne!(
-            chain_allocated_bytes([runtime_only.as_path()]),
-            chain_allocated_bytes([layer.as_path()]),
+            chain_allocated_bytes(std::slice::from_ref(&runtime_only)),
+            chain_allocated_bytes(std::slice::from_ref(&layer)),
             "the fixture needs two distinguishable parts"
         );
 
@@ -1641,7 +1641,7 @@ mod tests {
                 .map(|lower| PathBuf::from(&lower.file))
                 .collect::<Vec<_>>(),
         );
-        let shared_bytes = chain_allocated_bytes([layer.as_path()]);
+        let shared_bytes = chain_allocated_bytes(std::slice::from_ref(&layer));
         assert!(
             chain_bytes > shared_bytes,
             "the parts must be distinguishable"
@@ -1686,7 +1686,7 @@ mod tests {
         // the ceiling on its own, which is the shape the staging chain had.
         let stable = stable_root.join("sha256-base.overlaybd.commit");
         std::fs::write(&stable, vec![0x11u8; 512 * 1024]).expect("write stable lower");
-        let stable_bytes = chain_allocated_bytes([stable.as_path()]);
+        let stable_bytes = chain_allocated_bytes(std::slice::from_ref(&stable));
         assert!(stable_bytes > 0, "the prefix must allocate bytes");
 
         // Four runtime-owned generations rewriting the same pages, so one
