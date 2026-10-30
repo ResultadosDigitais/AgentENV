@@ -248,14 +248,10 @@ pub fn filetime_set(path: &std::path::Path, at: std::time::SystemTime) {
 #[macro_export]
 macro_rules! behavior_table {
     ($name:ident, $repository:expr, $root:expr, $age:expr) => {
-        #[allow(dead_code)]
-        async fn __behavior_table_constructor(
-            root: &std::path::Path,
-        ) -> std::sync::Arc<dyn Repository> {
-            $repository(root).await
-        }
-
         mod $name {
+            // The backend builder this invocation names is defined next to the
+            // invocation, one level up.
+            use super::*;
             use $crate::maintenance::behavior_table::{
                 age_layer, digest, request, store_image, store_layer, store_snapshot_record,
                 store_volume_record, stored_layer_keys, write_unreadable_layer,
@@ -267,9 +263,17 @@ macro_rules! behavior_table {
             };
             use $crate::repository::{DocumentCollection, ManagedLayerObject, Repository};
 
+            /// Builds this table's backend. It lives inside the generated
+            /// module so one module can hold several tables.
+            async fn __behavior_table_constructor(
+                root: &std::path::Path,
+            ) -> std::sync::Arc<dyn Repository> {
+                $repository(root).await
+            }
+
             async fn repository() -> (std::sync::Arc<dyn Repository>, tempfile::TempDir) {
                 let temp = tempfile::TempDir::new().expect("tempdir");
-                let repository = super::__behavior_table_constructor(temp.path()).await;
+                let repository = __behavior_table_constructor(temp.path()).await;
                 (repository, temp)
             }
 
