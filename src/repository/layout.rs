@@ -186,7 +186,11 @@ impl SnapshotFile {
 
 impl BlobKey {
     /// The directory or object prefix that holds every managed layer.
-    pub(crate) const LAYERS_DIR: &'static str = "managed-layers";
+    ///
+    /// Public so the exported `behavior_table!` macro can address a layer file
+    /// from another crate; it is the single place this name is defined.
+    #[doc(hidden)]
+    pub const LAYERS_DIR: &'static str = "managed-layers";
 
     /// The prefix every managed layer's repository-relative key starts with.
     pub(crate) const LAYERS_PREFIX: &'static str = "managed-layers/";
