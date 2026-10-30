@@ -40,6 +40,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_FIRECRACKER_WORK_DIR` | `$AENV_HOME/firecracker-work` | Override the parent directory for per-sandbox Firecracker work directories. |
 | `AENV_FIRECRACKER_SERIAL_DIR` | `$AENV_HOME/logs/serial` | Override the directory for persistent Firecracker serial output. Files are grouped under `{serial_dir}/{sandbox_id}/`. |
 | `AENV_PERSISTED_SANDBOX_STORE_PATH` | `$AENV_HOME/persisted-sandboxes` | Override the directory where paused sandbox state is persisted across server restarts. |
+| `AENV_CHAIN_BYTES_CEILING` | `51539607552` (48 GiB) | Override the byte ceiling for the reclaimable part of one sandbox's paused artifact chain (its runtime-owned generations plus each pause's appended layer; the shared image prefix is reported but not charged). `0` disables the ceiling and the stale-generation sweep, restoring the unbounded behavior without a redeploy. |
 
 ## E2B SDK / CLI
 

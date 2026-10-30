@@ -235,6 +235,11 @@ default_sandbox_timeout_secs = 15
 auto_resume_min_sandbox_timeout_secs = 300
 # Durable paused-sandbox metadata restored after a server restart.
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
+# Byte ceiling for one sandbox's paused artifact chain. A pause that would push
+# the chain past it compacts the runtime-owned generations into one and sweeps
+# unreferenced files from stale generations. 0 disables both. PROVISIONAL:
+# 51539607552 (48 GiB) comes from the OPSAI-5494 staging measurement.
+chain_bytes_ceiling = 51539607552
 
 [snapshot]
 # Node-local cache for snapshot artifacts.

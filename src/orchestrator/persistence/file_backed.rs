@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use crate::cfg::ConfigManager;
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
@@ -18,6 +20,60 @@ use crate::virtualization::VirtualizationMode;
 
 const RECORD_VERSION: u32 = 1;
 const RECORD_DB_DIR: &str = "records.db";
+/// Allocation unit reported by `st_blocks`, matching the chain measurement in
+/// `sandbox::firecracker::overlaybd_snapshot`.
+const ALLOCATION_BLOCK_SIZE: u64 = 512;
+
+/// Graceful-shutdown state, handed to a persister instead of read from a
+/// process-wide static.
+///
+/// While it is set, `persist_paused` stops reclaiming bytes from stale
+/// generations: shutdown persists every running sandbox as `Paused` and the
+/// machine is about to stop, so reclaiming there can only slow the shutdown
+/// down and risks deleting an artifact a not-yet-persisted sandbox still needs
+/// paths to.
+///
+/// It is injected because a process-wide read makes one holder's shutdown
+/// silently change the behavior of every other persister in the process - and
+/// `cargo test` runs the tests of one binary in parallel threads. Production
+/// keeps exactly one handle for the process ([`process_shutdown_signal`],
+/// set by [`begin_graceful_shutdown`]); each test builds its own.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ShutdownSignal {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ShutdownSignal {
+    /// A signal that starts out not shut down.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enter graceful shutdown. Idempotent; a real shutdown never leaves it.
+    pub(crate) fn begin(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The one shutdown handle production shares: the orchestrator starts the
+/// shutdown and every persister built by [`FileBackedSandboxPersister::new`]
+/// observes it.
+static PROCESS_SHUTDOWN: std::sync::OnceLock<ShutdownSignal> = std::sync::OnceLock::new();
+
+fn process_shutdown_signal() -> ShutdownSignal {
+    PROCESS_SHUTDOWN.get_or_init(ShutdownSignal::new).clone()
+}
+
+/// Mark the process as being in graceful shutdown, so `persist_paused` stops
+/// reclaiming bytes from stale generations.
+pub(crate) fn begin_graceful_shutdown() {
+    process_shutdown_signal().begin();
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +143,13 @@ pub struct FileBackedSandboxPersister {
     root: PathBuf,
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
+    /// Mirrors `orchestrator.chain_bytes_ceiling`: `0` disables both the ceiling
+    /// and the stale-generation sweep, restoring the unbounded behavior.
+    chain_bytes_ceiling: u64,
+    /// Whether a graceful shutdown is in progress. Injected rather than read
+    /// from a static so a shutdown in one persister cannot change the behavior
+    /// of another persister in the same process.
+    shutdown: ShutdownSignal,
     db: OnceCell<LocalKvStore>,
 }
 
@@ -96,18 +159,194 @@ impl FileBackedSandboxPersister {
             root,
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
+            chain_bytes_ceiling: ConfigManager::global_config()
+                .orchestrator
+                .chain_bytes_ceiling,
+            shutdown: process_shutdown_signal(),
             db: OnceCell::new(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(root: PathBuf) -> Self {
-        Self::new(root, VirtualizationMode::Kvm)
+        // A test gets its own shutdown handle: the process-wide one would make
+        // one test's shutdown change every other test's behavior, since the
+        // tests of one binary run in parallel threads.
+        Self::new(root, VirtualizationMode::Kvm).with_shutdown_signal(ShutdownSignal::new())
     }
 
     pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
         self.durability = durability;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_chain_bytes_ceiling(mut self, chain_bytes_ceiling: u64) -> Self {
+        self.chain_bytes_ceiling = chain_bytes_ceiling;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_shutdown_signal(mut self, shutdown: ShutdownSignal) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    /// Remove only genuinely unreferenced bytes from generations older than the
+    /// record that just became durable.
+    ///
+    /// Each pause writes a new generation whose files are hardlinks of the
+    /// previous ones, so freeing an old generation's directory releases nothing
+    /// while a newer generation still links its files. What does accumulate is
+    /// the *unshared* part of every generation, and that is exactly what a link
+    /// count of 1 identifies: a file with more than one link is still reachable
+    /// from a newer generation, and may also be held open by a resumed VM or a
+    /// fork child. `artifact_root` itself is never touched.
+    async fn sweep_stale_generations(
+        &self,
+        artifact_root: &Path,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<()> {
+        if self.chain_bytes_ceiling == 0 || self.shutdown.is_shutdown() {
+            return Ok(());
+        }
+        let sandbox_root = self.sandbox_artifact_root(sandbox_id);
+        let mut entries = match fs::read_dir(&sandbox_root).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "scan paused sandbox generations",
+                    &sandbox_root,
+                    source,
+                ));
+            }
+        };
+        let mut reclaimed_bytes = 0u64;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan paused sandbox generations", &sandbox_root, source)
+        })? {
+            let generation = entry.path();
+            if generation == artifact_root {
+                continue;
+            }
+            let file_type = entry.file_type().await.map_err(|source| {
+                SandboxPersistenceError::io(
+                    "inspect paused sandbox generation",
+                    &generation,
+                    source,
+                )
+            })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            reclaimed_bytes =
+                reclaimed_bytes.saturating_add(Self::sweep_unlinked_files(&generation).await?);
+        }
+        if reclaimed_bytes > 0 {
+            metrics::counter!("agentenv_paused_sandbox_chain_reclaimed_bytes_total")
+                .increment(reclaimed_bytes);
+            debug!(
+                sandbox_id = %sandbox_id,
+                reclaimed_bytes,
+                artifact_root = %artifact_root.display(),
+                "reclaimed unreferenced bytes from stale paused sandbox generations"
+            );
+        }
+        Ok(())
+    }
+
+    /// Delete regular files under `generation` whose link count is exactly 1,
+    /// then remove every directory the deletions left empty, deepest first, up
+    /// to and including `generation` itself. Returns freed bytes.
+    async fn sweep_unlinked_files(generation: &Path) -> PersistenceResult<u64> {
+        let (reclaimed, emptied) = Self::sweep_directory(generation).await?;
+        if emptied {
+            Self::remove_emptied_directory(generation).await?;
+        }
+        Ok(reclaimed)
+    }
+
+    /// Depth-first sweep of one directory: every child is resolved before the
+    /// directory itself, so a parent is only reported empty after its children
+    /// have been removed. Returns freed bytes and whether `directory` ended up
+    /// empty (which the caller turns into a removal).
+    async fn sweep_directory(directory: &Path) -> PersistenceResult<(u64, bool)> {
+        let mut entries = match fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, true)),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "scan stale paused sandbox generation",
+                    directory,
+                    source,
+                ));
+            }
+        };
+        let mut reclaimed = 0u64;
+        let mut emptied = true;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan stale paused sandbox generation", directory, source)
+        })? {
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "inspect stale paused sandbox artifact",
+                        &path,
+                        source,
+                    ));
+                }
+            };
+            if metadata.is_dir() {
+                let (child_reclaimed, child_emptied) =
+                    Box::pin(Self::sweep_directory(&path)).await?;
+                reclaimed = reclaimed.saturating_add(child_reclaimed);
+                if child_emptied {
+                    Self::remove_emptied_directory(&path).await?;
+                } else {
+                    emptied = false;
+                }
+                continue;
+            }
+            // Only regular files with a single link are unreferenced. A
+            // symlink, socket or device may be something a live runtime still
+            // points at, so it is left alone as well.
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                emptied = false;
+                continue;
+            }
+            let allocated = metadata.blocks().saturating_mul(ALLOCATION_BLOCK_SIZE);
+            match fs::remove_file(&path).await {
+                Ok(()) => reclaimed = reclaimed.saturating_add(allocated),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "remove unreferenced stale paused sandbox artifact",
+                        &path,
+                        source,
+                    ));
+                }
+            }
+        }
+        Ok((reclaimed, emptied))
+    }
+
+    async fn remove_emptied_directory(directory: &Path) -> PersistenceResult<()> {
+        match fs::remove_dir(directory).await {
+            Ok(()) => Ok(()),
+            // A concurrent writer may have re-created an entry between the scan
+            // and the removal; the next pause sweeps again.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            Err(source) => Err(SandboxPersistenceError::io(
+                "remove emptied stale paused sandbox generation",
+                directory,
+                source,
+            )),
+        }
     }
 
     fn records_db_path(&self) -> PathBuf {
@@ -367,8 +606,24 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let result = self.put_record(&record).await;
         if result.is_err() {
             let _ = Self::remove_artifact_root(artifact_root).await;
+            return result;
         }
-        result
+        // The sweep runs only after the new record is durable: until then the
+        // previous generation is the one a restart would resume from. A sweep
+        // failure must not fail the pause, which already succeeded durably, but
+        // it is reported as a warning with the sandbox id instead of being
+        // swallowed.
+        if let Err(error) = self
+            .sweep_stale_generations(artifact_root, &metadata.id)
+            .await
+        {
+            warn!(
+                sandbox_id = %metadata.id,
+                error = %error,
+                "failed to reclaim unreferenced bytes from stale paused sandbox generations"
+            );
+        }
+        Ok(())
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -689,6 +944,310 @@ mod tests {
 
         assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
         assert!(!snapshot_root.exists());
+        Ok(())
+    }
+
+    /// Number of generation directories retained under one sandbox's artifact
+    /// root, sorted so the assertion does not depend on directory order.
+    fn generation_dirs(sandbox_root: &Path) -> Vec<PathBuf> {
+        let mut generations: Vec<PathBuf> = std::fs::read_dir(sandbox_root)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.expect("read generation entry").path())
+                    .filter(|path| path.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        generations.sort();
+        generations
+    }
+
+    #[tokio::test]
+    async fn persist_paused_reclaims_unreferenced_bytes_from_stale_generations(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..10 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("file-backed persister allocates an artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            // A generation-private artifact with a single link, exactly what
+            // each pause accumulates: nothing else references it once its own
+            // generation stops being the record's.
+            std::fs::write(artifact_root.join("private.commit"), vec![0xABu8; 4096])?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        let artifact_root = roots.last().expect("ten generations").clone();
+        let generations = generation_dirs(&sandbox_root);
+        assert!(
+            generations.len() <= 2,
+            "ten pauses must not leave one generation each: {generations:?}"
+        );
+        assert!(
+            generations.contains(&artifact_root),
+            "the sweep must never remove the generation the current record references"
+        );
+        assert!(
+            artifact_root.join("private.commit").exists(),
+            "the current generation keeps its artifacts"
+        );
+        for stale in &roots[..roots.len() - 1] {
+            assert!(
+                !stale.exists(),
+                "a stale generation emptied by the sweep must be removed: {}",
+                stale.display()
+            );
+        }
+
+        // The record still loads and points at the surviving generation.
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, metadata.id);
+        Ok(())
+    }
+
+    /// A file that a fork child or a resumed VM still references by path must
+    /// survive the sweep even after its own generation stops being current.
+    #[tokio::test]
+    async fn persist_paused_sweep_keeps_a_fork_childs_hardlinked_artifact() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+
+        // The first generation holds the artifact the child keeps open; every
+        // later generation sees it with a link count above 1.
+        let first_root = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate artifact root");
+        std::fs::create_dir_all(&first_root)?;
+        let child_artifact = first_root.join("shared.commit");
+        std::fs::write(&child_artifact, vec![0xCDu8; 4096])?;
+
+        let mut roots = Vec::new();
+        for index in 0..10 {
+            let artifact_root = if index == 0 {
+                first_root.clone()
+            } else {
+                let artifact_root = persister
+                    .allocate_artifact_root(&metadata.id)
+                    .await?
+                    .expect("allocate artifact root");
+                std::fs::create_dir_all(&artifact_root)?;
+                // Mirror the pause path: a generation hardlinks what the child
+                // still references instead of copying it.
+                std::fs::hard_link(&child_artifact, artifact_root.join("shared.commit"))?;
+                artifact_root
+            };
+            if index == 0 {
+                std::fs::hard_link(&child_artifact, first_root.join("shared-alias.commit"))?;
+            }
+            std::fs::write(artifact_root.join("private.commit"), vec![0xABu8; 4096])?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        assert!(
+            child_artifact.exists(),
+            "a file a fork child still references must survive the sweep: {}",
+            child_artifact.display()
+        );
+        assert!(
+            std::fs::metadata(&child_artifact)?.nlink() > 1,
+            "the surviving artifact must still be reachable through a newer generation"
+        );
+        let current = roots.last().expect("ten generations");
+        assert!(current.join("private.commit").exists());
+        assert!(current.join("shared.commit").exists());
+        // The shared artifact keeps the stale generation it was created in
+        // non-empty, which is the price of correctness: only its private files
+        // are reclaimed, never the inode another runtime still references.
+        for stale in &roots[..roots.len() - 1] {
+            if stale.exists() {
+                assert!(
+                    !stale.join("private.commit").exists(),
+                    "the sweep must still reclaim private files from stale generation {}",
+                    stale.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A graceful shutdown persists every sandbox at once; the sweep must not
+    /// run there, or it competes with the artifacts still being written.
+    #[tokio::test]
+    async fn persist_paused_skips_the_sweep_during_graceful_shutdown() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let shutdown = ShutdownSignal::new();
+        let persister = test_persister(temp.path())
+            .with_chain_bytes_ceiling(48 << 30)
+            .with_shutdown_signal(shutdown.clone());
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..4 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("allocate artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("private.commit"), b"generation")?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        let before_shutdown = generation_dirs(&sandbox_root);
+        shutdown.begin();
+        let shutdown_root = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate artifact root");
+        std::fs::create_dir_all(&shutdown_root)?;
+        std::fs::write(shutdown_root.join("private.commit"), b"generation")?;
+        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+        persister
+            .persist_paused(&metadata, Some(&shutdown_root), paused_state.as_ref())
+            .await?;
+
+        let mut expected = before_shutdown.clone();
+        expected.push(shutdown_root);
+        expected.sort();
+        assert_eq!(
+            generation_dirs(&sandbox_root),
+            expected,
+            "a pause during shutdown must add its generation and reclaim nothing"
+        );
+        assert!(
+            roots
+                .iter()
+                .all(|root| root.exists() || !before_shutdown.contains(root)),
+            "no generation present before shutdown may be removed by it"
+        );
+        Ok(())
+    }
+
+    /// Pause `count` generations of one sandbox, each with a private artifact
+    /// so the sweep has something unreferenced to reclaim.
+    async fn pause_generations(
+        persister: &FileBackedSandboxPersister,
+        metadata: &SandboxMetadata,
+        count: usize,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut roots = Vec::with_capacity(count);
+        for _ in 0..count {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("file-backed persister allocates an artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("private.commit"), vec![0xABu8; 4096])?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+        Ok(roots)
+    }
+
+    /// Two persisters in the same process: one in graceful shutdown, one live.
+    /// Only the shut-down one may skip the sweep - a process-wide shutdown read
+    /// made the live one silently skip it too, which is exactly how the
+    /// reclaim test went flaky when these tests ran in parallel.
+    #[tokio::test]
+    async fn shutdown_is_per_persister_so_a_live_one_keeps_sweeping() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let live_dir = temp.path().join("live");
+        let stopped_dir = temp.path().join("stopped");
+        std::fs::create_dir_all(&live_dir)?;
+        std::fs::create_dir_all(&stopped_dir)?;
+
+        let shutting_down = ShutdownSignal::new();
+        let live = test_persister(&live_dir).with_chain_bytes_ceiling(48 << 30);
+        let stopped = test_persister(&stopped_dir)
+            .with_chain_bytes_ceiling(48 << 30)
+            .with_shutdown_signal(shutting_down.clone());
+
+        let live_metadata = SandboxMetadata::default();
+        let stopped_metadata = SandboxMetadata::default();
+
+        // The stopped persister is already shutting down; the live one is not,
+        // and both are paused at the same time in this process.
+        shutting_down.begin();
+        let live_roots = pause_generations(&live, &live_metadata, 4).await?;
+        let stopped_roots = pause_generations(&stopped, &stopped_metadata, 4).await?;
+
+        let live_generations = generation_dirs(&live.sandbox_artifact_root(&live_metadata.id));
+        assert!(
+            live_generations.len() <= 2,
+            "the live persister must keep sweeping its stale generations: {live_generations:?}"
+        );
+        assert!(
+            !live_roots[0].exists(),
+            "the live persister must remove a stale generation its sweep emptied: {}",
+            live_roots[0].display()
+        );
+        assert!(
+            live_generations.contains(&live_roots[3]),
+            "the live persister keeps the generation the current record references: {}",
+            live_roots[3].display()
+        );
+
+        assert_eq!(
+            generation_dirs(&stopped.sandbox_artifact_root(&stopped_metadata.id)),
+            stopped_roots,
+            "the shut-down persister must reclaim nothing while the live one sweeps"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_paused_keeps_every_generation_when_the_ceiling_is_disabled(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(0);
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..4 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("allocate artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("mem.commit"), b"generation")?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        assert_eq!(
+            generation_dirs(&sandbox_root),
+            roots,
+            "a 0 ceiling must keep today's behavior: no generation is swept"
+        );
         Ok(())
     }
 
