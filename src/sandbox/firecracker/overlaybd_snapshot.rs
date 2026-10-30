@@ -44,10 +44,78 @@ const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 /// Allocation unit reported by `st_blocks` on every supported filesystem.
 const ALLOCATION_BLOCK_SIZE: u64 = 512;
 /// Named, recoverable failure code: the sandbox chain cannot be brought under
-/// `orchestrator.chain_bytes_ceiling` because its immutable stable prefix alone
-/// already exceeds it. The pause is rejected instead of being allowed to grow
-/// the chain, and the sandbox keeps its runtime state.
+/// `orchestrator.chain_bytes_ceiling` because the part compaction can reclaim
+/// (the runtime-owned lowers plus the layer this pause appends) is still above
+/// it. The pause is rejected instead of being allowed to grow the chain, and
+/// the sandbox keeps its runtime state.
 pub(crate) const CHAIN_BYTES_CEILING_EXCEEDED: &str = "CHAIN_BYTES_CEILING_EXCEEDED";
+
+/// What the byte ceiling bounds: the bytes the sandbox's own pauses add.
+///
+/// The ceiling exists so one sandbox's pause churn cannot fill a node's disk,
+/// so it has to bound the part that grows pause by pause. The stable prefix is
+/// the opposite of that part: it is materialized once from the image, its
+/// lowers are shared by every sandbox created from the same image (the image
+/// cache and the published snapshot layers are the same files for all of
+/// them), and compaction cannot reclaim a byte of it. Charging it per sandbox
+/// counts the same node bytes once per sandbox and, at the default ceiling,
+/// rejects a chain whose own growth is far below the ceiling. The reclaimable
+/// part — the runtime-owned lowers plus the layer the pause appends — is what
+/// the ceiling judges; a reclaimable part that alone exceeds the ceiling still
+/// fails by name, and so does a stable prefix that alone exceeds it.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct ChainByteAccounting {
+    /// Bounded by the ceiling: runtime-owned lowers plus the appended layer.
+    pub(super) reclaimable_bytes: u64,
+    /// Reported, never charged: immutable lowers shared across sandboxes.
+    pub(super) stable_prefix_bytes: u64,
+}
+
+impl ChainByteAccounting {
+    /// Measure a chain plus the layer this pause appends, splitting it with the
+    /// predicate compaction itself uses.
+    ///
+    /// Position cannot decide this: a runtime-owned lower can follow another
+    /// runtime-owned lower, so the positional split only bounds the classified
+    /// one from below. Classifying here keeps the ceiling, the compaction it
+    /// triggers and the diagnostic report answering the same question.
+    pub(super) fn measure(
+        chain: impl IntoIterator<Item = LayerConfig>,
+        appended_layer: Option<&LayerConfig>,
+        runtime_owned_roots: &[PathBuf],
+    ) -> Self {
+        let (stable_prefix, runtime_owned) =
+            split_chain_by_classification(chain, runtime_owned_roots);
+        let stable_prefix_bytes =
+            chain_allocated_bytes(stable_prefix.iter().map(|lower| Path::new(&lower.file)));
+        let reclaimable_bytes = chain_allocated_bytes(
+            runtime_owned
+                .iter()
+                .chain(appended_layer)
+                .map(|lower| Path::new(&lower.file)),
+        );
+        Self {
+            reclaimable_bytes,
+            stable_prefix_bytes,
+        }
+    }
+
+    /// The bytes the ceiling refuses, or `None` when the chain fits.
+    ///
+    /// Either part alone can breach it: a reclaimable part compaction could not
+    /// shrink, or a stable prefix larger than a whole node's budget for one
+    /// sandbox. The returned value is the part that breached, so the rejection
+    /// reports a number an operator can compare with the ceiling.
+    pub(super) fn ceiling_breach(self, ceiling: u64) -> Option<u64> {
+        if self.reclaimable_bytes > ceiling {
+            Some(self.reclaimable_bytes)
+        } else if self.stable_prefix_bytes > ceiling {
+            Some(self.stable_prefix_bytes)
+        } else {
+            None
+        }
+    }
+}
 
 /// Measured shape of a chain that the byte ceiling rejected.
 ///
@@ -75,6 +143,11 @@ pub(crate) struct ChainCeilingBreakdown {
 ///
 /// Kept as a concrete error so the pause path can classify it as recoverable
 /// through `context` layers, instead of matching on message text.
+///
+/// `observed_bytes` is the reclaimable part the ceiling bounds, not the chain
+/// total: the immutable stable prefix is reported by the breakdown and never
+/// charged, because it is shared by every sandbox of the same image and grows
+/// with nothing.
 #[derive(Debug)]
 pub(crate) struct ChainBytesCeilingExceeded {
     pub observed_bytes: u64,
@@ -87,16 +160,16 @@ impl std::fmt::Display for ChainBytesCeilingExceeded {
         let breakdown = &self.breakdown;
         write!(
             f,
-            "{CHAIN_BYTES_CEILING_EXCEEDED}: paused sandbox chain needs {} bytes against the {} \
-             byte ceiling (stable prefix: {} lowers, {} bytes; compacted {} lowers into {} bytes; \
-             appended layer: {} bytes)",
+            "{CHAIN_BYTES_CEILING_EXCEEDED}: reclaimable paused sandbox chain needs {} bytes \
+             against the {} byte ceiling (compacted {} lowers into {} bytes; appended layer: {} \
+             bytes; immutable stable prefix not charged: {} lowers, {} bytes)",
             self.observed_bytes,
             self.ceiling_bytes,
-            breakdown.stable_prefix_lowers,
-            breakdown.stable_prefix_bytes,
             breakdown.compacted_lowers,
             breakdown.compacted_bytes,
-            breakdown.appended_bytes
+            breakdown.appended_bytes,
+            breakdown.stable_prefix_lowers,
+            breakdown.stable_prefix_bytes
         )
     }
 }
@@ -582,18 +655,28 @@ async fn rewrite_lowers_with_runtime_roots(
     // disk, because each generation rewrites far more bytes than it shares. A
     // ceiling of 0 keeps the pre-ceiling behavior: no byte accounting and no
     // compaction on bytes.
-    let over_ceiling = if chain_bytes_ceiling == 0 {
-        false
+    //
+    // It bounds the reclaimable part — the runtime-owned lowers plus the layer
+    // this pause appends — never the whole chain. The stable prefix is
+    // materialized from the image once, identical for every sandbox of that
+    // image, and compaction cannot reclaim it; charging it here would count the
+    // same node bytes once per sandbox and reject a chain whose own growth is
+    // far under the ceiling. A stable prefix above the ceiling is still a
+    // breach, judged on its own: no pause of that sandbox could ever fit.
+    let accounting = if chain_bytes_ceiling == 0 {
+        ChainByteAccounting::default()
     } else {
-        let chain_bytes = chain_allocated_bytes(
+        ChainByteAccounting::measure(
             lowers
                 .iter()
                 .chain(runtime_owned_lowers.iter())
-                .chain(appended_layer.iter())
-                .map(|lower| Path::new(&lower.file)),
-        );
-        chain_bytes > chain_bytes_ceiling
+                .cloned()
+                .collect::<Vec<_>>(),
+            appended_layer.as_ref(),
+            runtime_owned_roots,
+        )
     };
+    let over_ceiling = accounting.ceiling_breach(chain_bytes_ceiling).is_some();
     if compactable_count > max_runtime_owned_layers || over_ceiling {
         // The byte trigger decides what it rewrites by classification, never by
         // position: `split_runtime_suffix` hands over everything from the first
@@ -636,11 +719,6 @@ async fn rewrite_lowers_with_runtime_roots(
         if compactable.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
         }
-        let stable_prefix_bytes = if ceiling_enforced {
-            chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)))
-        } else {
-            0
-        };
         let compacted_path = compact_layers(
             &compactable,
             &output_dir.join(compaction_output_name),
@@ -652,7 +730,7 @@ async fn rewrite_lowers_with_runtime_roots(
         }
         let breakdown = ChainCeilingBreakdown {
             stable_prefix_lowers: lowers.len(),
-            stable_prefix_bytes,
+            stable_prefix_bytes: accounting.stable_prefix_bytes,
             compacted_lowers,
             compacted_bytes: if ceiling_enforced {
                 compacted_path
@@ -668,15 +746,24 @@ async fn rewrite_lowers_with_runtime_roots(
             lowers.push(local_layer_config(compacted_path));
         }
         if ceiling_enforced {
-            // The stable prefix is immutable, so compaction cannot reclaim it.
-            // Re-measure the result and refuse the pause by name when even the
-            // compacted chain is still over the ceiling.
-            let chain_bytes =
-                chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)));
-            if chain_bytes > chain_bytes_ceiling {
+            // Re-measure the bounded part on the result and refuse the pause by
+            // name when compaction could not bring it under the ceiling. After
+            // compaction the reclaimable part is exactly the generation it
+            // produced — the appended layer and every rewritten lower live
+            // inside it — so a compacted layer still above the ceiling means
+            // compaction did not shrink the chain. The stable prefix is judged
+            // the same way it was judged before compaction: on its own.
+            let accounting_after = ChainByteAccounting {
+                reclaimable_bytes: match compacted_path.as_deref() {
+                    Some(path) => chain_allocated_bytes([path]),
+                    None => accounting.reclaimable_bytes,
+                },
+                stable_prefix_bytes: breakdown.stable_prefix_bytes,
+            };
+            if let Some(observed_bytes) = accounting_after.ceiling_breach(chain_bytes_ceiling) {
                 warn!(
                     ceiling_bytes = chain_bytes_ceiling,
-                    observed_bytes = chain_bytes,
+                    observed_bytes = observed_bytes,
                     stable_prefix_lowers = breakdown.stable_prefix_lowers,
                     stable_prefix_bytes = breakdown.stable_prefix_bytes,
                     compacted_lowers = breakdown.compacted_lowers,
@@ -701,12 +788,12 @@ async fn rewrite_lowers_with_runtime_roots(
                 // while the memory-config path is still recoverable.
                 chain_metrics::record_chain_bytes(
                     compaction_output_name,
-                    chain_bytes,
+                    observed_bytes,
                     chain_bytes_ceiling,
                 );
                 chain_metrics::record_ceiling_exceeded(compaction_output_name);
                 return Err(chain_ceiling_exceeded(
-                    chain_bytes,
+                    observed_bytes,
                     chain_bytes_ceiling,
                     breakdown,
                 ));
@@ -733,8 +820,11 @@ async fn rewrite_lowers_with_runtime_roots(
         lowers.push(layer);
     }
     if chain_bytes_ceiling != 0 {
-        let chain_bytes = chain_allocated_bytes(lowers.iter().map(|lower| Path::new(&lower.file)));
-        chain_metrics::record_chain_bytes(compaction_output_name, chain_bytes, chain_bytes_ceiling);
+        chain_metrics::record_chain_bytes(
+            compaction_output_name,
+            accounting.reclaimable_bytes,
+            chain_bytes_ceiling,
+        );
     }
 
     Ok(lowers)
@@ -1396,6 +1486,141 @@ mod tests {
         assert_eq!(
             super::chain_allocated_bytes([layer.as_path(), missing.as_path(), Path::new("")]),
             single
+        );
+    }
+
+    /// The ceiling must bound what grows, not what is shared.
+    ///
+    /// These are the numbers the staging run of
+    /// `ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling` rejected on:
+    /// a chain that compacts its runtime-owned lowers into a 2.30 GiB layer and
+    /// appends a 0.50 GiB layer, against a 2.64 GiB ceiling, still carried a
+    /// 0.64 GiB stable prefix. Charging the prefix as well put the total at
+    /// 2.81 GiB and refused the pause, although the part that grows pause by
+    /// pause was 0.59 GiB under the ceiling. The prefix is materialized once
+    /// from the image and shared by every sandbox of it, so counting it here
+    /// charged the node's disk once per sandbox and rejected a chain that had
+    /// already been brought under the ceiling by compaction.
+    #[test]
+    fn chain_ceiling_charges_the_reclaimable_part_and_not_the_shared_prefix() {
+        // Verbatim from the rejected staging pause. The rule before this change
+        // charged the prefix too, so it computed 3_098_832_896 bytes — the exact
+        // figure the fork CI reported — against a 2_838_224_896 byte ceiling.
+        let stable_prefix_bytes = 690_716_672u64;
+        let compacted_bytes = 2_408_116_224u64;
+        let appended_bytes = 536_989_696u64;
+        let ceiling_bytes = 2_838_224_896u64;
+        // The old rule, kept as the red case: it refuses the pause.
+        assert!(
+            stable_prefix_bytes + compacted_bytes + appended_bytes > ceiling_bytes,
+            "the fixture must be the rejected shape: total above the ceiling"
+        );
+
+        // Compaction folds the appended layer into the generation it writes, so
+        // the reclaimable part after compaction is that generation alone.
+        let after_compaction = ChainByteAccounting {
+            reclaimable_bytes: compacted_bytes,
+            stable_prefix_bytes,
+        };
+        assert_eq!(
+            after_compaction.ceiling_breach(ceiling_bytes),
+            None,
+            "a compacted chain whose reclaimable part is {compacted_bytes} bytes must fit the \
+             {ceiling_bytes} byte ceiling; only the shared {stable_prefix_bytes} byte prefix \
+             pushed the total over"
+        );
+
+        // The named rejection survives for the part that really does not fit:
+        // compaction left a generation above the ceiling.
+        assert_eq!(
+            ChainByteAccounting {
+                reclaimable_bytes: ceiling_bytes + 1,
+                stable_prefix_bytes,
+            }
+            .ceiling_breach(ceiling_bytes),
+            Some(ceiling_bytes + 1),
+            "a compacted generation above the ceiling must still be refused, naming its bytes"
+        );
+
+        // And for a prefix that alone exceeds the ceiling: no pause of that
+        // sandbox could ever fit, however small its own growth is.
+        assert_eq!(
+            ChainByteAccounting {
+                reclaimable_bytes: 1,
+                stable_prefix_bytes: ceiling_bytes + 1,
+            }
+            .ceiling_breach(ceiling_bytes),
+            Some(ceiling_bytes + 1),
+            "a shared prefix above the ceiling is still a breach, judged on its own"
+        );
+    }
+
+    /// The same rejected shape through the rewrite: a runtime-owned suffix that
+    /// compacts under the ceiling succeeds with a stable prefix far larger than
+    /// the ceiling, and the compacted generation is the only lower written.
+    #[tokio::test]
+    async fn rewrite_compacts_under_a_ceiling_the_stable_prefix_alone_exceeds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let stable_root = temp.path().join("image-cache");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&stable_root).expect("create stable layer root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // A shared, immutable lower of the same order as the measured prefix:
+        // 4 MiB, deliberately larger than the ceiling below.
+        let stable = stable_root.join("sha256-base.overlaybd.commit");
+        std::fs::write(&stable, vec![0x11u8; 4 * 1024 * 1024]).expect("write stable lower");
+        let stable_bytes = chain_allocated_bytes([stable.as_path()]);
+        assert!(stable_bytes > 1024 * 1024, "the prefix must dominate");
+
+        // Four runtime-owned generations rewriting the same pages, so one
+        // compacted generation is far smaller than the chain it replaces.
+        let mut lowers = vec![local_layer_config(&stable)];
+        for (index, byte) in [0xAAu8, 0xBB, 0xCC, 0xDD].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("gen-{index}"),
+                8192,
+                &[(0, byte), (4096, byte)],
+            )
+            .await;
+            lowers.push(local_layer_config(&path));
+        }
+        let runtime_chain: Vec<PathBuf> = lowers[1..]
+            .iter()
+            .map(|lower| PathBuf::from(&lower.file))
+            .collect();
+        let runtime_bytes = chain_allocated_bytes(&runtime_chain);
+        // Larger than the runtime chain (so the byte trigger fires) and smaller
+        // than the shared prefix (so a total ceiling could never fit).
+        let ceiling = runtime_bytes / 2;
+        assert!(
+            ceiling < stable_bytes,
+            "the prefix alone must exceed the ceiling"
+        );
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ceiling,
+        )
+        .await
+        .expect("a reclaimable part that compacts under the ceiling must not be refused");
+
+        assert_eq!(rewritten.len(), 2, "prefix plus one compacted generation");
+        assert_eq!(PathBuf::from(&rewritten[0].file), stable);
+        let compacted = PathBuf::from(&rewritten[1].file);
+        assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
+        assert!(
+            chain_allocated_bytes(std::slice::from_ref(&compacted)) <= ceiling,
+            "the compacted generation must fit the ceiling on its own"
         );
     }
 

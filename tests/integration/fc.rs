@@ -631,6 +631,14 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
 /// printed footprint uses the same method as the staging measurement: allocated
 /// bytes deduplicated by device and inode.
 ///
+/// The ceiling bounds the reclaimable part of the chain — the runtime-owned
+/// lowers plus the layer each pause appends — and never the stable prefix, which
+/// is materialized from the image once and shared by every sandbox of it. The
+/// assertions therefore compare the reclaimable part, read through
+/// [`FirecrackerSandbox::chain_bytes_for_pause`] so the test and the pause path
+/// charge the same bytes; the total footprint is printed beside it for the
+/// staging measurement.
+///
 /// The ceiling is injected into each sandbox handle instead of being read from
 /// the process-wide config: the pause path takes it from the sandbox, and only
 /// [`FirecrackerSandbox::build`] fills it from
@@ -670,41 +678,51 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     sandbox.start().await?;
     write_disk_marker(&mut sandbox).await?;
 
-    // Establish the base chains before any ceiling is injected. One ceiling
-    // bounds both the memory and the rootfs chain of this sandbox, and a
-    // compaction can only merge the runtime-owned suffix, so the ceiling has to
-    // hold the larger base plus one compacted generation (at most a
-    // touched-page generation's worth of guest memory). Deriving it from the
-    // measured base keeps the test independent of the image's layer sizes
-    // instead of guessing a constant.
+    // Establish the base chains before any ceiling is injected. The ceiling
+    // bounds the reclaimable part of a chain — the runtime-owned lowers plus the
+    // layer the pause appends — and never the shared stable prefix, so it has to
+    // hold one compacted generation (at most a touched-page generation's worth
+    // of guest memory) rather than the base image. Sizing it against the base
+    // footprint, as this test first did, made the fixture impossible: on the
+    // staging guest the prefix alone was 690,716,672 bytes of a 2,838,224,896
+    // byte ceiling, and a chain whose own growth had compacted to 2,408,116,224
+    // bytes was rejected for a total it could never shrink.
     let mut current = sandbox.pause().await?;
     let pause_count = 10;
-    let base_mem_footprint = allocated_bytes(&lower_file_paths_from_image_config(
-        &current.mem_overlaybd_config.image_config_path,
-    )?);
-    let base_rootfs_footprint = allocated_bytes(&lower_file_paths_from_image_config(
+    let (base_mem_reclaimable, base_mem_prefix) =
+        sandbox.chain_bytes_for_pause(&current.mem_overlaybd_config.image_config_path)?;
+    let (base_rootfs_reclaimable, base_rootfs_prefix) = sandbox.chain_bytes_for_pause(
         &current
             .common
             .rootfs_image_config
             .as_ref()
             .context("paused snapshot should carry a rootfs image config")?
             .image_config_path,
-    )?);
-    let base_footprint = base_mem_footprint.max(base_rootfs_footprint);
-    let ceiling = (base_footprint + 2 * guest_memory).min(
+    )?;
+    let ceiling = (base_mem_reclaimable
+        .max(base_rootfs_reclaimable)
+        .saturating_add(2 * guest_memory))
+    .min(
         agentenv::cfg::ConfigManager::global_config()
             .orchestrator
             .chain_bytes_ceiling,
     );
     assert!(
-        base_footprint <= ceiling,
-        "the ceiling must hold the larger base chain (memory {base_mem_footprint} bytes, rootfs \
-         {base_rootfs_footprint} bytes): {base_footprint} > {ceiling}"
+        base_mem_reclaimable <= ceiling && base_rootfs_reclaimable <= ceiling,
+        "the ceiling must hold the reclaimable part of both base chains (memory \
+         {base_mem_reclaimable} bytes, rootfs {base_rootfs_reclaimable} bytes): {ceiling}"
+    );
+    eprintln!(
+        "base chains: memory reclaimable {base_mem_reclaimable} bytes over a \
+         {base_mem_prefix} byte shared prefix, rootfs reclaimable {base_rootfs_reclaimable} \
+         bytes over a {base_rootfs_prefix} byte shared prefix, ceiling {ceiling} bytes"
     );
 
     let mut compaction_seen = false;
     let mut first_footprint = None;
     let mut previous_footprint = None;
+    let mut final_reclaimable = 0u64;
+    let mut final_prefix = 0u64;
     for pause_index in 0..pause_count {
         let mut resumed =
             FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(ceiling);
@@ -760,12 +778,18 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
         let change_bytes = previous_footprint
             .map(|previous| footprint as i128 - previous as i128)
             .unwrap_or(0);
+        // The ceiling bounds the reclaimable part, so the assertion has to read
+        // the same two parts the pause path charges, from the same accounting.
+        let (reclaimable, shared_prefix) =
+            resumed.chain_bytes_for_pause(&snapshot.mem_overlaybd_config.image_config_path)?;
         eprintln!(
-            "pause {}: chain footprint {} bytes ({} lowers), change {:+} bytes, ceiling {} bytes\n\
-             lowers (bytes, deduplicated): {}\n{}",
+            "pause {}: chain footprint {} bytes ({} lowers) = {} reclaimable + {} shared prefix, \
+             change {:+} bytes, ceiling {} bytes\nlowers (bytes, deduplicated): {}\n{}",
             pause_index + 1,
             footprint,
             lowers.len(),
+            reclaimable,
+            shared_prefix,
             change_bytes,
             ceiling,
             format_lower_bytes(&lowers, &per_lower_bytes),
@@ -780,10 +804,13 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
             compaction_seen = true;
         }
         assert!(
-            footprint <= ceiling,
-            "pause {} must leave the chain under the ceiling: {footprint} > {ceiling}",
+            reclaimable <= ceiling,
+            "pause {} must leave the reclaimable part of the chain under the ceiling: \
+             {reclaimable} > {ceiling} (shared prefix {shared_prefix} bytes is not charged)",
             pause_index + 1
         );
+        final_reclaimable = reclaimable;
+        final_prefix = shared_prefix;
         current = snapshot;
     }
 
@@ -791,15 +818,19 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
         lower_file_paths_from_image_config(&current.mem_overlaybd_config.image_config_path)?;
     let final_footprint = allocated_bytes(&final_lowers);
     eprintln!(
-        "ten pauses: first footprint {} bytes, final footprint {} bytes, ceiling {} bytes",
+        "ten pauses: first footprint {} bytes, final footprint {} bytes ({} reclaimable + {} \
+         shared prefix), ceiling {} bytes",
         first_footprint.expect("at least one pause ran"),
         final_footprint,
+        final_reclaimable,
+        final_prefix,
         ceiling
     );
 
     assert!(
-        final_footprint <= ceiling,
-        "ten pauses must leave the chain under the ceiling: {final_footprint} > {ceiling}"
+        final_reclaimable <= ceiling,
+        "ten pauses must leave the reclaimable part of the chain under the ceiling: \
+         {final_reclaimable} > {ceiling}"
     );
     assert!(
         compaction_seen,

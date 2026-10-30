@@ -3851,9 +3851,10 @@ async fn pause_chain_ceiling_exceeded_keeps_running_and_allows_retry_after_raise
     behavior.push_action(
         MockOperation::Pause,
         MockAction::Fail {
-            message: "CHAIN_BYTES_CEILING_EXCEEDED: paused sandbox chain needs 64424509440 \
-                      bytes against the 42949672960 byte ceiling (stable prefix: 0 lowers, 0 \
-                      bytes; compacted 5 lowers into 64424509440 bytes; appended layer: 0 bytes)"
+            message: "CHAIN_BYTES_CEILING_EXCEEDED: reclaimable paused sandbox chain needs \
+                      64424509440 bytes against the 42949672960 byte ceiling (compacted 5 lowers \
+                      into 64424509440 bytes; appended layer: 0 bytes; immutable stable prefix \
+                      not charged: 0 lowers, 0 bytes)"
                 .to_string(),
         },
     );

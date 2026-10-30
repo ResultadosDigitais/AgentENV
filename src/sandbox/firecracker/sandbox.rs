@@ -827,6 +827,28 @@ impl FirecrackerSandbox {
         Ok(out)
     }
 
+    /// The bytes a pause of this snapshot would be charged by the chain ceiling.
+    ///
+    /// Returns `(reclaimable_bytes, stable_prefix_bytes)`: the first is what
+    /// `orchestrator.chain_bytes_ceiling` bounds — the runtime-owned lowers plus
+    /// the layer the next pause appends — and the second is the immutable prefix
+    /// it reports without charging, because every sandbox of the same image
+    /// shares those lowers. Computed by the production accounting with the roots
+    /// in force, so a caller never has to re-derive the classification and
+    /// disagree with the pause path.
+    pub fn chain_bytes_for_pause(&self, image_config_path: &Path) -> Result<(u64, u64)> {
+        let image_config = overlaybd::config::load_image_config(image_config_path)
+            .with_context(|| format!("load image config {}", image_config_path.display()))?;
+        let pause_output_dir = image_config_path.parent().unwrap_or(image_config_path);
+        let roots = self.runtime_owned_roots(Some(pause_output_dir));
+        let accounting = super::overlaybd_snapshot::ChainByteAccounting::measure(
+            image_config.lowers,
+            None,
+            &roots,
+        );
+        Ok((accounting.reclaimable_bytes, accounting.stable_prefix_bytes))
+    }
+
     /// The dedicated pack-recording memory device's id, when this sandbox was
     /// started with `pack_recording = true`.
     pub(crate) fn dedicated_mem_device_id(&self) -> Option<u32> {
