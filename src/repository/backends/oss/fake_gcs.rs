@@ -22,6 +22,10 @@ use serde_json::json;
 struct Object {
     data: Bytes,
     generation: u64,
+    /// When the object was last written, as the store reports it in RFC 3339.
+    /// It is real time, not a fixed stamp: a maintenance pass decides whether an
+    /// object is old enough to collect from this value alone.
+    updated: String,
 }
 
 struct Upload {
@@ -39,13 +43,14 @@ struct Inner {
 
 /// A running fake. Dropping it stops nothing: the server lives for the test
 /// process, on its own port.
-pub(super) struct FakeGcs {
-    pub(super) endpoint: String,
+#[derive(Clone)]
+pub(crate) struct FakeGcs {
+    pub(crate) endpoint: String,
     inner: Arc<Mutex<Inner>>,
 }
 
 impl FakeGcs {
-    pub(super) async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let inner = Arc::new(Mutex::new(Inner::default()));
         let app = Router::new()
             .fallback(handle)
@@ -61,21 +66,21 @@ impl FakeGcs {
     }
 
     /// The object at `name` in the bucket, if any.
-    pub(super) fn object(&self, name: &str) -> Option<Vec<u8>> {
+    pub(crate) fn object(&self, name: &str) -> Option<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         inner.objects.get(name).map(|object| object.data.to_vec())
     }
 
-    pub(super) fn object_names(&self) -> Vec<String> {
+    pub(crate) fn object_names(&self) -> Vec<String> {
         self.inner.lock().unwrap().objects.keys().cloned().collect()
     }
 
     /// `METHOD path?query` of every request so far, in arrival order.
-    pub(super) fn requests(&self) -> Vec<String> {
+    pub(crate) fn requests(&self) -> Vec<String> {
         self.inner.lock().unwrap().requests.clone()
     }
 
-    pub(super) fn requests_matching(&self, needle: &str) -> usize {
+    pub(crate) fn requests_matching(&self, needle: &str) -> usize {
         self.requests()
             .iter()
             .filter(|request| request.contains(needle))
@@ -112,8 +117,40 @@ fn resource(bucket: &str, name: &str, object: &Object) -> serde_json::Value {
         "generation": object.generation.to_string(),
         "md5Hash": "",
         "contentType": "application/octet-stream",
-        "updated": "2026-01-01T00:00:00.000Z",
+        "updated": object.updated,
     })
+}
+
+/// The current instant in the format the store reports `updated` in.
+fn now_rfc3339() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = now.as_secs();
+    let millis = now.subsec_millis();
+    let days = seconds / 86_400;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(i64::try_from(days).unwrap_or_default());
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// The civil date of `days` since the Unix epoch, by Howard Hinnant's
+/// `civil_from_days`, so the fake needs no date crate.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = u32::try_from(day_of_year - (153 * mp + 2) / 5 + 1).unwrap_or(1);
+    let month = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1);
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 fn etag(object: &Object) -> String {
@@ -175,6 +212,7 @@ async fn handle(State(inner): State<Arc<Mutex<Inner>>>, request: Request<Body>) 
             let object = Object {
                 data: body,
                 generation: inner.generation,
+                updated: now_rfc3339(),
             };
             let created = resource(bucket, name, &object);
             inner.objects.insert(name.clone(), object);
@@ -330,6 +368,7 @@ fn multipart(
                 Object {
                     data: Bytes::from(data),
                     generation,
+                    updated: now_rfc3339(),
                 },
             );
             reply(

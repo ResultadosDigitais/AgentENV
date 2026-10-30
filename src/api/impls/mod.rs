@@ -108,6 +108,11 @@ impl ApiImpl {
         Arc::clone(&self.image_resolver)
     }
 
+    /// The durable repository the snapshot manager reads and writes.
+    pub(crate) fn repository(&self) -> Arc<dyn crate::repository::Repository> {
+        self.snapshot_manager.repository()
+    }
+
     /// Returns the optional observability service backing node/admin
     /// observability endpoints. This is `None` when the server is configured
     /// with `observability.enabled = false`.

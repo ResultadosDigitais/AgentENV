@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use anyhow::Result;
+use tracing::warn;
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::config::{NormalizedGcsConfig, NormalizedOssConfig};
@@ -15,7 +16,8 @@ use crate::cfg::{
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
     BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
-    RepositoryError, RepositoryResult, SnapshotFile,
+    MaintenanceLock, ManagedLayerObject, RepositoryError, RepositoryResult, SnapshotFile,
+    MAINTENANCE_LOCK_STALE_AFTER,
 };
 use crate::types::SnapshotId;
 
@@ -95,6 +97,50 @@ fn upload_artifact(key: &BlobKey) -> OssUploadArtifact {
         }
         BlobKey::Snapshot(_, SnapshotFile::StartupManifest) => OssUploadArtifact::StartupPack,
     }
+}
+
+/// Takes over a lock object whose holder is gone, or reports the contention.
+///
+/// The object is rewritten with `this` token only when it is older than
+/// [`MAINTENANCE_LOCK_STALE_AFTER`]. Two passes that see the same stale object
+/// may both rewrite it; the last write wins, and the loser sees a token that is
+/// not its own on release and leaves the object alone.
+async fn take_over_stale_lock(
+    client: &OssClient,
+    name: &str,
+    key: &str,
+    token: String,
+) -> RepositoryResult<Option<MaintenanceLock>> {
+    let metadata = match client.stat(key).await {
+        Ok(metadata) => metadata,
+        Err(error) if OssClient::is_not_found_error(&error) => return Ok(None),
+        Err(error) => {
+            return Err(RepositoryError::backend(
+                format!("stat maintenance lock '{key}'"),
+                error,
+            ))
+        }
+    };
+    let stale = metadata.last_modified.is_some_and(|modified| {
+        modified
+            .elapsed()
+            .is_ok_and(|age| age >= MAINTENANCE_LOCK_STALE_AFTER)
+    });
+    if !stale {
+        return Ok(None);
+    }
+    warn!(key, "taking over a maintenance lock its holder left behind");
+    client
+        .put_bytes(
+            key,
+            token.clone().into_bytes(),
+            OssUploadArtifact::CatalogRecord,
+        )
+        .await
+        .map_err(|error| {
+            RepositoryError::backend(format!("replace maintenance lock '{key}'"), error)
+        })?;
+    Ok(Some(MaintenanceLock::new(name.to_owned(), token)))
 }
 
 // ── Repository impl ────────────────────────────────────────────
@@ -211,6 +257,91 @@ impl Repository for OssRepository {
         collection: DocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         documents::read_all(&self.client, collection).await
+    }
+
+    async fn list_managed_layers(&self) -> RepositoryResult<Vec<ManagedLayerObject>> {
+        let entries = self
+            .client
+            .list_entries_recursive(BlobKey::LAYERS_PREFIX)
+            .await
+            .map_err(|error| {
+                RepositoryError::backend(format!("list '{}'", BlobKey::LAYERS_PREFIX), error)
+            })?;
+        let mut layers: Vec<ManagedLayerObject> = entries
+            .into_iter()
+            .map(|entry| ManagedLayerObject {
+                layer_digest: BlobKey::digest_from_layer_key(&entry.key),
+                bytes: entry.bytes,
+                last_modified: entry.last_modified,
+                key: entry.key,
+            })
+            .collect();
+        layers.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(layers)
+    }
+
+    async fn delete_managed_layer(&self, key: &str) -> RepositoryResult<()> {
+        self.client
+            .delete(key)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("delete '{key}'"), error))
+    }
+
+    async fn put_managed_layer_object(&self, key: &str, body: &[u8]) -> RepositoryResult<()> {
+        self.client
+            .put_bytes(key, body.to_vec(), OssUploadArtifact::RootfsLayer)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("write '{key}'"), error))
+    }
+
+    /// Takes the pass lock by creating the lock object only when it is absent.
+    ///
+    /// This is a create-only write, not a [`lease`](super::lease): a lease needs
+    /// Alibaba OSS's append, which other S3 stores do not support, while every
+    /// store this backend talks to honours a conditional create. A holder that
+    /// dies without releasing leaves the object behind, so a later pass takes it
+    /// over once it is older than
+    /// [`MAINTENANCE_LOCK_STALE_AFTER`](crate::repository::MAINTENANCE_LOCK_STALE_AFTER).
+    async fn acquire_maintenance_lock(
+        &self,
+        name: &str,
+    ) -> RepositoryResult<Option<MaintenanceLock>> {
+        let key = crate::repository::maintenance_lock_key(name);
+        let token = uuid::Uuid::now_v7().to_string();
+        let created = self
+            .client
+            .put_bytes_conditionally(&key, token.clone().into_bytes(), None)
+            .await
+            .map_err(|error| {
+                RepositoryError::backend(format!("create maintenance lock '{key}'"), error)
+            })?;
+        if created {
+            return Ok(Some(MaintenanceLock::new(name.to_owned(), token)));
+        }
+        take_over_stale_lock(&self.client, name, &key, token).await
+    }
+
+    async fn release_maintenance_lock(&self, lock: MaintenanceLock) -> RepositoryResult<()> {
+        let key = crate::repository::maintenance_lock_key(&lock.name);
+        // Only the holder removes the object: a lock another pass took over
+        // already carries that pass's token.
+        let current = match self.client.get_bytes(&key).await {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(error) if super::client::OssClient::is_not_found_error(&error) => None,
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read maintenance lock '{key}'"),
+                    error,
+                ))
+            }
+        };
+        if current.as_deref() != Some(lock.token.as_bytes()) {
+            return Ok(());
+        }
+        self.client
+            .delete(&key)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("delete '{key}'"), error))
     }
 }
 
