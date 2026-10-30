@@ -136,6 +136,26 @@ fn chain_allocated_bytes<'a>(paths: impl IntoIterator<Item = &'a Path>) -> u64 {
     total
 }
 
+/// Split a chain into the lowers compaction may rewrite and the ones it must
+/// leave untouched, using the very predicate
+/// `FirecrackerSandbox::describe_chain_classification` prints.
+///
+/// Position in the image config cannot decide this. `split_runtime_suffix` stops
+/// at the first runtime-owned lower and hands the rest over wholesale, which is
+/// the right unit to adopt but the wrong one to blame for bytes: on a chain whose
+/// lowers the diagnostic reports as pause-owned end to end, the suffix is
+/// everything and the ceiling would still be judged against a "stable prefix"
+/// that does not exist. Classifying each lower keeps the ceiling, the compaction
+/// it triggers and the diagnostic report all answering the same question.
+fn split_chain_by_classification(
+    lowers: impl IntoIterator<Item = LayerConfig>,
+    runtime_owned_roots: &[PathBuf],
+) -> (Vec<LayerConfig>, Vec<LayerConfig>) {
+    lowers
+        .into_iter()
+        .partition(|lower| !is_runtime_owned(Path::new(&lower.file), runtime_owned_roots))
+}
+
 enum LiveOverlaybdSnapshotState {
     ReadOnly,
     Restacked(PathBuf),
@@ -523,32 +543,53 @@ async fn rewrite_lowers_with_runtime_roots(
     let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
     // The byte ceiling is the stricter of the two triggers: a chain can stay
     // inside the layer-count budget for many pauses and still fill the node's
-    // disk, because each generation rewrites far more bytes than it shares.
-    // Projected bytes are the stable prefix plus the runtime suffix plus the
-    // layer this pause appends (hardlinks deduplicated). A ceiling of 0 keeps
-    // the pre-ceiling behavior: no byte accounting, no compaction on bytes.
-    let projected_chain_bytes = if chain_bytes_ceiling == 0 {
-        0
+    // disk, because each generation rewrites far more bytes than it shares. A
+    // ceiling of 0 keeps the pre-ceiling behavior: no byte accounting and no
+    // compaction on bytes.
+    let over_ceiling = if chain_bytes_ceiling == 0 {
+        false
     } else {
-        let stable_prefix: Vec<&Path> = lowers.iter().map(|lower| Path::new(&lower.file)).collect();
-        let runtime_suffix: Vec<&Path> = runtime_owned_lowers
-            .iter()
-            .map(|lower| Path::new(&lower.file))
-            .chain(appended_layer.iter().map(|layer| Path::new(&layer.file)))
-            .collect();
-        chain_allocated_bytes(stable_prefix).saturating_add(chain_allocated_bytes(runtime_suffix))
+        let chain_bytes = chain_allocated_bytes(
+            lowers
+                .iter()
+                .chain(runtime_owned_lowers.iter())
+                .chain(appended_layer.iter())
+                .map(|lower| Path::new(&lower.file)),
+        );
+        chain_bytes > chain_bytes_ceiling
     };
-    let over_ceiling = chain_bytes_ceiling != 0 && projected_chain_bytes > chain_bytes_ceiling;
     if compactable_count > max_runtime_owned_layers || over_ceiling {
-        let mut runtime_suffix = runtime_owned_lowers;
+        // The byte trigger decides what it rewrites by classification, never by
+        // position: `split_runtime_suffix` hands over everything from the first
+        // runtime-owned lower onward, which is the right unit to adopt but the
+        // wrong one to blame for bytes. Compaction therefore rewrites exactly
+        // the lowers the chain diagnostic reports as runtime-owned, including
+        // the ones a positional prefix would have held as immutable — a chain of
+        // pause-owned generations has no stable prefix at all, and refusing it
+        // while the diagnostic reports every lower as reclaimable is the defect
+        // this split closes. Under the count trigger the positional suffix is
+        // kept as it was, because there the chain is not being blamed for its
+        // size, only rewritten to stay below overlaybd's layer limit.
+        let mut compactable = if over_ceiling {
+            let (stable_prefix, runtime_owned) = split_chain_by_classification(
+                std::mem::take(&mut lowers)
+                    .into_iter()
+                    .chain(std::mem::take(&mut runtime_owned_lowers)),
+                runtime_owned_roots,
+            );
+            lowers = stable_prefix;
+            runtime_owned
+        } else {
+            std::mem::take(&mut runtime_owned_lowers)
+        };
         if let Some(layer) = appended_layer {
-            runtime_suffix.push(layer);
+            compactable.push(layer);
         }
-        if runtime_suffix.iter().any(|lower| lower.file.is_empty()) {
+        if compactable.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
         }
         let compacted_path = compact_layers(
-            &runtime_suffix,
+            &compactable,
             &output_dir.join(compaction_output_name),
             compaction_output,
         )

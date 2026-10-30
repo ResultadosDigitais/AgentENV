@@ -3988,11 +3988,7 @@ impl std::fmt::Display for NewColdSandbox {
                 .as_ref()
                 .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
             self.memory_request_mb.as_ref().map(|memory_request_mb| {
-                [
-                    "memoryRequestMB".to_string(),
-                    memory_request_mb.to_string(),
-                ]
-                .join(",")
+                ["memoryRequestMB".to_string(), memory_request_mb.to_string()].join(",")
             }),
             self.disk_size_mb
                 .as_ref()
