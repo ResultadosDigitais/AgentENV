@@ -704,6 +704,7 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
 
     let mut compaction_seen = false;
     let mut first_footprint = None;
+    let mut previous_footprint = None;
     for pause_index in 0..pause_count {
         let mut resumed =
             FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(ceiling);
@@ -750,18 +751,27 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
             lower_file_paths_from_image_config(&snapshot.mem_overlaybd_config.image_config_path)?;
         let footprint = allocated_bytes(&lowers);
         first_footprint.get_or_insert(footprint);
-        // Print the classification before asserting anything about compaction:
-        // when the ceiling is breached the byte totals alone cannot distinguish
-        // a too-small ceiling from lowers misclassified as stable prefix, and
-        // this report names which one it was.
+        // Print the chain shape the ceiling rejection reports, pause by pause:
+        // the lower count, the allocated bytes of each lower and the total, with
+        // the per-lower classification below. A chain that compacts does not
+        // shrink shows up here as the pause count rising while the total stays
+        // at one compacted generation's worth of bytes.
+        let per_lower_bytes = per_lower_allocated_bytes(&lowers);
+        let change_bytes = previous_footprint
+            .map(|previous| footprint as i128 - previous as i128)
+            .unwrap_or(0);
         eprintln!(
-            "pause {}: chain footprint {} bytes ({} lowers), ceiling {} bytes\n{}",
+            "pause {}: chain footprint {} bytes ({} lowers), change {:+} bytes, ceiling {} bytes\n\
+             lowers (bytes, deduplicated): {}\n{}",
             pause_index + 1,
             footprint,
             lowers.len(),
+            change_bytes,
             ceiling,
+            format_lower_bytes(&lowers, &per_lower_bytes),
             describe_chain(&resumed, &snapshot)
         );
+        previous_footprint = Some(footprint);
         // A compaction rewrote the runtime-owned suffix into one generation.
         if lowers
             .iter()
@@ -821,6 +831,37 @@ fn allocated_bytes(paths: &[PathBuf]) -> u64 {
         .filter(|metadata| seen.insert((metadata.dev(), metadata.ino())))
         .map(|metadata| metadata.blocks().saturating_mul(512))
         .sum()
+}
+
+/// Allocated bytes of each layer path, deduplicated by device and inode.
+///
+/// Reports `0` for a path a hardlink already accounted for and for one that
+/// cannot be inspected, so the printed per-lower figures sum to
+/// [`allocated_bytes`] over the same paths and a hardlinked generation is
+/// visible as the lower that contributed nothing.
+fn per_lower_allocated_bytes(paths: &[PathBuf]) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .iter()
+        .map(|path| {
+            fs::metadata(path)
+                .ok()
+                .filter(|metadata| seen.insert((metadata.dev(), metadata.ino())))
+                .map(|metadata| metadata.blocks().saturating_mul(512))
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Render `paths` and their allocated bytes as one comma-separated line.
+fn format_lower_bytes(paths: &[PathBuf], bytes: &[u64]) -> String {
+    paths
+        .iter()
+        .zip(bytes)
+        .enumerate()
+        .map(|(index, (path, allocated))| format!("[{index}] {allocated} bytes {}", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Runs a connectivity probe, retrying expected successes so transient public
