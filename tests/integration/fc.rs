@@ -708,41 +708,86 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     // un-reclaimable shape this test exists to distinguish from.
     seed_chain_ballast(&mut sandbox, ballast_mib).await?;
 
-    // The warm-up pause carries the ballast once and measures what the ceiling
-    // has to hold: one generation of the rewritten region, plus the immutable
-    // parts of both chains (the image prefix of the memory chain is empty on a
-    // fresh boot; the rootfs chain carries the image layers and is never
-    // rewritten here, because the ballast lives on tmpfs).
+    // Warm-up: one pause carrying the ballast once. The first capture of a booted
+    // guest also carries everything the boot touched, so this generation is the
+    // SUPERSET of every later one — the ballast pages are a subset of it. That
+    // matters twice: compaction of a chain starting here can never produce more
+    // than this, and the chain has to be given room for exactly that much.
     let mut current = sandbox.pause().await?;
-    let (base_mem_reclaimable, base_mem_prefix) = memory_chain_parts(&sandbox, &current)?;
+    let (warmup_bytes, base_mem_prefix) = memory_chain_parts(&sandbox, &current)?;
     let (base_rootfs_reclaimable, base_rootfs_prefix) = rootfs_chain_parts(&sandbox, &current)?;
     assert!(
-        base_mem_reclaimable > 0,
-        "the rewritten tmpfs region must allocate a memory generation to bound"
+        warmup_bytes > 0,
+        "the warm-up pause must allocate a memory generation to bound"
     );
-    // The parts that never change across pauses and must fit on their own: both
-    // shared prefixes, and the rootfs chain's reclaimable part, which is
-    // rewritten by the restack rather than grown by the workload.
+    // Steady state: one more pause that only rewrites the same ballast pages.
+    // The growth it adds is one pause's worth of churn, which is what decides how
+    // soon the chain crosses the ceiling.
+    let steady_first = current.clone();
+    let mut steady_sandbox =
+        FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(0);
+    steady_sandbox.start().await?;
+    rewrite_chain_ballast(&mut steady_sandbox, ballast_mib).await?;
+    let steady_second = steady_sandbox.pause().await?;
+    drop(steady_sandbox);
+    let before = allocated_bytes(&lower_file_paths_from_image_config(
+        &steady_first.mem_overlaybd_config.image_config_path,
+    )?);
+    let after = allocated_bytes(&lower_file_paths_from_image_config(
+        &steady_second.mem_overlaybd_config.image_config_path,
+    )?);
+    let generation_bytes = after.saturating_sub(before);
+    assert!(
+        generation_bytes > 0,
+        "a pause that rewrites {ballast_mib} MiB must add a generation to the chain: \
+         {before} bytes before, {after} after"
+    );
+    // One value bounds both chains, so it has to clear everything either of them
+    // carries that the workload cannot shrink: both shared prefixes and the
+    // rootfs chain's restacked part.
     let fixed_bytes = base_mem_prefix
         .max(base_rootfs_prefix)
         .max(base_rootfs_reclaimable);
-    // One and a half generations: a compacted chain (one generation) fits with
-    // half a generation of slack for the noise a real guest adds, while two
-    // accumulated generations do not — so the trigger fires within the first two
-    // pauses and keeps firing, and every fire has a fitting result to produce.
-    let generation_budget = base_mem_reclaimable.saturating_mul(3) / 2;
-    let ceiling = fixed_bytes.saturating_add(generation_budget);
+    // The memory chain's budget: room for the warm-up generation (the most a
+    // compaction of this chain can leave behind), plus one steady generation and
+    // half of another. The second pause then still fits, the third does not, and
+    // from there every pause above the ceiling has a fitting compacted result —
+    // so the trigger fires repeatedly inside ten pauses and never rejects one.
+    let memory_budget = warmup_bytes
+        .saturating_add(generation_bytes)
+        .saturating_add(generation_bytes / 2);
+    let ceiling = fixed_bytes.max(memory_budget);
+    // `0` means "ceiling disabled", so a degenerate fixture must not silently
+    // turn enforcement off and pass every assertion for the wrong reason.
     assert!(
-        ceiling > base_rootfs_prefix && ceiling > base_mem_prefix,
-        "the ceiling must hold both shared prefixes on their own (memory \
-         {base_mem_prefix} bytes, rootfs {base_rootfs_prefix} bytes): {ceiling}"
+        ceiling > 0,
+        "the ceiling must be a real bound, not the disabled value: {ceiling}"
+    );
+    // The two properties the fixture depends on, asserted up front so a red run
+    // says which one broke instead of failing later on a missing compaction. A
+    // compacted memory chain is at most the warm-up generation, so the ceiling has
+    // to hold that much; and the chain grows by one generation per pause, so the
+    // ceiling has to be below two generations' growth or ten pauses never reach it.
+    assert!(
+        ceiling >= warmup_bytes,
+        "the ceiling must hold a compacted memory chain: {ceiling} < warm-up {warmup_bytes}"
+    );
+    assert!(
+        ceiling < warmup_bytes.saturating_add(2 * generation_bytes),
+        "the chain must reach the ceiling within ten pauses, or nothing compacts: ceiling \
+         {ceiling} vs warm-up {warmup_bytes} plus two {generation_bytes} byte generations; the \
+         fixed floor that could push it out of reach is {fixed_bytes} (memory prefix \
+         {base_mem_prefix}, rootfs prefix {base_rootfs_prefix}, rootfs reclaimable \
+         {base_rootfs_reclaimable})"
     );
     eprintln!(
-        "base chains: memory reclaimable {base_mem_reclaimable} bytes over a \
-         {base_mem_prefix} byte shared prefix, rootfs reclaimable {base_rootfs_reclaimable} \
-         bytes over a {base_rootfs_prefix} byte shared prefix, ceiling {ceiling} bytes \
-         ({fixed_bytes} fixed + {generation_budget} generation budget), ballast {ballast_mib} MiB"
+        "measured: warm-up generation {warmup_bytes} bytes, a steady-state pause adds \
+         {generation_bytes} bytes ({before} -> {after}); shared prefixes memory \
+         {base_mem_prefix} / rootfs {base_rootfs_prefix} bytes, rootfs reclaimable \
+         {base_rootfs_reclaimable} bytes, ceiling {ceiling} bytes ({warmup_bytes} warm-up + \
+         1.5 x {generation_bytes} steady, floor {fixed_bytes}), ballast {ballast_mib} MiB"
     );
+    current = steady_second;
 
     let mut compaction_seen = false;
     let mut first_footprint = None;
