@@ -1595,8 +1595,9 @@ mod tests {
     ///
     /// The parts are measured separately, so a shared inode set is what stops
     /// the same layer appearing in the prefix total and in the reclaimable
-    /// total. Without it the chain over-reports by that layer's bytes and the
-    /// ceiling refuses a pause the node's disk would have tolerated.
+    /// total. Without it the chain reports a sum larger than its own
+    /// deduplicated footprint and the ceiling refuses a pause the node's disk
+    /// would have tolerated.
     #[test]
     fn chain_accounting_counts_a_layer_hardlinked_into_both_parts_once() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1612,10 +1613,18 @@ mod tests {
         std::fs::create_dir_all(&adopted).expect("create adopted dir");
         let adopted = adopted.join("overlaybd.commit");
         std::fs::hard_link(&layer, &adopted).expect("hardlink the layer into the suffix");
+        let runtime_only = runtime_root.join("gen-runtime.overlaybd.commit");
+        std::fs::write(&runtime_only, vec![0xA5u8; 32768]).expect("write runtime layer");
+        assert_ne!(
+            chain_allocated_bytes([runtime_only.as_path()]),
+            chain_allocated_bytes([layer.as_path()]),
+            "the fixture needs two distinguishable parts"
+        );
 
         let chain = vec![
             local_layer_config(&layer),
             local_layer_config(&adopted),
+            local_layer_config(&runtime_only),
             LayerConfig {
                 file: String::new(),
                 digest: "sha256:remote".to_string(),
@@ -1632,24 +1641,39 @@ mod tests {
                 .map(|lower| PathBuf::from(&lower.file))
                 .collect::<Vec<_>>(),
         );
-        assert!(chain_bytes > 0);
+        let shared_bytes = chain_allocated_bytes([layer.as_path()]);
+        assert!(
+            chain_bytes > shared_bytes,
+            "the parts must be distinguishable"
+        );
         assert_eq!(
             accounting.stable_prefix_bytes + accounting.reclaimable_bytes,
             chain_bytes,
             "the two parts must sum to the chain, so the shared inode is charged once"
         );
-        // The prefix is measured first, so the shared inode lands there: the
-        // bytes already exist for the image, and leaving them out of the
+        // The prefix is measured first, so the shared inode lands there: those
+        // bytes exist for the image already, and leaving them out of the
         // reclaimable part keeps the ceiling from charging them as pause growth.
-        assert_eq!(accounting.stable_prefix_bytes, chain_bytes);
-        assert_eq!(accounting.reclaimable_bytes, 0);
+        assert_eq!(accounting.stable_prefix_bytes, shared_bytes);
+        assert_eq!(
+            accounting.reclaimable_bytes,
+            chain_bytes - shared_bytes,
+            "the runtime-owned part must count only the layer that is not shared"
+        );
+        // No part alone breaches a ceiling above each, so the chain fits even
+        // though the naive prefix-plus-suffix sum would not.
+        assert_eq!(
+            accounting.ceiling_breach(chain_bytes),
+            None,
+            "a chain whose parts fit individually must fit as a whole"
+        );
     }
 
-    /// The same rejected shape through the rewrite: a runtime-owned suffix that
-    /// compacts under the ceiling succeeds with a stable prefix far larger than
-    /// the ceiling, and the compacted generation is the only lower written.
+    /// The staging rejection, reproduced through the rewrite: a stable prefix
+    /// and a runtime-owned suffix that each fit the ceiling, whose naive sum
+    /// does not, must compact instead of failing.
     #[tokio::test]
-    async fn rewrite_compacts_under_a_ceiling_the_stable_prefix_alone_exceeds() {
+    async fn rewrite_compacts_when_only_the_prefix_plus_suffix_sum_exceeds_the_ceiling() {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_root = temp.path().join("runtime");
         let stable_root = temp.path().join("image-cache");
@@ -1658,12 +1682,12 @@ mod tests {
         std::fs::create_dir_all(&stable_root).expect("create stable layer root");
         std::fs::create_dir_all(&output_dir).expect("create output dir");
 
-        // A shared, immutable lower of the same order as the measured prefix:
-        // 4 MiB, deliberately larger than the ceiling below.
+        // A shared, immutable lower standing in for the image prefix. It fits
+        // the ceiling on its own, which is the shape the staging chain had.
         let stable = stable_root.join("sha256-base.overlaybd.commit");
-        std::fs::write(&stable, vec![0x11u8; 4 * 1024 * 1024]).expect("write stable lower");
+        std::fs::write(&stable, vec![0x11u8; 512 * 1024]).expect("write stable lower");
         let stable_bytes = chain_allocated_bytes([stable.as_path()]);
-        assert!(stable_bytes > 1024 * 1024, "the prefix must dominate");
+        assert!(stable_bytes > 0, "the prefix must allocate bytes");
 
         // Four runtime-owned generations rewriting the same pages, so one
         // compacted generation is far smaller than the chain it replaces.
@@ -1683,12 +1707,17 @@ mod tests {
             .map(|lower| PathBuf::from(&lower.file))
             .collect();
         let runtime_bytes = chain_allocated_bytes(&runtime_chain);
-        // Larger than the runtime chain (so the byte trigger fires) and smaller
-        // than the shared prefix (so a total ceiling could never fit).
-        let ceiling = runtime_bytes / 2;
+        // Above the runtime chain, so the byte trigger fires; above the prefix,
+        // so neither part breaches it; below their sum, which is what the old
+        // total rule charged and why the staging pause was refused.
+        let ceiling = runtime_bytes + runtime_bytes / 2;
         assert!(
-            ceiling < stable_bytes,
-            "the prefix alone must exceed the ceiling"
+            ceiling > stable_bytes,
+            "the prefix must fit the ceiling on its own: {stable_bytes} > {ceiling}"
+        );
+        assert!(
+            stable_bytes + runtime_bytes > ceiling,
+            "the naive sum must be the rejected shape: prefix and suffix do not fit together"
         );
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
@@ -1714,9 +1743,10 @@ mod tests {
         );
     }
 
-    /// A stable prefix that cannot be reclaimed must fail the rewrite by name.
+    /// A reclaimable part compaction cannot bring under the ceiling must fail
+    /// the rewrite by name and leave no output behind.
     #[tokio::test]
-    async fn rewrite_stable_prefix_above_ceiling_fails_named_and_leaves_no_output() {
+    async fn rewrite_unreclaimable_chain_above_ceiling_fails_named_and_leaves_no_output() {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_root = temp.path().join("runtime");
         let output_dir = temp.path().join("out");
