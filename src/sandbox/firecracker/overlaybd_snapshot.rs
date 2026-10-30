@@ -66,9 +66,17 @@ pub(crate) const CHAIN_BYTES_CEILING_EXCEEDED: &str = "CHAIN_BYTES_CEILING_EXCEE
 /// inside a single chain, so it could not correct that double count across
 /// sandboxes; not charging the prefix at all does. What the ceiling judges is
 /// the reclaimable part — the runtime-owned lowers plus the layer the pause
-/// appends — and a reclaimable part that alone exceeds the ceiling still fails
-/// by name, as does a shared prefix larger than the whole budget for one
-/// sandbox.
+/// appends — and nothing else, so a reclaimable part that alone exceeds the
+/// ceiling still fails by name.
+///
+/// The prefix is never a breach, however large it is. It is a function of the
+/// image, not of this sandbox's pauses, so refusing a pause because of it would
+/// fail a sandbox whose own growth is under the ceiling and never let it pause
+/// again: the rootfs chain is restacked under the same ceiling on every pause,
+/// and its image prefix alone is hundreds of megabytes, so any ceiling below
+/// that prefix would terminally reject the pause of every sandbox of that image.
+/// A node whose images outgrow the ceiling needs a different image, not a
+/// sandbox that cannot stop.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct ChainByteAccounting {
     /// Bounded by the ceiling: runtime-owned lowers plus the appended layer.
@@ -114,29 +122,23 @@ impl ChainByteAccounting {
 
     /// The bytes the ceiling refuses, or `None` when the chain fits.
     ///
-    /// Either part alone can breach it: a reclaimable part compaction could not
-    /// shrink, or a stable prefix larger than a whole node's budget for one
-    /// sandbox. The returned value is the part that breached, so the rejection
-    /// reports a number an operator can compare with the ceiling.
+    /// Only the reclaimable part is judged: it is the part this sandbox's
+    /// pauses add and the part compaction can shrink. `stable_prefix_bytes` is
+    /// carried for the rejection message, never compared with the ceiling — see
+    /// the type-level note for why a shared prefix must not reject a pause.
     pub(super) fn ceiling_breach(self, ceiling: u64) -> Option<u64> {
-        if self.reclaimable_bytes > ceiling {
-            Some(self.reclaimable_bytes)
-        } else if self.stable_prefix_bytes > ceiling {
-            Some(self.stable_prefix_bytes)
-        } else {
-            None
-        }
+        (self.reclaimable_bytes > ceiling).then_some(self.reclaimable_bytes)
     }
 }
 
 /// Measured shape of a chain that the byte ceiling rejected.
 ///
-/// The totals alone cannot tell a ceiling that was set too low from a
-/// compaction that did not shrink the chain: a chain whose runtime-owned lowers
-/// compacted into a layer the size of their sum reports exactly the same total
-/// as a chain whose immutable prefix alone is over. Carrying the parts makes
-/// the rejection say which of the two happened, so the operator reads a cause
-/// instead of a suspicion.
+/// The reclaimable total alone cannot tell a ceiling that was set too low from
+/// a compaction that did not shrink the chain: both leave a generation above the
+/// ceiling. Carrying the parts names the layers and the appended bytes the
+/// rewrite folded, so the operator reads the shape that was refused instead of
+/// only the number. The stable prefix travels with it because it explains how
+/// much of the node's disk this sandbox does not own.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ChainCeilingBreakdown {
     /// Lowers left untouched by compaction, and their allocated bytes.
@@ -687,8 +689,9 @@ async fn rewrite_lowers_with_runtime_roots(
     // materialized from the image once, identical for every sandbox of that
     // image, and compaction cannot reclaim it; charging it here would count the
     // same node bytes once per sandbox and reject a chain whose own growth is
-    // far under the ceiling. A stable prefix above the ceiling is still a
-    // breach, judged on its own: no pause of that sandbox could ever fit.
+    // far under the ceiling. A stable prefix is never a breach on its own,
+    // whatever its size: judging it would refuse the pause of every sandbox of
+    // that image for a number none of their pauses can change.
     let accounting = if chain_bytes_ceiling == 0 {
         ChainByteAccounting::default()
     } else {
@@ -777,8 +780,8 @@ async fn rewrite_lowers_with_runtime_roots(
             // compaction the reclaimable part is exactly the generation it
             // produced — the appended layer and every rewritten lower live
             // inside it — so a compacted layer still above the ceiling means
-            // compaction did not shrink the chain. The stable prefix is judged
-            // the same way it was judged before compaction: on its own.
+            // compaction did not shrink the chain. The stable prefix is carried
+            // for the message and not judged, exactly as it was before.
             let accounting_after = ChainByteAccounting {
                 reclaimable_bytes: match compacted_path.as_deref() {
                     Some(path) => chain_allocated_bytes([path]),
@@ -1578,16 +1581,20 @@ mod tests {
             "a compacted generation above the ceiling must still be refused, naming its bytes"
         );
 
-        // And for a prefix that alone exceeds the ceiling: no pause of that
-        // sandbox could ever fit, however small its own growth is.
+        // And a prefix above the ceiling is not a breach at all, however large
+        // it is: the prefix belongs to the image, so judging it would refuse the
+        // pause of every sandbox of that image forever. The rootfs chain is
+        // restacked under this same ceiling on every pause and its image prefix
+        // alone is 690,712,576 bytes, so this is the case a live sandbox meets,
+        // not a corner.
         assert_eq!(
             ChainByteAccounting {
                 reclaimable_bytes: 1,
                 stable_prefix_bytes: ceiling_bytes + 1,
             }
             .ceiling_breach(ceiling_bytes),
-            Some(ceiling_bytes + 1),
-            "a shared prefix above the ceiling is still a breach, judged on its own"
+            None,
+            "a shared prefix above the ceiling must be reported, never refused"
         );
     }
 
@@ -1669,11 +1676,23 @@ mod tests {
         );
     }
 
-    /// The staging rejection, reproduced through the rewrite: a stable prefix
-    /// and a runtime-owned suffix that each fit the ceiling, whose naive sum
-    /// does not, must compact instead of failing.
+    /// A shared prefix larger than the ceiling must not make the pause fail.
+    ///
+    /// This is the rule the ceiling applies, seen through the rewrite: the
+    /// prefix is a function of the image, not of this sandbox's pauses, so it is
+    /// reported and never judged. The fixture is the shape that would break if
+    /// it were judged — a prefix above the ceiling with a runtime-owned suffix
+    /// that fits on its own. The suffix is adopted as it is, which is the
+    /// pre-ceiling behavior, and the pause succeeds: no compaction is triggered
+    /// by bytes the sandbox does not own, and no named rejection is raised.
+    ///
+    /// The earlier revision of this test asserted the opposite. Under the
+    /// total-chain rule the naive prefix-plus-suffix sum was what the ceiling
+    /// charged, so it compacted to get under a number the sandbox could never
+    /// reach. Charging only the reclaimable part leaves nothing to compact: the
+    /// ceiling is satisfied before the rewrite starts.
     #[tokio::test]
-    async fn rewrite_compacts_when_only_the_prefix_plus_suffix_sum_exceeds_the_ceiling() {
+    async fn rewrite_ignores_a_shared_prefix_above_the_ceiling() {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_root = temp.path().join("runtime");
         let stable_root = temp.path().join("image-cache");
@@ -1682,17 +1701,18 @@ mod tests {
         std::fs::create_dir_all(&stable_root).expect("create stable layer root");
         std::fs::create_dir_all(&output_dir).expect("create output dir");
 
-        // A shared, immutable lower standing in for the image prefix. It fits
-        // the ceiling on its own, which is the shape the staging chain had.
+        // A shared, immutable lower standing in for the image prefix. The rootfs
+        // image of the staging sandbox is exactly this shape: its prefix alone is
+        // 690,712,576 bytes, far above any ceiling tight enough to bound one
+        // sandbox's pause churn.
         let stable = stable_root.join("sha256-base.overlaybd.commit");
         std::fs::write(&stable, vec![0x11u8; 512 * 1024]).expect("write stable lower");
         let stable_bytes = chain_allocated_bytes(std::slice::from_ref(&stable));
         assert!(stable_bytes > 0, "the prefix must allocate bytes");
 
-        // Four runtime-owned generations rewriting the same pages, so one
-        // compacted generation is far smaller than the chain it replaces.
+        // Two runtime-owned generations rewriting the same pages.
         let mut lowers = vec![local_layer_config(&stable)];
-        for (index, byte) in [0xAAu8, 0xBB, 0xCC, 0xDD].into_iter().enumerate() {
+        for (index, byte) in [0xAAu8, 0xBB].into_iter().enumerate() {
             let path = seal_raw_test_layer(
                 &runtime_root,
                 &format!("gen-{index}"),
@@ -1707,17 +1727,17 @@ mod tests {
             .map(|lower| PathBuf::from(&lower.file))
             .collect();
         let runtime_bytes = chain_allocated_bytes(&runtime_chain);
-        // Above the runtime chain, so the byte trigger fires; above the prefix,
-        // so neither part breaches it; below their sum, which is what the old
-        // total rule charged and why the staging pause was refused.
-        let ceiling = runtime_bytes + runtime_bytes / 2;
+        assert!(runtime_bytes > 0, "the suffix must allocate bytes");
+        // Below the prefix, above the suffix: the ceiling the rootfs chain of a
+        // real sandbox meets, where the prefix is the only part over it.
+        let ceiling = stable_bytes / 2;
         assert!(
-            ceiling > stable_bytes,
-            "the prefix must fit the ceiling on its own: {stable_bytes} > {ceiling}"
+            stable_bytes > ceiling,
+            "the prefix must be the part above the ceiling: {stable_bytes} <= {ceiling}"
         );
         assert!(
-            stable_bytes + runtime_bytes > ceiling,
-            "the naive sum must be the rejected shape: prefix and suffix do not fit together"
+            runtime_bytes <= ceiling,
+            "the reclaimable part must fit on its own: {runtime_bytes} > {ceiling}"
         );
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
@@ -1731,15 +1751,25 @@ mod tests {
             ceiling,
         )
         .await
-        .expect("a reclaimable part that compacts under the ceiling must not be refused");
+        .expect("a shared prefix above the ceiling must not refuse the pause");
 
-        assert_eq!(rewritten.len(), 2, "prefix plus one compacted generation");
+        // Adopted, not compacted: the append path keeps every lower and moves
+        // the runtime-owned ones into the artifact directory.
+        assert_eq!(
+            rewritten.len(),
+            3,
+            "prefix plus both adopted generations, got {rewritten:#?}"
+        );
         assert_eq!(PathBuf::from(&rewritten[0].file), stable);
-        let compacted = PathBuf::from(&rewritten[1].file);
-        assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
+        for adopted in &rewritten[1..] {
+            assert!(
+                PathBuf::from(&adopted.file).starts_with(output_dir.join(INHERITED_LAYERS_DIR)),
+                "the runtime-owned suffix must be adopted, not compacted: {adopted:#?}"
+            );
+        }
         assert!(
-            chain_allocated_bytes(std::slice::from_ref(&compacted)) <= ceiling,
-            "the compacted generation must fit the ceiling on its own"
+            !output_dir.join(MANAGED_BASE_LAYER_FILE).exists(),
+            "bytes the sandbox does not own must not trigger a compaction"
         );
     }
 
