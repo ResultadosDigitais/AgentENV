@@ -54,15 +54,21 @@ pub(crate) const CHAIN_BYTES_CEILING_EXCEEDED: &str = "CHAIN_BYTES_CEILING_EXCEE
 ///
 /// The ceiling exists so one sandbox's pause churn cannot fill a node's disk,
 /// so it has to bound the part that grows pause by pause. The stable prefix is
-/// the opposite of that part: it is materialized once from the image, its
-/// lowers are shared by every sandbox created from the same image (the image
-/// cache and the published snapshot layers are the same files for all of
-/// them), and compaction cannot reclaim a byte of it. Charging it per sandbox
-/// counts the same node bytes once per sandbox and, at the default ceiling,
-/// rejects a chain whose own growth is far below the ceiling. The reclaimable
-/// part — the runtime-owned lowers plus the layer the pause appends — is what
-/// the ceiling judges; a reclaimable part that alone exceeds the ceiling still
-/// fails by name, and so does a stable prefix that alone exceeds it.
+/// the opposite of that part. It is materialized once from the image and every
+/// sandbox of that image points at the same node-local files: the lowers reach
+/// an image config through `OverlaybdLayerStore::layer_location(digest, ..)`,
+/// which answers with a digest-addressed path under the image cache, and the
+/// commit index hardlinks the cache seed from that same store, so two sandboxes
+/// of one image share the inode, not just the path. Compaction cannot reclaim a
+/// byte of it either. Charging it per sandbox therefore counts one node's bytes
+/// once per sandbox, and at the default ceiling rejects a chain whose own growth
+/// is far below the ceiling. `chain_allocated_bytes` deduplicates by inode
+/// inside a single chain, so it could not correct that double count across
+/// sandboxes; not charging the prefix at all does. What the ceiling judges is
+/// the reclaimable part — the runtime-owned lowers plus the layer the pause
+/// appends — and a reclaimable part that alone exceeds the ceiling still fails
+/// by name, as does a shared prefix larger than the whole budget for one
+/// sandbox.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct ChainByteAccounting {
     /// Bounded by the ceiling: runtime-owned lowers plus the appended layer.

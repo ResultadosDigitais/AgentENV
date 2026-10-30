@@ -766,12 +766,17 @@ pub struct OrchestratorConfig {
     )]
     pub persisted_sandbox_store_path: PathBuf,
 
-    /// Ceiling, in bytes, for the paused artifact chain of a single sandbox.
+    /// Ceiling, in bytes, for the reclaimable part of the paused artifact chain
+    /// of a single sandbox: its runtime-owned overlaybd generations plus the
+    /// layer each pause appends.
     ///
-    /// A pause whose runtime-owned overlaybd suffix would push the chain past
-    /// this value compacts that suffix into one complete generation (and
-    /// reclaims unreferenced files from stale generations). `0` disables both
-    /// the ceiling and the reclaim sweep, restoring the unbounded behavior.
+    /// The image-derived stable prefix is reported by the rejection but never
+    /// charged, because every sandbox of an image points at the same node-local
+    /// files; charging it would count one node's bytes once per sandbox. A pause
+    /// whose reclaimable part would push past this value compacts the
+    /// runtime-owned suffix into one complete generation (and reclaims
+    /// unreferenced files from stale generations). `0` disables both the ceiling
+    /// and the reclaim sweep, restoring the unbounded behavior.
     ///
     /// PROVISIONAL default: 48 GiB comes from the OPSAI-5494 staging
     /// measurement of 29/10/2026 (each pause of a used productfactory-32g adds
