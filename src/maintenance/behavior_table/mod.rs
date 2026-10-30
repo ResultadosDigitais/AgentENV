@@ -603,3 +603,46 @@ behavior_table!(
     |temp: &tempfile::TempDir| temp.path().join("repository"),
     true
 );
+
+/// Builds an object-store repository over the GCS wire protocol, backed by the
+/// in-process fake rather than a bucket.
+///
+/// The fake's store outlives each case and its listing is keyed by object name,
+/// so every case works under its own prefix, the way the MinIO suite does.
+#[cfg(test)]
+pub async fn gcs_repository(root: &std::path::Path) -> std::sync::Arc<dyn Repository> {
+    use crate::repository::backends::oss::fake_gcs::FakeGcs;
+
+    let fake = FakeGcs::start().await;
+    let client = crate::repository::backends::oss::OssClient::new_gcs(
+        "snapshots".to_owned(),
+        fake.endpoint.clone(),
+        gcs_prefix(root),
+        object_store_operator::GcsAuth::Anonymous,
+    );
+    std::sync::Arc::new(crate::repository::backends::OssRepository::new(
+        std::sync::Arc::new(client),
+        crate::cfg::SnapshotImageStoragePolicy::ObjectStorage,
+        &crate::cfg::SnapshotPublishCompressionConfig::default(),
+    ))
+}
+
+#[cfg(test)]
+fn gcs_prefix(root: &std::path::Path) -> String {
+    // The tempdir name is unique per case, which makes the prefix unique.
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("case");
+    format!("managed-layer-collect/{name}")
+}
+
+// GCS reports `last_modified` for every object, so the cases can age nothing
+// but can still ask for a zero grace.
+#[cfg(test)]
+behavior_table!(
+    gcs,
+    gcs_repository,
+    |temp: &tempfile::TempDir| temp.path().join("never-aged"),
+    false
+);

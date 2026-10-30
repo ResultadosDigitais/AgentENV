@@ -15,7 +15,9 @@ use super::fake_gcs::FakeGcs;
 use super::repository::OssRepository;
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::Repository;
-use crate::repository::{BlobBody, BlobKey, DocumentChange, DocumentKey, DocumentUpdate};
+use crate::repository::{
+    BlobBody, BlobKey, DocumentChange, DocumentKey, DocumentUpdate, LayerRole,
+};
 
 const BUCKET: &str = "snapshots";
 
@@ -141,6 +143,51 @@ async fn names_with_reserved_characters_survive_a_write_and_read() {
 
     client.delete(&key).await.unwrap();
     assert!(!client.exists(&key).await.unwrap());
+}
+
+/// A managed layer under GCS is stored under the `~`-escaped name, and the
+/// collector must see it back under the digest the catalog addresses it by:
+/// otherwise every layer reads as an unparseable name and nothing is collected.
+#[tokio::test]
+async fn managed_layers_list_and_delete_under_their_repository_key() {
+    let fake = FakeGcs::start().await;
+    let repository = repository(&fake, "agentenv/stg");
+    let digest = crate::digest::sha256_digest(b"a-managed-layer");
+    let key = BlobKey::Layer {
+        digest: digest.clone(),
+        role: LayerRole::Rootfs,
+    };
+
+    repository
+        .put_blob(&key, BlobBody::Bytes(vec![0xAB; 128]))
+        .await
+        .unwrap();
+
+    // The store holds the escaped spelling; the repository addresses the digest.
+    assert!(
+        fake.object_names().iter().any(|name| name.contains("~3A")),
+        "the object is stored escaped: {:?}",
+        fake.object_names()
+    );
+
+    let listed = repository.list_managed_layers().await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].layer_digest.as_deref(), Some(digest.as_str()));
+    assert_eq!(listed[0].bytes, 128);
+
+    repository
+        .delete_managed_layer(&listed[0].key)
+        .await
+        .unwrap();
+    assert!(
+        repository.list_managed_layers().await.unwrap().is_empty(),
+        "{:?}",
+        fake.object_names()
+    );
+    assert!(fake
+        .object_names()
+        .iter()
+        .all(|name| !name.contains("managed-layers/")));
 }
 
 #[tokio::test]

@@ -39,13 +39,14 @@ struct Inner {
 
 /// A running fake. Dropping it stops nothing: the server lives for the test
 /// process, on its own port.
-pub(super) struct FakeGcs {
-    pub(super) endpoint: String,
+#[derive(Clone)]
+pub(crate) struct FakeGcs {
+    pub(crate) endpoint: String,
     inner: Arc<Mutex<Inner>>,
 }
 
 impl FakeGcs {
-    pub(super) async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let inner = Arc::new(Mutex::new(Inner::default()));
         let app = Router::new()
             .fallback(handle)
@@ -61,21 +62,21 @@ impl FakeGcs {
     }
 
     /// The object at `name` in the bucket, if any.
-    pub(super) fn object(&self, name: &str) -> Option<Vec<u8>> {
+    pub(crate) fn object(&self, name: &str) -> Option<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         inner.objects.get(name).map(|object| object.data.to_vec())
     }
 
-    pub(super) fn object_names(&self) -> Vec<String> {
+    pub(crate) fn object_names(&self) -> Vec<String> {
         self.inner.lock().unwrap().objects.keys().cloned().collect()
     }
 
     /// `METHOD path?query` of every request so far, in arrival order.
-    pub(super) fn requests(&self) -> Vec<String> {
+    pub(crate) fn requests(&self) -> Vec<String> {
         self.inner.lock().unwrap().requests.clone()
     }
 
-    pub(super) fn requests_matching(&self, needle: &str) -> usize {
+    pub(crate) fn requests_matching(&self, needle: &str) -> usize {
         self.requests()
             .iter()
             .filter(|request| request.contains(needle))
