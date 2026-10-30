@@ -287,6 +287,13 @@ impl Repository for OssRepository {
             .map_err(|error| RepositoryError::backend(format!("delete '{key}'"), error))
     }
 
+    async fn put_managed_layer_object(&self, key: &str, body: &[u8]) -> RepositoryResult<()> {
+        self.client
+            .put_bytes(key, body.to_vec(), OssUploadArtifact::RootfsLayer)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("write '{key}'"), error))
+    }
+
     /// Takes the pass lock by creating the lock object only when it is absent.
     ///
     /// This is a create-only write, not a [`lease`](super::lease): a lease needs

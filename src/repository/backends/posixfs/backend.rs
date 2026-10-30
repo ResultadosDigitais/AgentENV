@@ -183,6 +183,15 @@ impl Repository for PosixFsRepository {
         .await
     }
 
+    async fn put_managed_layer_object(&self, key: &str, body: &[u8]) -> RepositoryResult<()> {
+        let key = key.to_owned();
+        let body = body.to_vec();
+        self.run_artifacts("write managed layer object", move |store| {
+            store.put_managed_layer_object(&key, &body)
+        })
+        .await
+    }
+
     async fn acquire_maintenance_lock(
         &self,
         name: &str,

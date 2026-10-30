@@ -186,22 +186,21 @@ pub fn age_layer(root: &std::path::Path, digest: &str) {
     );
 }
 
-/// Writes one POSIX object under `managed-layers/` whose name does not translate
-/// back to a digest.
+/// Writes one object under `managed-layers/` whose name does not translate back
+/// to a digest.
 ///
 /// It cannot go through `put_blob`, which only writes digest-shaped names: such
 /// an object is exactly what an older release, or a hand edit, leaves behind.
-pub fn write_unreadable_layer(root: &std::path::Path) {
+///
+/// It goes through the backend, not the filesystem, so the case means the same
+/// thing on every backend; aging is the caller's, and only POSIX storage can be
+/// aged.
+pub async fn write_unreadable_layer(repository: &dyn Repository) {
     let key = format!("{}/not-a-digest.overlaybd.commit", BlobKey::LAYERS_DIR);
-    let path = root.join(&key);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("mkdir managed layers");
-    }
-    std::fs::write(&path, [0u8; 32]).expect("write unreadable layer");
-    filetime_set(
-        &path,
-        std::time::SystemTime::now() - Duration::from_secs(24 * 3600),
-    );
+    repository
+        .put_managed_layer_object(&key, &[0u8; 32])
+        .await
+        .expect("write unreadable layer");
 }
 
 pub fn filetime_set(path: &std::path::Path, at: std::time::SystemTime) {
@@ -253,9 +252,9 @@ macro_rules! behavior_table {
             // invocation, one level up.
             use super::*;
             use $crate::maintenance::behavior_table::{
-                age_layer, digest, request, store_image, store_layer, store_snapshot_record,
-                store_volume_record, stored_layer_keys, write_unreadable_layer,
-                LiveSandboxesUnderTest, NoLiveSandboxesUnderTest,
+                age_layer, digest, filetime_set, request, store_image, store_layer,
+                store_snapshot_record, store_volume_record, stored_layer_keys,
+                write_unreadable_layer, LiveSandboxesUnderTest, NoLiveSandboxesUnderTest,
             };
             use $crate::maintenance::{
                 collect_managed_layers, ManagedLayerCollectMode, ManagedLayerCollectRequest,
@@ -443,7 +442,18 @@ macro_rules! behavior_table {
             #[tokio::test]
             async fn an_object_whose_name_is_not_a_digest_never_leaves() {
                 let (repository, temp) = repository().await;
-                write_unreadable_layer(&$root(&temp));
+                write_unreadable_layer(repository.as_ref()).await;
+                // POSIX storage can be aged; an object store reports its own
+                // clock, so these cases ask for a zero grace instead.
+                if $age {
+                    filetime_set(
+                        &$root(&temp).join(format!(
+                            "{}/not-a-digest.overlaybd.commit",
+                            $crate::repository::BlobKey::LAYERS_DIR
+                        )),
+                        std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600),
+                    );
+                }
 
                 let listed = repository.list_managed_layers().await.expect("list");
                 let unreadable = listed

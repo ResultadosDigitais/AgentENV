@@ -267,6 +267,19 @@ pub trait Repository: Send + Sync {
         unsupported("managed layer collection")
     }
 
+    /// Stores one object under `managed-layers/` under a name that need not be a
+    /// digest.
+    ///
+    /// [`Self::put_blob`] only accepts a digest-shaped layer, which is all a
+    /// publisher writes. An older release, or a hand edit, can leave an object
+    /// there whose name is not a digest, and that object must be listed as
+    /// unreadable and never deleted. A test needs to place such an object next
+    /// to the ones a pass collects, and it can only do that through the backend
+    /// that stores it.
+    async fn put_managed_layer_object(&self, _key: &str, _body: &[u8]) -> RepositoryResult<()> {
+        unsupported("managed layer object write")
+    }
+
     /// Takes the named maintenance lock for the lifetime of one pass, so two
     /// passes never overlap. `Ok(None)` reports that another pass holds it.
     ///

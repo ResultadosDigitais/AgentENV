@@ -132,6 +132,19 @@ impl PosixFsArtifactStore {
         Ok(layers)
     }
 
+    /// Writes one object under `managed-layers/` under `key`, which need not be
+    /// a digest.
+    pub(crate) fn put_managed_layer_object(&self, key: &str, body: &[u8]) -> RepositoryResult<()> {
+        let path = self.root.join(key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                RepositoryError::backend(format!("create '{}'", parent.display()), error)
+            })?;
+        }
+        fs::write(&path, body)
+            .map_err(|error| RepositoryError::backend(format!("write '{}'", path.display()), error))
+    }
+
     /// Removes one object listed by [`Self::list_managed_layers`].
     pub(crate) fn delete_managed_layer(&self, key: &str) -> RepositoryResult<()> {
         let path = self.root.join(key);

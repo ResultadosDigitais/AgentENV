@@ -354,7 +354,6 @@ impl OssClient {
 
     /// One object's size and modification time, without reading it.
     pub(crate) async fn stat(&self, key: &str) -> Result<OssListedObject> {
-        let strip = (!self.prefix.is_empty()).then(|| format!("{}/", self.prefix));
         let entry = self
             .run_with_key(key, |operator, key| async move {
                 let metadata = operator.stat(&key).await?;
@@ -366,16 +365,13 @@ impl OssClient {
             })
             .await
             .with_context(|| format!("oss stat '{key}'"))?;
-        Ok(match strip {
-            Some(strip) => OssListedObject {
-                key: entry
-                    .key
-                    .strip_prefix(&strip)
-                    .map_or(entry.key.clone(), str::to_owned),
-                ..entry
-            },
-            None => entry,
-        })
+        // Back through the one translation point, like every other listing, so
+        // a GCS-stored object comes back under the name the repository uses.
+        let key = self
+            .relative_keys(vec![entry.key])
+            .pop()
+            .unwrap_or_else(|| key.to_owned());
+        Ok(OssListedObject { key, ..entry })
     }
 
     /// Check whether an object exists.
