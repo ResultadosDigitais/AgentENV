@@ -970,8 +970,9 @@ impl Slot {
                             if !reap_child_bounded(&mut child, CHILD_REAP_GRACE) {
                                 hand_off_unreaped_child(child);
                             }
-                            return Err(err)
-                                .context(format!("Failed to kill timed-out ip link del {veth_name}"));
+                            return Err(err).context(format!(
+                                "Failed to kill timed-out ip link del {veth_name}"
+                            ));
                         }
                         // `kill` only sends the termination request; reap
                         // with bounded polling instead of a blocking `wait`

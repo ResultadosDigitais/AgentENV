@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -70,6 +70,15 @@ impl OssUploadArtifact {
             Self::Alias => "alias",
         }
     }
+}
+
+/// One object a recursive listing returned, before its key is made relative to
+/// the configured backend prefix.
+#[derive(Clone, Debug)]
+pub(crate) struct OssListedObject {
+    pub(crate) key: String,
+    pub(crate) bytes: u64,
+    pub(crate) last_modified: Option<SystemTime>,
 }
 
 /// How writers of one shared document exclude each other, which depends on
@@ -343,6 +352,28 @@ impl OssClient {
         result
     }
 
+    /// One object's size and modification time, without reading it.
+    pub(crate) async fn stat(&self, key: &str) -> Result<OssListedObject> {
+        let entry = self
+            .run_with_key(key, |operator, key| async move {
+                let metadata = operator.stat(&key).await?;
+                Ok(OssListedObject {
+                    key,
+                    bytes: metadata.content_length(),
+                    last_modified: metadata.last_modified().map(SystemTime::from),
+                })
+            })
+            .await
+            .with_context(|| format!("oss stat '{key}'"))?;
+        // Back through the one translation point, like every other listing, so
+        // a GCS-stored object comes back under the name the repository uses.
+        let key = self
+            .relative_keys(vec![entry.key])
+            .pop()
+            .unwrap_or_else(|| key.to_owned());
+        Ok(OssListedObject { key, ..entry })
+    }
+
     /// Check whether an object exists.
     pub(crate) async fn exists(&self, key: &str) -> Result<bool> {
         let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "exists");
@@ -373,6 +404,42 @@ impl OssClient {
             .with_context(|| format!("oss list '{prefix}'"))?;
 
         Ok(self.relative_keys(keys))
+    }
+
+    /// Lists every object under `prefix` recursively, with the size and
+    /// modification time the store reports for each. Keys come back relative to
+    /// the configured backend prefix, like [`Self::list_keys_recursive`], and
+    /// decoded the same way — so a GCS-stored managed layer lists back under
+    /// the name the repository addresses it by.
+    pub(crate) async fn list_entries_recursive(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<OssListedObject>> {
+        let entries = self
+            .run_with_key(prefix, |operator, prefix| async move {
+                let entries = operator.list_with(&prefix).recursive(true).await?;
+                Ok(entries
+                    .into_iter()
+                    .filter(|entry| !entry.metadata().mode().is_dir())
+                    .map(|entry| {
+                        let metadata = entry.metadata();
+                        OssListedObject {
+                            key: entry.path().to_string(),
+                            bytes: metadata.content_length(),
+                            last_modified: metadata.last_modified().map(SystemTime::from),
+                        }
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await
+            .with_context(|| format!("oss list '{prefix}'"))?;
+        let mut keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+        keys = self.relative_keys(keys);
+        Ok(entries
+            .into_iter()
+            .zip(keys)
+            .map(|(entry, key)| OssListedObject { key, ..entry })
+            .collect())
     }
 
     /// Lists at most `limit` files after a repository-relative key.

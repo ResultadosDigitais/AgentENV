@@ -414,6 +414,32 @@ pub struct SnapshotConfig {
     pub publish_compression: SnapshotPublishCompressionConfig,
     #[config(nested)]
     pub memory_startup_pack: SnapshotStartupPackConfig,
+    #[config(nested)]
+    pub managed_layer_collect: SnapshotManagedLayerCollectConfig,
+}
+
+/// Collecting managed layers that no record cites.
+///
+/// The pass deletes content-addressed layers, and a layer cannot be recreated
+/// without its origin, so it is off unless an operator turns it on and runs a
+/// report first.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotManagedLayerCollectConfig {
+    /// Whether the admin collection endpoint runs at all. Disabled, it answers
+    /// 409 and sweeps nothing.
+    #[config(default = false, env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED")]
+    pub enabled: bool,
+    /// How old an uncited layer must be before enforce may delete it. This
+    /// covers one publication, which uploads its layers before it writes the
+    /// record that cites them: a layer uploaded moments ago and not cited yet
+    /// belongs to a publication in flight. Measured on staging from a golden's
+    /// first layer upload to its record commit; see
+    /// `docs/src/internals/persistence-artifact-inventory.md`.
+    #[config(
+        default = 7200u64,
+        env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS"
+    )]
+    pub grace_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]

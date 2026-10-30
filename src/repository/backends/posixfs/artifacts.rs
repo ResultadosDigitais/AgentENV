@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use crate::digest::{self, FileDigest};
-use crate::repository::{BlobBody, BlobKey, RepositoryError, RepositoryResult};
+use crate::repository::{BlobBody, BlobKey, ManagedLayerObject, RepositoryError, RepositoryResult};
 use crate::types::SnapshotId;
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
@@ -80,6 +80,82 @@ impl PosixFsArtifactStore {
             )
         })?;
         self.write_snapshot_file(snapshot_id, name, bytes)
+    }
+
+    /// Every object under `managed-layers/`, with its size and modification
+    /// time. A name that does not translate back to a digest is reported with
+    /// `layer_digest == None`, which makes it undeletable.
+    pub(crate) fn list_managed_layers(&self) -> RepositoryResult<Vec<ManagedLayerObject>> {
+        let directory = self.root.join(BlobKey::LAYERS_DIR);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read '{}'", directory.display()),
+                    error,
+                ))
+            }
+        };
+        let mut layers = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                RepositoryError::backend(format!("read '{}'", directory.display()), error)
+            })?;
+            // A directory under the prefix is not a stored layer.
+            if !entry
+                .file_type()
+                .map_err(|error| {
+                    RepositoryError::backend(format!("inspect '{}'", entry.path().display()), error)
+                })?
+                .is_file()
+            {
+                continue;
+            }
+            let metadata = entry.metadata().map_err(|error| {
+                RepositoryError::backend(format!("stat '{}'", entry.path().display()), error)
+            })?;
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                // A name that is not even UTF-8 cannot be a digest either.
+                continue;
+            };
+            let key = format!("{}{name}", BlobKey::LAYERS_PREFIX);
+            layers.push(ManagedLayerObject {
+                layer_digest: BlobKey::digest_from_layer_key(&key),
+                bytes: metadata.len(),
+                last_modified: metadata.modified().ok(),
+                key,
+            });
+        }
+        layers.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(layers)
+    }
+
+    /// Writes one object under `managed-layers/` under `key`, which need not be
+    /// a digest.
+    pub(crate) fn put_managed_layer_object(&self, key: &str, body: &[u8]) -> RepositoryResult<()> {
+        let path = self.root.join(key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                RepositoryError::backend(format!("create '{}'", parent.display()), error)
+            })?;
+        }
+        fs::write(&path, body)
+            .map_err(|error| RepositoryError::backend(format!("write '{}'", path.display()), error))
+    }
+
+    /// Removes one object listed by [`Self::list_managed_layers`].
+    pub(crate) fn delete_managed_layer(&self, key: &str) -> RepositoryResult<()> {
+        let path = self.root.join(key);
+        match fs::remove_file(&path) {
+            Ok(()) => path.parent().map_or(Ok(()), sync_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RepositoryError::backend(
+                format!("remove '{}'", path.display()),
+                error,
+            )),
+        }
     }
 
     /// Removes one snapshot's directory. Shared managed layers stay.

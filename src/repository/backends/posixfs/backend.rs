@@ -10,7 +10,7 @@ use super::catalog::PosixFsCatalogStore;
 use crate::repository::interfaces::Repository;
 use crate::repository::{
     BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
-    RepositoryError, RepositoryResult,
+    MaintenanceLock, ManagedLayerObject, RepositoryError, RepositoryResult,
 };
 use crate::types::SnapshotId;
 
@@ -168,6 +168,54 @@ impl Repository for PosixFsRepository {
             store.read_documents(collection)
         })
         .await
+    }
+
+    async fn list_managed_layers(&self) -> RepositoryResult<Vec<ManagedLayerObject>> {
+        self.run_artifacts("list managed layers", |store| store.list_managed_layers())
+            .await
+    }
+
+    async fn delete_managed_layer(&self, key: &str) -> RepositoryResult<()> {
+        let key = key.to_owned();
+        self.run_artifacts("delete managed layer", move |store| {
+            store.delete_managed_layer(&key)
+        })
+        .await
+    }
+
+    async fn put_managed_layer_object(&self, key: &str, body: &[u8]) -> RepositoryResult<()> {
+        let key = key.to_owned();
+        let body = body.to_vec();
+        self.run_artifacts("write managed layer object", move |store| {
+            store.put_managed_layer_object(&key, &body)
+        })
+        .await
+    }
+
+    async fn acquire_maintenance_lock(
+        &self,
+        name: &str,
+    ) -> RepositoryResult<Option<MaintenanceLock>> {
+        let name = name.to_owned();
+        self.run_catalog("acquire maintenance lock", move |store| {
+            let Some((lock, keeper)) = store.acquire_maintenance_lock(&name)? else {
+                return Ok(None);
+            };
+            RepositoryResult::Ok(Some(MaintenanceLock::with_keeper(
+                lock.name,
+                lock.token,
+                Box::new(keeper),
+            )))
+        })
+        .await
+    }
+
+    /// The POSIX lock lives in an `flock` that the kernel releases when the
+    /// holding process dies, so dropping it is the whole release. The lock file
+    /// stays behind on purpose: removing it would let a waiter that already
+    /// opened it take a lock no one holds.
+    async fn release_maintenance_lock(&self, _lock: MaintenanceLock) -> RepositoryResult<()> {
+        Ok(())
     }
 }
 

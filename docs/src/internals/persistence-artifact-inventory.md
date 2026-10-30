@@ -131,11 +131,45 @@ Owned by `src/repository/*` and `src/snapshot/types/*`.
 | Shared documents (snapshot records and aliases, volume records and names, build logs, build-cache state) | Paths named in `src/repository/layout.rs`. POSIX: one file each, updated under a lock file. OSS: one `{name}.json` object each. S3 stores replace it only if its ETag is unchanged. Alibaba OSS cannot, so every write holds a lease on the appendable lock object `locks/{path}` (see `src/repository/backends/oss/lease.rs`). | Volume state, reservations, and name bindings; template build logs; the shared build-cache seed | Updated atomically by the snapshot and volume catalogs and the template builder on every node | A released lease deletes its lock object. A holder that dies leaves it until a contender takes it over 30 seconds later. | No. |
 | Firecracker manifest | POSIX: `<snapshot_store>/repository/snapshots/{id}/firecracker-manifest.json`; OSS: `artifacts/{id}/firecracker-manifest.json` | Firecracker snapshot shape, virtual sizes, attached-drive metadata; path fields are hydrated at runtime | Runtime manifest template for launching committed snapshots | Persisted during publish. Removed with per-snapshot artifacts. | Partially, but kept as durable artifact. |
 | VM state | POSIX: `<snapshot_store>/repository/snapshots/{id}/vm_state.bin`; OSS: `artifacts/{id}/vm_state.bin` | Firecracker VM state snapshot | Required to resume committed snapshots | Copied/uploaded during publish. Removed with per-snapshot artifacts. | No. |
-| Managed snapshot layers | POSIX: `<snapshot_store>/repository/managed-layers/{digest}.overlaybd.commit`; OSS: `managed-layers/{digest}` | Content-addressed rootfs, attached-drive, and memory overlaybd commit layers | Shared immutable layer storage for committed snapshots | Imported during publish by descriptor or by hashing local descriptor-less layers. Usually not removed with a single snapshot. | Not from metadata alone; can be re-fetched only if source still exists. |
+| Managed snapshot layers | POSIX: `<snapshot_store>/repository/managed-layers/{digest}.overlaybd.commit`; OSS: `managed-layers/{digest}` | Content-addressed rootfs, attached-drive, and memory overlaybd commit layers | Shared immutable layer storage for committed snapshots, volume backing, and published images | Imported during publish by descriptor or by hashing local descriptor-less layers. Not removed with a single snapshot, because other records may cite the layer. A layer no record cites is collected by `POST /admin/managed-layers/collect` once it is older than `[snapshot.managed_layer_collect].grace_secs`; see "Managed Layer Collection" below. | Not from metadata alone; can be re-fetched only if source still exists, and a collected layer is gone for good. |
+| Managed-layer collection lock | POSIX: `<snapshot_store>/repository/maintenance/locks/managed-layer-collect`; OSS: `maintenance/locks/managed-layer-collect` | The holder token of the running collection pass | Serializes collection passes so two never overlap | Created by `maintenance::collect_managed_layers`. POSIX holds an `flock` the kernel drops with the process; OSS deletes the object on release, and a later pass takes over an object older than 30 minutes. Never under `managed-layers/`, so a pass never lists its own lock as a layer. | Yes. |
 | Staging files | POSIX: `<snapshot_store>/repository/staging/*`; OSS: process temp dir | Dense-exported and recontainerized layers prepared for storage | On POSIX, the same filesystem as `managed-layers/`, so a prepared layer is hard-linked in without a copy | Temporary files, removed once the publish that made them is done. A process that crashes mid-publish leaves its files behind. | Yes. |
 | Source-registry publications | `SnapshotRecord.committed.disk_publications` plus remote OCI registry objects | Published rootfs/attached-drive image refs and manifest digests | Lets compatible snapshot deltas live in their source registry | Created during OSS publish when image publishing is enabled. Rolled back on failure or delete when possible. | Registry-owned; record is required to locate. |
 
 Repository records are the logical source of truth for committed snapshots. Build-time and runtime `image.json` files should not become committed truth unless they contain data that cannot be derived from committed metadata.
+
+## Managed Layer Collection
+
+Owned by `src/maintenance/managed_layers.rs`.
+
+A managed layer is content addressed and shared, so deleting a snapshot removes only that snapshot's own files and leaves every layer behind. Nothing used to notice a layer that no record cited any more, so deleting a record stranded its layers in the bucket for good. `POST /admin/managed-layers/collect` is that collector.
+
+The citation set is closed and comes from four places:
+
+- **snapshot records** (`catalog/records/`): committed rootfs, attached-drive, memory and volume-snapshot layers;
+- **volume records** (`volumes/records/`): backing layers, which keep a volume's layers after the snapshots that used it are gone;
+- **published image descriptions** (`images/descriptions/`): an image owns its layers;
+- **live sandboxes**: the source snapshot of every sandbox this node holds, running or paused. If a live sandbox's source is no longer in the catalog, the pass is downgraded to a report for the whole bucket, because the substrate can no longer prove which layers that sandbox may read.
+
+`BlobKey::Layer` is written only by snapshot publication (`src/snapshot/store.rs`) and volume publication (`src/volume/mod.rs`); image builds reuse the same two stores, and image descriptions only reference layers those stores wrote.
+
+The pass runs in two modes. `report` lists and counts without deleting anything. `enforce` deletes only the uncited layers older than `[snapshot.managed_layer_collect].grace_secs`, and only after a report has run in the same server process. The grace period exists because a publish uploads its layers *before* it writes the record that cites them: a layer uploaded moments ago and not cited yet belongs to a publish in flight.
+
+Two things the pass never does:
+
+- it never deletes an object under `managed-layers/` whose name does not translate back to a `sha256:<hex>` digest — the substrate cannot prove what such an object is, so it is counted as unreadable and left alone;
+- it never deletes while another pass holds the maintenance lock. The lock serializes passes only; it does not exclude publishers, and the grace period covers that race.
+
+Every pass records cited layers and bytes, orphan layers and bytes, unexpired and unreadable layers, deleted layers and reclaimed bytes, and the objects it could not handle. A single failure never stops the pass.
+
+### Rolling it out
+
+Report first, in this order, on a node whose repository is the environment you are cleaning:
+
+1. Start one node with `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED=true`. The pass only removes what the node that ran it can see, so run it on a node holding the environment's live sandboxes; a node with none reports the layer of every paused sandbox that is not running right now.
+2. Run `POST /admin/managed-layers/collect` with `{"mode": "report"}` and compare `orphanLayers`/`orphanBytes` with what you measured independently. A difference larger than the layers a known publication is uploading means the citation set is missing a source; **stop** and investigate, do not enforce.
+3. Only then run `{"mode": "enforce"}`. It applies the same grace period, so the layers a pass in flight is uploading stay.
+4. The pass never removes an object whose name is not a digest. A non-zero `unreadableLayers` is expected from older releases and stays reported every pass.
 
 ## Snapshot Runtime Resolution
 

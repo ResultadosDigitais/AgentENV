@@ -80,7 +80,9 @@ static POOL: OnceLock<Option<FirecrackerPool>> = OnceLock::new();
 /// Lock the dead-entry queue, recovering from poisoning: a panicked cleanup
 /// worker must not turn into a pool-wide panic on the next lock.
 fn lock_dead_queue(queue: &Mutex<DeadWarmQueue>) -> std::sync::MutexGuard<'_, DeadWarmQueue> {
-    queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 extern "C" fn firecracker_pool_exit_hook() {
@@ -281,7 +283,8 @@ fn finalize_closed_dead_entry(
         Err(err) => {
             let mut message = err.error.to_string();
             if let Some(prior) = prior_error {
-                message = format!("{prior:#}; final teardown during shutdown also failed: {message}");
+                message =
+                    format!("{prior:#}; final teardown during shutdown also failed: {message}");
             }
             // Teardown failed, so the allocation bit stays set: the index is
             // quarantined from reuse while index-derived network resources
@@ -580,9 +583,9 @@ impl FirecrackerPool {
                     error = %err,
                     "firecracker pool: failed to spawn dead-entry cleanup worker; retrying with plain spawn"
                 );
-                match std::thread::Builder::new().spawn(move || {
-                    Self::dead_cleanup_worker_loop(shared_retry, network)
-                }) {
+                match std::thread::Builder::new()
+                    .spawn(move || Self::dead_cleanup_worker_loop(shared_retry, network))
+                {
                     Ok(handle) => queue.worker = Some(handle),
                     Err(retry_err) => {
                         warn!(
@@ -732,11 +735,9 @@ impl FirecrackerPool {
                 // re-run `Slot::cleanup` via `Slot::drop` and leak the bits.
                 drop(queue);
                 for (entry, error) in failed {
-                    if let Some(message) = finalize_closed_dead_entry(
-                        NetworkManager::global(),
-                        entry,
-                        Some(error),
-                    ) {
+                    if let Some(message) =
+                        finalize_closed_dead_entry(NetworkManager::global(), entry, Some(error))
+                    {
                         failures.push(message);
                     }
                 }

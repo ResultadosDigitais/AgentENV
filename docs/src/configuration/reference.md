@@ -527,6 +527,20 @@ configuration with device prefetch; this is not a claim that device page cache
 is bypassed. The configured I/O engine is never changed. OSS retains its existing
 physical-range planner and executor. Prefetch is not a correctness dependency.
 
+## `[snapshot.managed_layer_collect]`
+
+Collecting managed layers that no catalog record cites. A managed layer is
+content addressed and shared, so deleting a snapshot leaves its layers in the
+repository. `POST /admin/managed-layers/collect` sweeps them: `mode: report`
+lists and counts, `mode: enforce` deletes the uncited layers older than the
+grace period. See
+[Managed Layer Collection](../internals/persistence-artifact-inventory.md#managed-layer-collection).
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Enables the endpoint. Disabled, it answers 409 and sweeps nothing. Enforce is refused until a report pass has run in the same server process. |
+| `grace_secs` | integer | `7200` | How old an uncited layer must be before enforce may delete it. A publish uploads its layers before it writes the record that cites them, so a newer uncited layer may belong to a publish in flight and always stays. |
+
 ## `[backend.posix_fs]`
 
 POSIX filesystem-backed snapshot repository configuration. This section is used when `snapshot.repository_backend = "posix_fs"`.

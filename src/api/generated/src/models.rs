@@ -3471,6 +3471,665 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MachineInfo>
     }
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ManagedLayerCollectFailure {
+    /// Repository-relative key of the object
+    #[serde(rename = "key")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub key: String,
+
+    /// Why the object could not be handled
+    #[serde(rename = "message")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub message: String,
+}
+
+impl ManagedLayerCollectFailure {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(key: String, message: String) -> ManagedLayerCollectFailure {
+        ManagedLayerCollectFailure { key, message }
+    }
+}
+
+/// Converts the ManagedLayerCollectFailure value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ManagedLayerCollectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("key".to_string()),
+            Some(self.key.to_string()),
+            Some("message".to_string()),
+            Some(self.message.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ManagedLayerCollectFailure value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ManagedLayerCollectFailure {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub key: Vec<String>,
+            pub message: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ManagedLayerCollectFailure".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "key" => intermediate_rep.key.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "message" => intermediate_rep.message.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ManagedLayerCollectFailure".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ManagedLayerCollectFailure {
+            key: intermediate_rep
+                .key
+                .into_iter()
+                .next()
+                .ok_or_else(|| "key missing in ManagedLayerCollectFailure".to_string())?,
+            message: intermediate_rep
+                .message
+                .into_iter()
+                .next()
+                .ok_or_else(|| "message missing in ManagedLayerCollectFailure".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ManagedLayerCollectFailure> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ManagedLayerCollectFailure>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ManagedLayerCollectFailure>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ManagedLayerCollectFailure - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ManagedLayerCollectFailure> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ManagedLayerCollectFailure as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ManagedLayerCollectFailure - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// `report` lists and counts without deleting anything; `enforce` deletes the uncited layers older than the grace period. Enforce is refused until a report has run in this server process.
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum ManagedLayerCollectMode {
+    #[serde(rename = "report")]
+    Report,
+    #[serde(rename = "enforce")]
+    Enforce,
+}
+
+impl validator::Validate for ManagedLayerCollectMode {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for ManagedLayerCollectMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ManagedLayerCollectMode::Report => write!(f, "report"),
+            ManagedLayerCollectMode::Enforce => write!(f, "enforce"),
+        }
+    }
+}
+
+impl std::str::FromStr for ManagedLayerCollectMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "report" => std::result::Result::Ok(ManagedLayerCollectMode::Report),
+            "enforce" => std::result::Result::Ok(ManagedLayerCollectMode::Enforce),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ManagedLayerCollectReport {
+    #[serde(rename = "mode")]
+    #[validate(nested)]
+    pub mode: models::ManagedLayerCollectMode,
+
+    /// Managed layers a catalog record or live sandbox cites
+    #[serde(rename = "citedLayers")]
+    pub cited_layers: u64,
+
+    /// Bytes of those cited layers
+    #[serde(rename = "citedBytes")]
+    pub cited_bytes: u64,
+
+    /// Uncited layers older than the grace period
+    #[serde(rename = "orphanLayers")]
+    pub orphan_layers: u64,
+
+    /// Bytes of those orphan layers
+    #[serde(rename = "orphanBytes")]
+    pub orphan_bytes: u64,
+
+    /// Uncited layers still inside the grace period, which stay
+    #[serde(rename = "unexpiredLayers")]
+    pub unexpired_layers: u64,
+
+    /// Objects under managed-layers/ whose name is not a digest. They are never deleted, because the substrate cannot prove what they are.
+    #[serde(rename = "unreadableLayers")]
+    pub unreadable_layers: u64,
+
+    /// Layers the pass could not classify because the citation set was unknowable (a live sandbox whose source left the catalog, or an unreadable record). They are neither cited nor orphaned, and are never deleted.
+    #[serde(rename = "unknownLayers")]
+    pub unknown_layers: u64,
+
+    /// Layers actually removed. Always zero in report mode.
+    #[serde(rename = "deletedLayers")]
+    pub deleted_layers: u64,
+
+    /// Bytes actually removed. Always zero in report mode.
+    #[serde(rename = "reclaimedBytes")]
+    pub reclaimed_bytes: u64,
+
+    /// Present when the pass counted but deleted nothing even in enforce mode, naming why. A live sandbox whose source left the catalog downgrades the pass.
+    #[serde(rename = "downgradedReason")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downgraded_reason: Option<String>,
+
+    /// Objects the pass could not delete or classify
+    #[serde(rename = "failures")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failures: Option<Vec<models::ManagedLayerCollectFailure>>,
+}
+
+impl ManagedLayerCollectReport {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        mode: models::ManagedLayerCollectMode,
+        cited_layers: u64,
+        cited_bytes: u64,
+        orphan_layers: u64,
+        orphan_bytes: u64,
+        unexpired_layers: u64,
+        unreadable_layers: u64,
+        unknown_layers: u64,
+        deleted_layers: u64,
+        reclaimed_bytes: u64,
+    ) -> ManagedLayerCollectReport {
+        ManagedLayerCollectReport {
+            mode,
+            cited_layers,
+            cited_bytes,
+            orphan_layers,
+            orphan_bytes,
+            unexpired_layers,
+            unreadable_layers,
+            unknown_layers,
+            deleted_layers,
+            reclaimed_bytes,
+            downgraded_reason: None,
+            failures: None,
+        }
+    }
+}
+
+/// Converts the ManagedLayerCollectReport value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ManagedLayerCollectReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping mode in query parameter serialization
+            Some("citedLayers".to_string()),
+            Some(self.cited_layers.to_string()),
+            Some("citedBytes".to_string()),
+            Some(self.cited_bytes.to_string()),
+            Some("orphanLayers".to_string()),
+            Some(self.orphan_layers.to_string()),
+            Some("orphanBytes".to_string()),
+            Some(self.orphan_bytes.to_string()),
+            Some("unexpiredLayers".to_string()),
+            Some(self.unexpired_layers.to_string()),
+            Some("unreadableLayers".to_string()),
+            Some(self.unreadable_layers.to_string()),
+            Some("unknownLayers".to_string()),
+            Some(self.unknown_layers.to_string()),
+            Some("deletedLayers".to_string()),
+            Some(self.deleted_layers.to_string()),
+            Some("reclaimedBytes".to_string()),
+            Some(self.reclaimed_bytes.to_string()),
+            self.downgraded_reason.as_ref().map(|downgraded_reason| {
+                [
+                    "downgradedReason".to_string(),
+                    downgraded_reason.to_string(),
+                ]
+                .join(",")
+            }),
+            // Skipping failures in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ManagedLayerCollectReport value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ManagedLayerCollectReport {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub mode: Vec<models::ManagedLayerCollectMode>,
+            pub cited_layers: Vec<u64>,
+            pub cited_bytes: Vec<u64>,
+            pub orphan_layers: Vec<u64>,
+            pub orphan_bytes: Vec<u64>,
+            pub unexpired_layers: Vec<u64>,
+            pub unreadable_layers: Vec<u64>,
+            pub unknown_layers: Vec<u64>,
+            pub deleted_layers: Vec<u64>,
+            pub reclaimed_bytes: Vec<u64>,
+            pub downgraded_reason: Vec<String>,
+            pub failures: Vec<Vec<models::ManagedLayerCollectFailure>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ManagedLayerCollectReport".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "mode" => intermediate_rep.mode.push(<models::ManagedLayerCollectMode as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "citedLayers" => intermediate_rep.cited_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "citedBytes" => intermediate_rep.cited_bytes.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "orphanLayers" => intermediate_rep.orphan_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "orphanBytes" => intermediate_rep.orphan_bytes.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "unexpiredLayers" => intermediate_rep.unexpired_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "unreadableLayers" => intermediate_rep.unreadable_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "unknownLayers" => intermediate_rep.unknown_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "deletedLayers" => intermediate_rep.deleted_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "reclaimedBytes" => intermediate_rep.reclaimed_bytes.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "downgradedReason" => intermediate_rep.downgraded_reason.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "failures" => return std::result::Result::Err("Parsing a container in this style is not supported in ManagedLayerCollectReport".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing ManagedLayerCollectReport".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ManagedLayerCollectReport {
+            mode: intermediate_rep
+                .mode
+                .into_iter()
+                .next()
+                .ok_or_else(|| "mode missing in ManagedLayerCollectReport".to_string())?,
+            cited_layers: intermediate_rep
+                .cited_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "citedLayers missing in ManagedLayerCollectReport".to_string())?,
+            cited_bytes: intermediate_rep
+                .cited_bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "citedBytes missing in ManagedLayerCollectReport".to_string())?,
+            orphan_layers: intermediate_rep
+                .orphan_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "orphanLayers missing in ManagedLayerCollectReport".to_string())?,
+            orphan_bytes: intermediate_rep
+                .orphan_bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "orphanBytes missing in ManagedLayerCollectReport".to_string())?,
+            unexpired_layers: intermediate_rep
+                .unexpired_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "unexpiredLayers missing in ManagedLayerCollectReport".to_string()
+                })?,
+            unreadable_layers: intermediate_rep
+                .unreadable_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "unreadableLayers missing in ManagedLayerCollectReport".to_string()
+                })?,
+            unknown_layers: intermediate_rep
+                .unknown_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "unknownLayers missing in ManagedLayerCollectReport".to_string())?,
+            deleted_layers: intermediate_rep
+                .deleted_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "deletedLayers missing in ManagedLayerCollectReport".to_string())?,
+            reclaimed_bytes: intermediate_rep
+                .reclaimed_bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "reclaimedBytes missing in ManagedLayerCollectReport".to_string())?,
+            downgraded_reason: intermediate_rep.downgraded_reason.into_iter().next(),
+            failures: intermediate_rep.failures.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ManagedLayerCollectReport> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ManagedLayerCollectReport>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ManagedLayerCollectReport>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ManagedLayerCollectReport - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ManagedLayerCollectReport> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ManagedLayerCollectReport as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ManagedLayerCollectReport - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ManagedLayerCollectRequest {
+    #[serde(rename = "mode")]
+    #[validate(nested)]
+    pub mode: models::ManagedLayerCollectMode,
+
+    /// Overrides the configured grace period for this pass, in seconds. An uncited layer younger than this is kept: a publish uploads its layers before it writes the record that cites them.
+    #[serde(rename = "graceSeconds")]
+    #[validate(range(min = 0u64))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grace_seconds: Option<u64>,
+}
+
+impl ManagedLayerCollectRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(mode: models::ManagedLayerCollectMode) -> ManagedLayerCollectRequest {
+        ManagedLayerCollectRequest {
+            mode,
+            grace_seconds: None,
+        }
+    }
+}
+
+/// Converts the ManagedLayerCollectRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ManagedLayerCollectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping mode in query parameter serialization
+            self.grace_seconds.as_ref().map(|grace_seconds| {
+                ["graceSeconds".to_string(), grace_seconds.to_string()].join(",")
+            }),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ManagedLayerCollectRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ManagedLayerCollectRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub mode: Vec<models::ManagedLayerCollectMode>,
+            pub grace_seconds: Vec<u64>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ManagedLayerCollectRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "mode" => intermediate_rep.mode.push(
+                        <models::ManagedLayerCollectMode as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "graceSeconds" => intermediate_rep.grace_seconds.push(
+                        <u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ManagedLayerCollectRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ManagedLayerCollectRequest {
+            mode: intermediate_rep
+                .mode
+                .into_iter()
+                .next()
+                .ok_or_else(|| "mode missing in ManagedLayerCollectRequest".to_string())?,
+            grace_seconds: intermediate_rep.grace_seconds.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ManagedLayerCollectRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ManagedLayerCollectRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ManagedLayerCollectRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ManagedLayerCollectRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ManagedLayerCollectRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ManagedLayerCollectRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ManagedLayerCollectRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
 /// vCPUs of the sandbox's VM, fixed when the VM first booted (by its template or cold start). cpuCount can be resized up to this value.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
@@ -3894,7 +4553,7 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u32>,
 
-    /// Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= memoryMB. Defaults to memoryMB. Does not change VM size.
+    /// Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
     #[serde(rename = "memoryRequestMB")]
     #[validate(range(min = 1u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3988,11 +4647,7 @@ impl std::fmt::Display for NewColdSandbox {
                 .as_ref()
                 .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
             self.memory_request_mb.as_ref().map(|memory_request_mb| {
-                [
-                    "memoryRequestMB".to_string(),
-                    memory_request_mb.to_string(),
-                ]
-                .join(",")
+                ["memoryRequestMB".to_string(), memory_request_mb.to_string()].join(",")
             }),
             self.disk_size_mb
                 .as_ref()

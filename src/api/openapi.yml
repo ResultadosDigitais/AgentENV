@@ -1737,6 +1737,110 @@ components:
           format: uint32
           description: Number of sandboxes currently in the Paused state
 
+    ManagedLayerCollectMode:
+      type: string
+      enum: [report, enforce]
+      description: >-
+        `report` lists and counts without deleting anything; `enforce` deletes
+        the uncited layers older than the grace period. Enforce is refused
+        until a report has run in this server process.
+
+    ManagedLayerCollectRequest:
+      required:
+        - mode
+      properties:
+        mode:
+          $ref: "#/components/schemas/ManagedLayerCollectMode"
+        graceSeconds:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: >-
+            Overrides the configured grace period for this pass, in seconds. An
+            uncited layer younger than this is kept: a publish uploads its
+            layers before it writes the record that cites them.
+
+    ManagedLayerCollectReport:
+      required:
+        - mode
+        - citedLayers
+        - citedBytes
+        - orphanLayers
+        - orphanBytes
+        - unexpiredLayers
+        - unreadableLayers
+        - unknownLayers
+        - deletedLayers
+        - reclaimedBytes
+      properties:
+        mode:
+          $ref: "#/components/schemas/ManagedLayerCollectMode"
+        citedLayers:
+          type: integer
+          format: uint64
+          description: Managed layers a catalog record or live sandbox cites
+        citedBytes:
+          type: integer
+          format: uint64
+          description: Bytes of those cited layers
+        orphanLayers:
+          type: integer
+          format: uint64
+          description: Uncited layers older than the grace period
+        orphanBytes:
+          type: integer
+          format: uint64
+          description: Bytes of those orphan layers
+        unexpiredLayers:
+          type: integer
+          format: uint64
+          description: Uncited layers still inside the grace period, which stay
+        unreadableLayers:
+          type: integer
+          format: uint64
+          description: >-
+            Objects under managed-layers/ whose name is not a digest. They are
+            never deleted, because the substrate cannot prove what they are.
+        unknownLayers:
+          type: integer
+          format: uint64
+          description: >-
+            Layers the pass could not classify because the citation set was
+            unknowable (a live sandbox whose source left the catalog, or an
+            unreadable record). They are neither cited nor orphaned, and are
+            never deleted.
+        deletedLayers:
+          type: integer
+          format: uint64
+          description: Layers actually removed. Always zero in report mode.
+        reclaimedBytes:
+          type: integer
+          format: uint64
+          description: Bytes actually removed. Always zero in report mode.
+        downgradedReason:
+          type: string
+          description: >-
+            Present when the pass counted but deleted nothing even in enforce
+            mode, naming why. A live sandbox whose source left the catalog
+            downgrades the pass.
+        failures:
+          type: array
+          description: Objects the pass could not delete or classify
+          items:
+            $ref: "#/components/schemas/ManagedLayerCollectFailure"
+
+    ManagedLayerCollectFailure:
+      required:
+        - key
+        - message
+      properties:
+        key:
+          type: string
+          description: Repository-relative key of the object
+        message:
+          type: string
+          description: Why the object could not be handled
+
     Error:
       required:
         - code
@@ -3264,6 +3368,52 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/managed-layers/collect:
+    post:
+      summary: Collect managed layers no record cites
+      description: >-
+        Sweeps the repository's managed layers and, in enforce mode, deletes the
+        ones no catalog record cites and that are older than the grace period.
+        Report mode lists and counts without deleting. A managed layer is
+        content addressed and shared, so deleting a snapshot leaves its layers
+        behind; this is the only operation that removes them.
+
+        It runs under a repository lock, so two passes never overlap, and it
+        refuses to run at all while
+        `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED` is false.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedLayerCollectRequest"
+      responses:
+        "200":
+          description: Successfully ran one collection pass
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedLayerCollectReport"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "409":
+          description: >-
+            The pass is disabled on this node, another pass holds the lock, or
+            enforce was requested before a report ran in this process.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/500"
 

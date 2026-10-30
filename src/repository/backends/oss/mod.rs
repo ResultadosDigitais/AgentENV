@@ -2,8 +2,10 @@ mod client;
 mod config;
 mod documents;
 mod epoch_lease;
+// The managed-layer behavior table runs against this fake too, so it is visible
+// to the crate's test build rather than to this module alone.
 #[cfg(test)]
-mod fake_gcs;
+pub(crate) mod fake_gcs;
 #[cfg(test)]
 mod gcs_tests;
 mod lease;
