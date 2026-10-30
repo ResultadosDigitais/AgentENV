@@ -631,6 +631,17 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
 /// printed footprint uses the same method as the staging measurement: allocated
 /// bytes deduplicated by device and inode.
 ///
+/// The workload is what makes the ceiling hold. Every pause overwrites the same
+/// tmpfs region with new bytes, so each memory generation covers the same guest
+/// offsets as the previous one and compaction folds them into a single copy: the
+/// compressed chain stays at one generation's worth of pages however many pauses
+/// ran. A workload that writes new data every pause cannot be held by any
+/// ceiling — its generations are disjoint, so compaction's output equals the sum
+/// of its inputs and the chain grows without bound — which is why that shape is
+/// the rejection case in
+/// [`unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox`]
+/// rather than the workload here.
+///
 /// The ceiling bounds the reclaimable part of the chain — the runtime-owned
 /// lowers plus the layer each pause appends — and never the stable prefix, which
 /// is materialized from the image once and shared by every sandbox of it. The
@@ -638,6 +649,14 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
 /// [`FirecrackerSandbox::chain_bytes_for_pause`] so the test and the pause path
 /// charge the same bytes; the total footprint is printed beside it for the
 /// staging measurement.
+///
+/// The ceiling itself is measured, never guessed: a warm-up pause with the
+/// ballast already written produces exactly one generation of the rewritten
+/// region, and the ceiling is that size plus a quarter. That is above what
+/// compaction has to leave behind and below the two uncompacted generations the
+/// next pause would otherwise carry, so the parity between "the ceiling fires"
+/// and "compaction is what brings the chain back under it" is what the assertions
+/// observe.
 ///
 /// The ceiling is injected into each sandbox handle instead of being read from
 /// the process-wide config: the pause path takes it from the sandbox, and only
@@ -663,59 +682,66 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
 
     let sandbox_config = common::default_sandbox_config()?;
     let mem_size_mib = u64::from(sandbox_config.mem_size_mib);
-    let guest_memory = mem_size_mib * 1024 * 1024;
-    // Deterministic churn: the guest rewrites the same file every cycle. The
-    // stable path keeps the compacted footprint bounded — rewriting the same
-    // blocks holds the suffix at one generation's worth of pages no matter how
-    // many pauses ran — while each fresh generation still commits those pages,
-    // so the un-compacted chain grows every pause. Half of guest memory per
-    // cycle keeps the trigger deterministic: the chain crosses the 1.5x-memory
-    // budget within a few pauses, and one compacted generation fits it.
-    let ballast_mib = mem_size_mib / 2;
-    let ballast_path = "/tmp/aenv-chain-ballast";
+    // An eighth of guest memory per cycle: comfortably inside the guest's tmpfs
+    // budget (default half of RAM) and still large enough that a couple of
+    // generations dwarf anything the image contributes. Rewritten in place, so
+    // every cycle dirties the SAME guest pages.
+    let ballast_mib = (mem_size_mib / 8).max(1);
+    let pause_count = 10;
 
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
     write_disk_marker(&mut sandbox).await?;
+    if !chain_ballast_dir_is_tmpfs(&mut sandbox).await? {
+        eprintln!(
+            "skipping ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling: {CHAIN_TMPFS_DIR} \
+             is not tmpfs in this guest, so the ballast would dirty the rootfs chain instead of \
+             the memory chain"
+        );
+        sandbox.stop().await?;
+        return Ok(());
+    }
+    // Allocate the ballast region before the first pause, so every later cycle
+    // rewrites pages that already exist. Letting `dd` create the file on the
+    // first write of each cycle would place the data on freshly allocated guest
+    // pages, and the generations would then cover disjoint offsets — exactly the
+    // un-reclaimable shape this test exists to distinguish from.
+    seed_chain_ballast(&mut sandbox, ballast_mib).await?;
 
-    // Establish the base chains before any ceiling is injected. The ceiling
-    // bounds the reclaimable part of a chain — the runtime-owned lowers plus the
-    // layer the pause appends — and never the shared stable prefix, so it has to
-    // hold one compacted generation (at most a touched-page generation's worth
-    // of guest memory) rather than the base image. Sizing it against the base
-    // footprint, as this test first did, made the fixture impossible: on the
-    // staging guest the prefix alone was 690,716,672 bytes of a 2,838,224,896
-    // byte ceiling, and a chain whose own growth had compacted to 2,408,116,224
-    // bytes was rejected for a total it could never shrink.
+    // The warm-up pause carries the ballast once and measures what the ceiling
+    // has to hold: one generation of the rewritten region, plus the immutable
+    // parts of both chains (the image prefix of the memory chain is empty on a
+    // fresh boot; the rootfs chain carries the image layers and is never
+    // rewritten here, because the ballast lives on tmpfs).
     let mut current = sandbox.pause().await?;
-    let pause_count = 10;
-    let (base_mem_reclaimable, base_mem_prefix) =
-        sandbox.chain_bytes_for_pause(&current.mem_overlaybd_config.image_config_path)?;
-    let (base_rootfs_reclaimable, base_rootfs_prefix) = sandbox.chain_bytes_for_pause(
-        &current
-            .common
-            .rootfs_image_config
-            .as_ref()
-            .context("paused snapshot should carry a rootfs image config")?
-            .image_config_path,
-    )?;
-    let ceiling = (base_mem_reclaimable
-        .max(base_rootfs_reclaimable)
-        .saturating_add(2 * guest_memory))
-    .min(
-        agentenv::cfg::ConfigManager::global_config()
-            .orchestrator
-            .chain_bytes_ceiling,
-    );
+    let (base_mem_reclaimable, base_mem_prefix) = memory_chain_parts(&sandbox, &current)?;
+    let (base_rootfs_reclaimable, base_rootfs_prefix) = rootfs_chain_parts(&sandbox, &current)?;
     assert!(
-        base_mem_reclaimable <= ceiling && base_rootfs_reclaimable <= ceiling,
-        "the ceiling must hold the reclaimable part of both base chains (memory \
-         {base_mem_reclaimable} bytes, rootfs {base_rootfs_reclaimable} bytes): {ceiling}"
+        base_mem_reclaimable > 0,
+        "the rewritten tmpfs region must allocate a memory generation to bound"
+    );
+    // The parts that never change across pauses and must fit on their own: both
+    // shared prefixes, and the rootfs chain's reclaimable part, which is
+    // rewritten by the restack rather than grown by the workload.
+    let fixed_bytes = base_mem_prefix
+        .max(base_rootfs_prefix)
+        .max(base_rootfs_reclaimable);
+    // One and a half generations: a compacted chain (one generation) fits with
+    // half a generation of slack for the noise a real guest adds, while two
+    // accumulated generations do not — so the trigger fires within the first two
+    // pauses and keeps firing, and every fire has a fitting result to produce.
+    let generation_budget = base_mem_reclaimable.saturating_mul(3) / 2;
+    let ceiling = fixed_bytes.saturating_add(generation_budget);
+    assert!(
+        ceiling > base_rootfs_prefix && ceiling > base_mem_prefix,
+        "the ceiling must hold both shared prefixes on their own (memory \
+         {base_mem_prefix} bytes, rootfs {base_rootfs_prefix} bytes): {ceiling}"
     );
     eprintln!(
         "base chains: memory reclaimable {base_mem_reclaimable} bytes over a \
          {base_mem_prefix} byte shared prefix, rootfs reclaimable {base_rootfs_reclaimable} \
-         bytes over a {base_rootfs_prefix} byte shared prefix, ceiling {ceiling} bytes"
+         bytes over a {base_rootfs_prefix} byte shared prefix, ceiling {ceiling} bytes \
+         ({fixed_bytes} fixed + {generation_budget} generation budget), ballast {ballast_mib} MiB"
     );
 
     let mut compaction_seen = false;
@@ -727,23 +753,9 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
         let mut resumed =
             FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(ceiling);
         resumed.start().await?;
-        let write = resumed
-            .run_command(
-                "dd",
-                &[
-                    "if=/dev/zero",
-                    &format!("of={ballast_path}"),
-                    "bs=1M",
-                    &format!("count={ballast_mib}"),
-                ],
-            )
+        rewrite_chain_ballast(&mut resumed, ballast_mib)
             .await
-            .with_context(|| format!("write chain ballast for pause {pause_index}"))?;
-        assert_eq!(
-            write.exit_code, 0,
-            "chain ballast write failed: {}",
-            write.stderr
-        );
+            .with_context(|| format!("rewrite chain ballast for pause {pause_index}"))?;
         // A rejected pause only reports the byte totals, which cannot tell a
         // ceiling that was set too low from a chain whose runtime-owned lowers
         // were misclassified as immutable stable prefix. Classify the chain the
@@ -780,11 +792,12 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
             .unwrap_or(0);
         // The ceiling bounds the reclaimable part, so the assertion has to read
         // the same two parts the pause path charges, from the same accounting.
-        let (reclaimable, shared_prefix) =
-            resumed.chain_bytes_for_pause(&snapshot.mem_overlaybd_config.image_config_path)?;
+        let (reclaimable, shared_prefix) = memory_chain_parts(&resumed, &snapshot)?;
+        let (rootfs_reclaimable, rootfs_prefix) = rootfs_chain_parts(&resumed, &snapshot)?;
         eprintln!(
             "pause {}: chain footprint {} bytes ({} lowers) = {} reclaimable + {} shared prefix, \
-             change {:+} bytes, ceiling {} bytes\nlowers (bytes, deduplicated): {}\n{}",
+             change {:+} bytes, ceiling {} bytes; rootfs chain {} reclaimable + {} shared \
+             prefix\nlowers (bytes, deduplicated): {}\n{}",
             pause_index + 1,
             footprint,
             lowers.len(),
@@ -792,6 +805,8 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
             shared_prefix,
             change_bytes,
             ceiling,
+            rootfs_reclaimable,
+            rootfs_prefix,
             format_lower_bytes(&lowers, &per_lower_bytes),
             describe_chain(&resumed, &snapshot)
         );
@@ -807,6 +822,15 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
             reclaimable <= ceiling,
             "pause {} must leave the reclaimable part of the chain under the ceiling: \
              {reclaimable} > {ceiling} (shared prefix {shared_prefix} bytes is not charged)",
+            pause_index + 1
+        );
+        // The pause path charges the rootfs chain too, and a rootfs breach is
+        // terminal, so the workload must not push that chain past the ceiling
+        // either: the ballast lives outside the rootfs precisely so it does not.
+        assert!(
+            rootfs_reclaimable <= ceiling,
+            "pause {} must leave the rootfs chain's reclaimable part under the ceiling: \
+             {rootfs_reclaimable} > {ceiling} (shared prefix {rootfs_prefix} bytes is not charged)",
             pause_index + 1
         );
         final_reclaimable = reclaimable;
@@ -837,6 +861,283 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
         "at least one pause must have compacted the runtime-owned suffix"
     );
     Ok(())
+}
+
+/// A pause whose chain grows with data compaction cannot reclaim fails named
+/// and keeps the sandbox.
+///
+/// The complement of [`ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling`]:
+/// there the guest rewrites one region, so compaction folds every generation into
+/// a single copy and the ceiling holds. Here each pause writes a fresh region and
+/// keeps the previous ones, so the generations are disjoint: compaction can only
+/// concatenate them, its output equals the sum of its inputs, and a fixed ceiling
+/// is unreachable no matter how often it runs. The named rejection is the correct
+/// outcome for that workload, and the sandbox must survive it — the pause is a
+/// recoverable capture error, so the VM is resumed in place, the handle keeps its
+/// runtime state, and the same sandbox pauses as soon as the ceiling allows it.
+///
+/// Needs a real Firecracker host (`/dev/kvm`), so it is skipped with a clear
+/// message elsewhere, like the reclaim test above.
+#[tokio::test]
+async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox() -> Result<()> {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!(
+            "skipping unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox: \
+             /dev/kvm is not available on this host"
+        );
+        return Ok(());
+    }
+    common::setup().await;
+
+    let sandbox_config = common::default_sandbox_config()?;
+    let mem_size_mib = u64::from(sandbox_config.mem_size_mib);
+    // Two unique regions per generation's worth of ceiling: the second pause's
+    // chain alone is the ceiling, and compaction cannot bring it under.
+    let unique_mib = (mem_size_mib / 4).max(1);
+
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    sandbox.start().await?;
+    write_disk_marker(&mut sandbox).await?;
+    if !chain_ballast_dir_is_tmpfs(&mut sandbox).await? {
+        eprintln!(
+            "skipping unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox: \
+             {CHAIN_TMPFS_DIR} is not tmpfs in this guest, so the unique regions would dirty the \
+             rootfs chain, whose ceiling breach is terminal"
+        );
+        sandbox.stop().await?;
+        return Ok(());
+    }
+    let output = sandbox
+        .run_command("mkdir", &["-p", CHAIN_UNIQUE_DIR])
+        .await
+        .context("create the unique-data directory")?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "create {} failed: {}",
+        CHAIN_UNIQUE_DIR,
+        output.stderr
+    );
+
+    // One pause carrying one unique region sizes the ceiling from measurement
+    // instead of a guess. The ceiling HOLDS one generation — the chain of this
+    // pause fits it — and does not hold two, which is what makes the next pause's
+    // rejection a statement about compaction rather than about a ceiling that was
+    // simply too small.
+    write_unique_chain_data(&mut sandbox, unique_mib, 0).await?;
+    let current = FirecrackerSandbox::pause(&mut sandbox).await?;
+    let (base_mem_reclaimable, base_mem_prefix) = memory_chain_parts(&sandbox, &current)?;
+    let (base_rootfs_reclaimable, base_rootfs_prefix) = rootfs_chain_parts(&sandbox, &current)?;
+    assert!(
+        base_mem_reclaimable > 0,
+        "the unique region must allocate a memory generation to bound"
+    );
+    let fixed_bytes = base_mem_prefix
+        .max(base_rootfs_prefix)
+        .max(base_rootfs_reclaimable);
+    let ceiling = fixed_bytes
+        .saturating_add(base_mem_reclaimable)
+        .saturating_add(base_mem_reclaimable / 4);
+    assert!(
+        ceiling >= base_mem_reclaimable,
+        "the ceiling must hold this pause's own generation: {base_mem_reclaimable} > {ceiling}"
+    );
+    eprintln!(
+        "unique-growth base: memory {base_mem_reclaimable} reclaimable over a \
+         {base_mem_prefix} byte prefix, rootfs {base_rootfs_reclaimable} reclaimable over a \
+         {base_rootfs_prefix} byte prefix, unique region {unique_mib} MiB, ceiling {ceiling} bytes"
+    );
+
+    // Resume the same chain under the tight ceiling and add another unique
+    // region. The next chain carries both regions, and compaction cannot drop
+    // either, so the pause must be refused by name.
+    let mut resumed =
+        FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(ceiling);
+    resumed.start().await?;
+    write_unique_chain_data(&mut resumed, unique_mib, 1).await?;
+    let error = SandboxBackend::pause(&mut resumed, None)
+        .await
+        .expect_err("a chain of disjoint generations cannot fit a fixed ceiling");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("CHAIN_BYTES_CEILING_EXCEEDED"),
+        "the rejection must carry the named code: {message}"
+    );
+    assert!(
+        !error.is_terminal(),
+        "a ceiling breach must be recoverable, never terminal: {message}"
+    );
+    eprintln!("expected ceiling rejection: {message}");
+
+    // The runtime state survived the rejection: the VM is running again and both
+    // the marker and the unique regions written so far are still there.
+    verify_disk_marker(&mut resumed).await?;
+    let output = resumed
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                &format!("test -s {CHAIN_UNIQUE_DIR}/gen-0 && test -s {CHAIN_UNIQUE_DIR}/gen-1"),
+            ],
+        )
+        .await
+        .context("check the unique regions survived the rejection")?;
+    assert_eq!(
+        output.exit_code, 0,
+        "both unique regions must survive the rejected pause: {}",
+        output.stderr
+    );
+
+    // And the same sandbox pauses as soon as the ceiling allows it, which is what
+    // makes the rejection recoverable rather than a lost sandbox.
+    let mut resumed = resumed.with_chain_bytes_ceiling(0);
+    let snapshot = FirecrackerSandbox::pause(&mut resumed)
+        .await
+        .context("a rejected pause must be retryable once the ceiling is lifted")?;
+    let (reclaimable, prefix) = memory_chain_parts(&resumed, &snapshot)?;
+    eprintln!(
+        "retry with the ceiling disabled: memory chain {reclaimable} reclaimable + {prefix} \
+         shared prefix"
+    );
+    Ok(())
+}
+
+/// Guest tmpfs directory the ceiling tests write their data into.
+///
+/// The data has to live in guest RAM: a file on the overlay rootfs would be
+/// captured by the rootfs chain instead of the memory chain, and the two tests
+/// would then be asserting against a different device than the one their
+/// doc comments describe. `/dev/shm` is the conventional tmpfs mount and is
+/// verified to be one before either test proceeds.
+const CHAIN_TMPFS_DIR: &str = "/dev/shm";
+/// The rewritten-in-place region of the reclaim test.
+const CHAIN_BALLAST_PATH: &str = "/dev/shm/aenv-chain-ballast";
+/// The append-only directory of the rejection test.
+const CHAIN_UNIQUE_DIR: &str = "/dev/shm/aenv-chain-unique";
+
+/// Whether the guest `/dev/shm` really is tmpfs, so the data lands in guest RAM.
+///
+/// Returns `false` — and the caller skips with a message — instead of writing to
+/// whatever filesystem happens to back the path: on a rootfs-backed `/dev/shm`
+/// the dirty pages would belong to the rootfs chain, whose ceiling rejection is
+/// terminal, so the assertion would test the wrong device and the wrong error
+/// classification.
+async fn chain_ballast_dir_is_tmpfs(sandbox: &mut FirecrackerSandbox) -> Result<bool> {
+    let output = sandbox
+        .run_command("sh", &["-c", &format!("stat -f -c %T {CHAIN_TMPFS_DIR}")])
+        .await
+        .context("inspect the guest filesystem type of /dev/shm")?;
+    Ok(output.exit_code == 0 && output.stdout.trim() == "tmpfs")
+}
+
+/// Size the ballast file once, before the first pause.
+///
+/// Later cycles overwrite these very pages, which is what keeps every memory
+/// generation covering the same guest offsets.
+async fn seed_chain_ballast(sandbox: &mut FirecrackerSandbox, size_mib: u64) -> Result<()> {
+    let output = sandbox
+        .run_command(
+            "dd",
+            &[
+                "if=/dev/zero",
+                &format!("of={CHAIN_BALLAST_PATH}"),
+                "bs=1M",
+                &format!("count={size_mib}"),
+            ],
+        )
+        .await
+        .with_context(|| format!("seed {size_mib} MiB chain ballast"))?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "chain ballast seed failed ({}): {}",
+        output.exit_code,
+        output.stderr
+    );
+    Ok(())
+}
+
+/// Overwrite the existing ballast pages with fresh bytes, in place.
+///
+/// `conv=notrunc` keeps the file's size and extent, so each pause dirties the
+/// same offsets as the previous one — the redundancy compaction reclaims. The
+/// bytes differ per call so every generation really commits new data; a pause
+/// that rewrote the same bytes would leave nothing for the overlay to replace.
+async fn rewrite_chain_ballast(sandbox: &mut FirecrackerSandbox, size_mib: u64) -> Result<()> {
+    let output = sandbox
+        .run_command(
+            "dd",
+            &[
+                "if=/dev/urandom",
+                &format!("of={CHAIN_BALLAST_PATH}"),
+                "bs=1M",
+                &format!("count={size_mib}"),
+                "conv=notrunc",
+            ],
+        )
+        .await
+        .with_context(|| format!("rewrite {size_mib} MiB chain ballast"))?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "chain ballast rewrite failed ({}): {}",
+        output.exit_code,
+        output.stderr
+    );
+    Ok(())
+}
+
+/// Grow the guest's unique-data footprint by `size_mib` MiB, never rewriting.
+///
+/// Each call leaves the previous file in place and writes a new one, so the
+/// union of the generations covers offsets no earlier generation covered:
+/// compaction can only concatenate them, and the chain grows by the full
+/// `size_mib` every pause.
+async fn write_unique_chain_data(
+    sandbox: &mut FirecrackerSandbox,
+    size_mib: u64,
+    pause_index: usize,
+) -> Result<()> {
+    let path = format!("{CHAIN_UNIQUE_DIR}/gen-{pause_index}");
+    let output = sandbox
+        .run_command(
+            "dd",
+            &[
+                "if=/dev/urandom",
+                &format!("of={path}"),
+                "bs=1M",
+                &format!("count={size_mib}"),
+            ],
+        )
+        .await
+        .with_context(|| {
+            format!("write {size_mib} MiB of unique chain data for pause {pause_index}")
+        })?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "unique chain data write failed ({}): {}",
+        output.exit_code,
+        output.stderr
+    );
+    Ok(())
+}
+
+/// The `(reclaimable, shared_prefix)` byte parts of a snapshot's memory chain.
+fn memory_chain_parts(
+    sandbox: &FirecrackerSandbox,
+    snapshot: &FirecrackerSnapshotConfig,
+) -> Result<(u64, u64)> {
+    sandbox.chain_bytes_for_pause(&snapshot.mem_overlaybd_config.image_config_path)
+}
+
+/// The `(reclaimable, shared_prefix)` byte parts of a snapshot's rootfs chain.
+fn rootfs_chain_parts(
+    sandbox: &FirecrackerSandbox,
+    snapshot: &FirecrackerSnapshotConfig,
+) -> Result<(u64, u64)> {
+    let rootfs = snapshot
+        .common
+        .rootfs_image_config
+        .as_ref()
+        .context("paused snapshot should carry a rootfs image config")?;
+    sandbox.chain_bytes_for_pause(&rootfs.image_config_path)
 }
 
 /// Report how `sandbox` classifies each lower of `snapshot`'s memory chain.
