@@ -77,7 +77,10 @@ pub struct ClusterLiveSandboxes {
 impl ClusterLiveSandboxes {
     /// A reader whose `local` half is always present and whose `cluster` half is
     /// `None` when no gateway base URL is configured.
-    pub fn new(local: Arc<dyn LiveSandboxes>, cluster: Option<Arc<dyn ClusterSandboxList>>) -> Self {
+    pub fn new(
+        local: Arc<dyn LiveSandboxes>,
+        cluster: Option<Arc<dyn ClusterSandboxList>>,
+    ) -> Self {
         Self { cluster, local }
     }
 }
@@ -101,5 +104,99 @@ impl LiveSandboxes for ClusterLiveSandboxes {
             .context("this node's sandbox list could not be read")?;
         let union: BTreeSet<String> = cluster.into_iter().chain(local).collect();
         Ok(union.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Origins(Result<Vec<String>, &'static str>);
+
+    #[async_trait]
+    impl LiveSandboxes for Origins {
+        async fn live_snapshot_origins(&self) -> anyhow::Result<Vec<String>> {
+            match &self.0 {
+                Ok(origins) => Ok(origins.clone()),
+                Err(message) => Err(anyhow::anyhow!("{message}")),
+            }
+        }
+    }
+
+    fn local(origins: Vec<&str>) -> Arc<dyn LiveSandboxes> {
+        Arc::new(Origins(Ok(origins
+            .into_iter()
+            .map(str::to_owned)
+            .collect())))
+    }
+
+    fn cluster(origins: Vec<&str>) -> Arc<dyn ClusterSandboxList> {
+        struct List(Vec<String>);
+
+        #[async_trait]
+        impl ClusterSandboxList for List {
+            async fn list_snapshot_origins(&self) -> anyhow::Result<Vec<String>> {
+                Ok(self.0.clone())
+            }
+        }
+
+        Arc::new(List(origins.into_iter().map(str::to_owned).collect()))
+    }
+
+    #[tokio::test]
+    async fn the_cluster_and_the_local_list_are_unioned() {
+        let live = ClusterLiveSandboxes::new(
+            local(vec!["snap-local", "snap-both"]),
+            Some(cluster(vec!["snap-other-node", "snap-both"])),
+        );
+
+        let origins = live.live_snapshot_origins().await.expect("list");
+
+        assert_eq!(
+            origins,
+            vec!["snap-both", "snap-local", "snap-other-node"],
+            "a sandbox only the gateway sees must stay cited, and duplicates collapse"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_gateway_is_an_error_not_a_local_only_answer() {
+        let live = ClusterLiveSandboxes::new(local(vec!["snap-local"]), None);
+
+        let error = live
+            .live_snapshot_origins()
+            .await
+            .expect_err("without the cluster, this node cannot answer for the cluster");
+
+        assert!(error.to_string().contains("not configured"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_cluster_list_that_failed_never_falls_back_to_the_local_list() {
+        struct Failing;
+
+        #[async_trait]
+        impl ClusterSandboxList for Failing {
+            async fn list_snapshot_origins(&self) -> anyhow::Result<Vec<String>> {
+                anyhow::bail!("node list failed")
+            }
+        }
+
+        let live = ClusterLiveSandboxes::new(local(vec!["snap-local"]), Some(Arc::new(Failing)));
+
+        assert!(
+            live.live_snapshot_origins().await.is_err(),
+            "a partial list must never be reported as the cluster's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_list_that_failed_is_an_error() {
+        let live = ClusterLiveSandboxes::new(
+            Arc::new(Origins(Err("store unavailable"))),
+            Some(cluster(vec!["snap-other-node"])),
+        );
+
+        assert!(live.live_snapshot_origins().await.is_err());
     }
 }

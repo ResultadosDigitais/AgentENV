@@ -3384,6 +3384,15 @@ paths:
         It runs under a repository lock, so two passes never overlap, and it
         refuses to run at all while
         `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED` is false.
+
+        The citation set is the whole cluster, not this node: the aggregate of
+        `GET /v2/sandboxes` on the gateway configured by
+        `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL`, because a sandbox
+        paused on another node keeps reading its source snapshot's layers.
+        Unset, or when any node of the gateway's fan-out fails, the pass cannot
+        prove a layer uncited: enforce answers 409 and only report runs.
+        Note that the credential this endpoint accepts is the node API key, so
+        anyone able to run a pass can delete layers.
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
@@ -3408,8 +3417,10 @@ paths:
           $ref: "#/components/responses/403"
         "409":
           description: >-
-            The pass is disabled on this node, another pass holds the lock, or
-            enforce was requested before a report ran in this process.
+            The pass is disabled on this node, another pass holds the lock,
+            enforce was requested before a report ran in this process, or
+            enforce was requested without a cluster gateway URL to list the
+            sandboxes of every node.
           content:
             application/json:
               schema:

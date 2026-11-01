@@ -83,8 +83,7 @@ pub fn cluster_live(
     local: Vec<String>,
 ) -> super::ClusterLiveSandboxes {
     super::ClusterLiveSandboxes::new(
-        std::sync::Arc::new(LiveSandboxesUnderTest(local))
-            as std::sync::Arc<dyn LiveSandboxes>,
+        std::sync::Arc::new(LiveSandboxesUnderTest(local)) as std::sync::Arc<dyn LiveSandboxes>,
         gateway.map(|gateway| {
             std::sync::Arc::new(GatewaySandboxListUnderTest(gateway))
                 as std::sync::Arc<dyn super::ClusterSandboxList>
@@ -599,7 +598,7 @@ macro_rules! behavior_table {
 
                 // The sandbox is paused on another node, so this node's list is
                 // empty; only the gateway's aggregated list names it.
-                let live = cluster_live(Ok(vec![origin]), Vec::new());
+                let live = cluster_live(Some(Ok(vec![origin])), Vec::new());
                 let report = collect_managed_layers(repository.as_ref(), &live, &pass)
                     .await
                     .expect("collect");
@@ -630,12 +629,15 @@ macro_rules! behavior_table {
                 // for every other node and silently missing this one, so it
                 // cannot be treated as the cluster.
                 let live = cluster_live(
-                    Err("node agentenv-node-local-ssd-xb9bd list failed".to_owned()),
+                    Some(Err(
+                        "node agentenv-node-local-ssd-xb9bd list failed".to_owned()
+                    )),
                     Vec::new(),
                 );
 
-                let report =
-                    collect_managed_layers(repository.as_ref(), &live, &pass).await.expect("collect");
+                let report = collect_managed_layers(repository.as_ref(), &live, &pass)
+                    .await
+                    .expect("collect");
 
                 assert!(
                     report.downgraded_reason.is_some(),

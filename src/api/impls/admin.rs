@@ -286,8 +286,12 @@ impl ApiImpl {
     /// A pass that cannot see the sandboxes of other nodes cannot prove any
     /// layer uncited — a sandbox paused elsewhere reads its source snapshot's
     /// layers on resume — so without a gateway the pass may only report.
-    fn live_sandboxes(&self, gateway_url: Option<&str>) -> Result<ClusterLiveSandboxes, models::Error> {
-        let local: Arc<dyn LiveSandboxes> = Arc::new(OrchestratorLiveSandboxes::new(self.orchestrator()));
+    fn live_sandboxes(
+        &self,
+        gateway_url: Option<&str>,
+    ) -> Result<ClusterLiveSandboxes, models::Error> {
+        let local: Arc<dyn LiveSandboxes> =
+            Arc::new(OrchestratorLiveSandboxes::new(self.orchestrator()));
         let Some(gateway_url) = gateway_url else {
             return Ok(ClusterLiveSandboxes::new(local, None));
         };

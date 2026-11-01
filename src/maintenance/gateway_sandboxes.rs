@@ -80,7 +80,10 @@ impl GatewaySandboxList {
     }
 
     /// One page of the aggregated list, and the token for the next one.
-    async fn page(&self, next_token: Option<&str>) -> anyhow::Result<(Vec<ListedSandbox>, Option<String>)> {
+    async fn page(
+        &self,
+        next_token: Option<&str>,
+    ) -> anyhow::Result<(Vec<ListedSandbox>, Option<String>)> {
         let mut request = self
             .client
             .get(format!("{}{CLUSTER_LIST_PATH}", self.endpoint))
@@ -159,16 +162,19 @@ mod tests {
     impl FakeGateway {
         async fn start(pages: Vec<Response<Body>>) -> Self {
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let state = (Arc::new(Mutex::new(pages.into_iter())), Arc::clone(&requests));
-            let app = Router::new()
-                .fallback(handle)
-                .with_state(state);
+            let state = (
+                Arc::new(Mutex::new(pages.into_iter())),
+                Arc::clone(&requests),
+            );
+            let app = Router::new().fallback(handle).with_state(state);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind fake gateway");
             let address = listener.local_addr().expect("address");
             tokio::spawn(async move {
-                axum::serve(listener, app).await.expect("serve fake gateway");
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve fake gateway");
             });
             Self {
                 endpoint: format!("http://{address}"),
@@ -182,19 +188,26 @@ mod tests {
         Arc<Mutex<Vec<String>>>,
     );
 
-    async fn handle(State((pages, requests)): State<ServeState>, request: Request<Body>) -> Response<Body> {
+    async fn handle(
+        State((pages, requests)): State<ServeState>,
+        request: Request<Body>,
+    ) -> Response<Body> {
         let uri = request.uri().to_string();
         assert_eq!(
-            request.headers().get("x-api-key").and_then(|v| v.to_str().ok()),
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
             Some(KEY),
             "the aggregated list is called with this node's API key"
         );
         requests.lock().expect("requests").push(uri);
-        pages
-            .lock()
-            .expect("pages")
-            .next()
-            .unwrap_or_else(|| Response::builder().status(500).body(Body::empty()).expect("response"))
+        pages.lock().expect("pages").next().unwrap_or_else(|| {
+            Response::builder()
+                .status(500)
+                .body(Body::empty())
+                .expect("response")
+        })
     }
 
     fn page(body: &str, next: Option<&str>) -> Response<Body> {
@@ -214,7 +227,10 @@ mod tests {
     #[tokio::test]
     async fn follows_every_page_of_the_aggregated_list() {
         let gateway = FakeGateway::start(vec![
-            page(r#"[{"templateID":"snap-a"},{"templateID":"snap-b"}]"#, Some("t1")),
+            page(
+                r#"[{"templateID":"snap-a"},{"templateID":"snap-b"}]"#,
+                Some("t1"),
+            ),
             page(r#"[{"templateID":"snap-c"}]"#, None),
         ])
         .await;
@@ -272,6 +288,9 @@ mod tests {
             .await
             .expect_err("a repeated cursor must not be read as the end");
 
-        assert!(error.to_string().contains("repeated the page token"), "{error}");
+        assert!(
+            error.to_string().contains("repeated the page token"),
+            "{error}"
+        );
     }
 }
