@@ -20,7 +20,7 @@ pub enum AdminManagedLayersCollectPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Forbidden
     Status403_Forbidden(models::Error),
-    /// The pass is disabled on this node, another pass holds the lock, or enforce was requested before a report ran in this process.
+    /// The pass is disabled on this node, another pass holds the lock, enforce was requested before a report ran in this process, or enforce was requested without a cluster gateway URL to list the sandboxes of every node.
     Status409_ThePassIsDisabledOnThisNode(models::Error),
     /// Server error
     Status500_ServerError(models::Error),

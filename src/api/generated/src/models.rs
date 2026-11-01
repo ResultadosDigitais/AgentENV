@@ -4956,6 +4956,12 @@ pub struct NewSandbox {
     #[validate(range(min = 128u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u32>,
+
+    /// Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= the sandbox's effective memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
+    #[serde(rename = "memoryRequestMB")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_request_mb: Option<u32>,
 }
 
 impl NewSandbox {
@@ -4976,6 +4982,7 @@ impl NewSandbox {
             volume_mounts: None,
             cpu_count: None,
             memory_mb: None,
+            memory_request_mb: None,
         }
     }
 }
@@ -5026,6 +5033,9 @@ impl std::fmt::Display for NewSandbox {
             self.memory_mb
                 .as_ref()
                 .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+            self.memory_request_mb.as_ref().map(|memory_request_mb| {
+                ["memoryRequestMB".to_string(), memory_request_mb.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -5062,6 +5072,7 @@ impl std::str::FromStr for NewSandbox {
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
+            pub memory_request_mb: Vec<u32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -5151,6 +5162,10 @@ impl std::str::FromStr for NewSandbox {
                     "memoryMB" => intermediate_rep.memory_mb.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryRequestMB" => intermediate_rep.memory_request_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandbox".to_string(),
@@ -5185,6 +5200,7 @@ impl std::str::FromStr for NewSandbox {
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),
             memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+            memory_request_mb: intermediate_rep.memory_request_mb.into_iter().next(),
         })
     }
 }

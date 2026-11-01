@@ -811,6 +811,11 @@ components:
             Guest memory in MiB for this sandbox, up to the template's
             memoryMB. Defaults to the template's. A lower value needs
             [resize].enabled on the node.
+        memoryRequestMB:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= the sandbox's effective memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
 
     NewSandboxV2:
       description: >-
