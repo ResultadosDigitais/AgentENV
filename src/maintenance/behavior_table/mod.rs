@@ -291,7 +291,9 @@ macro_rules! behavior_table {
                 collect_managed_layers, ManagedLayerCollectMode, ManagedLayerCollectRequest,
                 ManagedLayerCollectorError,
             };
-            use $crate::repository::{DocumentCollection, ManagedLayerObject, Repository};
+            use $crate::repository::{
+                DocumentCollection, DocumentKey, ManagedLayerObject, Repository,
+            };
 
             /// Builds this table's backend. It lives inside the generated
             /// module so one module can hold several tables.
