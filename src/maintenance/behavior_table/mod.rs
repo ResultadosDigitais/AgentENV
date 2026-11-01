@@ -594,27 +594,37 @@ macro_rules! behavior_table {
                     .read_documents(DocumentCollection::SnapshotRecords)
                     .await
                     .expect("read records");
-                let origin = records.first().expect("one record").0.clone();
+                let (origin, _) = records.first().expect("one record").clone();
+                // This is the staging shape: retention already removed the
+                // golden's record, so nothing in the catalog cites the layer —
+                // yet a sandbox paused on another node still resumes from it.
+                repository
+                    .delete_document(DocumentKey::SnapshotRecord(
+                        $crate::types::SnapshotId::parse(&origin).expect("snapshot id"),
+                    ))
+                    .await
+                    .expect("drop the record");
 
-                // The sandbox is paused on another node, so this node's list is
-                // empty; only the gateway's aggregated list names it.
+                // This node holds nothing: the sandbox is paused elsewhere, so
+                // only the gateway's aggregated list names it.
                 let live = cluster_live(Some(Ok(vec![origin])), Vec::new());
                 let report = collect_managed_layers(repository.as_ref(), &live, &pass)
                     .await
                     .expect("collect");
 
                 assert!(
-                    report.downgraded_reason.is_none(),
-                    "a complete fan-out must not downgrade the pass: {:?}",
+                    report.downgraded_reason.is_some(),
+                    "a live sandbox whose source is gone must downgrade the pass, \
+                     whichever node holds it: {:?}",
                     report.downgraded_reason
                 );
-                assert_eq!(report.cited_layers, 1);
-                assert_eq!(report.cited_bytes, 32768);
-                assert_eq!(report.orphan_layers, 0);
                 assert_eq!(report.deleted_layers, 0);
-                assert!(stored_layer_keys(repository.as_ref())
-                    .await
-                    .contains(&live_layer));
+                assert!(
+                    stored_layer_keys(repository.as_ref())
+                        .await
+                        .contains(&live_layer),
+                    "the layer a paused sandbox on another node reads must stay"
+                );
             }
 
             #[tokio::test]
