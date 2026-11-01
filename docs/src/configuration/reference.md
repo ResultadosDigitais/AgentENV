@@ -534,13 +534,16 @@ Collecting managed layers that no catalog record cites. A managed layer is
 content addressed and shared, so deleting a snapshot leaves its layers in the
 repository. `POST /admin/managed-layers/collect` sweeps them: `mode: report`
 lists and counts, `mode: enforce` deletes the uncited layers older than the
-grace period. See
+grace period. Enforce needs `gateway_url` (below), because a layer a sandbox
+paused on another node still reads must stay cited.
+See
 [Managed Layer Collection](../internals/persistence-artifact-inventory.md#managed-layer-collection).
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Enables the endpoint. Disabled, it answers 409 and sweeps nothing. Enforce is refused until a report pass has run in the same server process. |
 | `grace_secs` | integer | `7200` | How old an uncited layer must be before enforce may delete it. A publish uploads its layers before it writes the record that cites them, so a newer uncited layer may belong to a publish in flight and always stays. |
+| `gateway_url` | string | unset | Base URL of the cluster gateway (for example `http://agentenv-gateway:8080`). The pass reads `GET /v2/sandboxes` from it, which fans out to every node, so a sandbox paused on another node keeps its source layers cited. Unset, the pass sees only this node: `report` still runs, `enforce` answers 409. |
 
 ## `[backend.posix_fs]`
 

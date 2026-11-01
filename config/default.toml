@@ -287,6 +287,10 @@ workers = 1
 # uploads its layers before it writes the record that cites them, so a layer
 # uploaded moments ago and not cited yet belongs to a publish in flight.
 # grace_secs = 7200
+# Cluster gateway base URL. The pass reads GET /v2/sandboxes from it, which
+# fans out to every node, so a sandbox paused on another node keeps its layers
+# cited. Unset, only this node's sandboxes are visible and enforce is refused.
+# gateway_url = "http://agentenv-gateway:8080"
 
 # Optional for OSS and POSIX backends: record the guest's startup memory pages once per snapshot
 # at publish time (a short local re-resume on the capture node, ~10s budget),

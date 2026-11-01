@@ -7,10 +7,12 @@
 //! here keeps every other module's dependency direction intact.
 
 pub mod behavior_table;
+mod gateway_sandboxes;
 mod live_sandboxes;
 mod managed_layers;
 
-pub use live_sandboxes::OrchestratorLiveSandboxes;
+pub use gateway_sandboxes::GatewaySandboxList;
+pub use live_sandboxes::{ClusterLiveSandboxes, ClusterSandboxList, OrchestratorLiveSandboxes};
 pub use managed_layers::{
     collect_managed_layers, LiveSandboxes, ManagedLayerCollectFailure, ManagedLayerCollectMode,
     ManagedLayerCollectReport, ManagedLayerCollectRequest, ManagedLayerCollectorError,

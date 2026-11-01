@@ -149,7 +149,9 @@ The citation set is closed and comes from four places:
 - **snapshot records** (`catalog/records/`): committed rootfs, attached-drive, memory and volume-snapshot layers;
 - **volume records** (`volumes/records/`): backing layers, which keep a volume's layers after the snapshots that used it are gone;
 - **published image descriptions** (`images/descriptions/`): an image owns its layers;
-- **live sandboxes**: the source snapshot of every sandbox this node holds, running or paused. If a live sandbox's source is no longer in the catalog, the pass is downgraded to a report for the whole bucket, because the substrate can no longer prove which layers that sandbox may read.
+- **live sandboxes**: the source snapshot of every sandbox in the cluster, running or paused. The pass unions the node's own list with the gateway's aggregated `GET /v2/sandboxes`, which fans out to every node, because a sandbox paused on *another* node still reads its source snapshot's layers on resume. If a live sandbox's source is no longer in the catalog, the pass is downgraded to a report for the whole bucket, because the substrate can no longer prove which layers that sandbox may read.
+
+The cluster list is fail-closed. When `[snapshot.managed_layer_collect].gateway_url` is unset, when any node of the gateway's fan-out fails (the gateway answers 502 for the whole page), when a page does not arrive, or when a page token repeats, the pass treats the citation set as unknowable and deletes nothing: `enforce` is refused with 409 and only `report` runs. A partial list is never read as a complete one — an enforce pass built from one node's list deleted 123 layers on staging, one of them a lower layer of a sandbox paused on another node.
 
 `BlobKey::Layer` is written only by snapshot publication (`src/snapshot/store.rs`) and volume publication (`src/volume/mod.rs`); image builds reuse the same two stores, and image descriptions only reference layers those stores wrote.
 
@@ -166,8 +168,8 @@ Every pass records cited layers and bytes, orphan layers and bytes, unexpired an
 
 Report first, in this order, on a node whose repository is the environment you are cleaning:
 
-1. Start one node with `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED=true`. The pass only removes what the node that ran it can see, so run it on a node holding the environment's live sandboxes; a node with none reports the layer of every paused sandbox that is not running right now.
-2. Run `POST /admin/managed-layers/collect` with `{"mode": "report"}` and compare `orphanLayers`/`orphanBytes` with what you measured independently. A difference larger than the layers a known publication is uploading means the citation set is missing a source; **stop** and investigate, do not enforce.
+1. Start one node with `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED=true`, and with `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL` pointing at the cluster gateway. Without the gateway URL the pass sees only its own node, so a sandbox paused elsewhere looks gone and its layers look uncited: enforce is refused, and report still runs but its `orphanLayers` is not the cluster's.
+2. Run `POST /admin/managed-layers/collect` with `{"mode": "report"}` and compare `orphanLayers`/`orphanBytes` with what you measured independently. A difference larger than the layers a known publication is uploading means the citation set is missing a source; **stop** and investigate, do not enforce. A report whose `downgradedReason` is set proves nothing and must not be followed by an enforce.
 3. Only then run `{"mode": "enforce"}`. It applies the same grace period, so the layers a pass in flight is uploading stay.
 4. The pass never removes an object whose name is not a digest. A non-zero `unreadableLayers` is expected from older releases and stays reported every pass.
 

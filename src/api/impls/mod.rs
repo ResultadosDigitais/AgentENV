@@ -96,6 +96,13 @@ impl ApiImpl {
         Arc::clone(&self.orchestrator)
     }
 
+    /// The API key this node authenticates inbound requests with. Its only
+    /// outbound use is calling the cluster gateway with the credential the node
+    /// already holds; it must never be logged or returned.
+    pub(crate) fn api_key(&self) -> &ApiKey {
+        &self.api_key
+    }
+
     pub(crate) fn proxy_client(&self) -> &ProxyClient {
         &self.proxy_client
     }

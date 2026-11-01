@@ -440,6 +440,18 @@ pub struct SnapshotManagedLayerCollectConfig {
         env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS"
     )]
     pub grace_secs: u64,
+    /// Base URL of the cluster gateway, used to list the sandboxes of every
+    /// node. The collector must keep a layer cited when a sandbox paused on
+    /// *another* node still reads it, and a node can only see its own
+    /// sandboxes, so the pass reads the gateway's aggregated list.
+    ///
+    /// Unset, the pass cannot prove which layers the other nodes use: enforce is
+    /// refused and only a report runs.
+    #[config(
+        env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL",
+        parse_env = parse_trimmed_string
+    )]
+    pub gateway_url: Option<String>,
 }
 
 #[derive(Debug, Config, Clone)]

@@ -60,6 +60,37 @@ impl LiveSandboxes for LiveSandboxesUnderTest {
     }
 }
 
+/// The gateway's aggregated list, as the cluster reader consumes it.
+///
+/// `Ok` is a complete fan-out over every node; `Err` stands for any node that
+/// failed, could not be reached, or a page that did not arrive.
+pub struct GatewaySandboxListUnderTest(pub Result<Vec<String>, String>);
+
+#[async_trait]
+impl super::ClusterSandboxList for GatewaySandboxListUnderTest {
+    async fn list_snapshot_origins(&self) -> anyhow::Result<Vec<String>> {
+        match &self.0 {
+            Ok(origins) => Ok(origins.clone()),
+            Err(message) => Err(anyhow::anyhow!("{message}")),
+        }
+    }
+}
+
+/// The cluster reader the node runs: `gateway: None` is the unconfigured
+/// deployment, where only the local list exists.
+pub fn cluster_live(
+    gateway: Option<Result<Vec<String>, String>>,
+    local: Vec<String>,
+) -> super::ClusterLiveSandboxes {
+    super::ClusterLiveSandboxes::new(
+        std::sync::Arc::new(LiveSandboxesUnderTest(local)) as std::sync::Arc<dyn LiveSandboxes>,
+        gateway.map(|gateway| {
+            std::sync::Arc::new(GatewaySandboxListUnderTest(gateway))
+                as std::sync::Arc<dyn super::ClusterSandboxList>
+        }),
+    )
+}
+
 /// Stores one managed layer of `bytes` bytes straight through the blob
 /// primitives, which is exactly what a publication does before it writes its
 /// record.
@@ -252,7 +283,7 @@ macro_rules! behavior_table {
             // invocation, one level up.
             use super::*;
             use $crate::maintenance::behavior_table::{
-                age_layer, digest, filetime_set, request, store_image, store_layer,
+                age_layer, cluster_live, digest, filetime_set, request, store_image, store_layer,
                 store_snapshot_record, store_volume_record, stored_layer_keys,
                 write_unreadable_layer, LiveSandboxesUnderTest, NoLiveSandboxesUnderTest,
             };
@@ -260,7 +291,9 @@ macro_rules! behavior_table {
                 collect_managed_layers, ManagedLayerCollectMode, ManagedLayerCollectRequest,
                 ManagedLayerCollectorError,
             };
-            use $crate::repository::{DocumentCollection, ManagedLayerObject, Repository};
+            use $crate::repository::{
+                DocumentCollection, DocumentKey, ManagedLayerObject, Repository,
+            };
 
             /// Builds this table's backend. It lives inside the generated
             /// module so one module can hold several tables.
@@ -542,6 +575,111 @@ macro_rules! behavior_table {
                 assert!(
                     report.downgraded_reason.is_some(),
                     "a live sandbox whose source is gone must downgrade the pass"
+                );
+                assert_eq!(report.deleted_layers, 0);
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&orphan));
+            }
+
+            #[tokio::test]
+            async fn a_layer_cited_only_by_a_paused_sandbox_on_another_node_never_leaves() {
+                let (repository, temp) = repository().await;
+                let live_layer = digest("cross-node-layer");
+                store_layer(repository.as_ref(), &live_layer, 32768)
+                    .await
+                    .expect("store live layer");
+                store_snapshot_record(repository.as_ref(), &[&live_layer]).await;
+                let pass =
+                    age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce);
+                let records = repository
+                    .read_documents(DocumentCollection::SnapshotRecords)
+                    .await
+                    .expect("read records");
+                let (origin, _) = records.first().expect("one record").clone();
+                // This is the staging shape: retention already removed the
+                // golden's record, so nothing in the catalog cites the layer —
+                // yet a sandbox paused on another node still resumes from it.
+                repository
+                    .delete_document(DocumentKey::SnapshotRecord(
+                        $crate::types::SnapshotId::parse(&origin).expect("snapshot id"),
+                    ))
+                    .await
+                    .expect("drop the record");
+
+                // This node holds nothing: the sandbox is paused elsewhere, so
+                // only the gateway's aggregated list names it.
+                let live = cluster_live(Some(Ok(vec![origin])), Vec::new());
+                let report = collect_managed_layers(repository.as_ref(), &live, &pass)
+                    .await
+                    .expect("collect");
+
+                assert!(
+                    report.downgraded_reason.is_some(),
+                    "a live sandbox whose source is gone must downgrade the pass, \
+                     whichever node holds it: {:?}",
+                    report.downgraded_reason
+                );
+                assert_eq!(report.deleted_layers, 0);
+                assert!(
+                    stored_layer_keys(repository.as_ref())
+                        .await
+                        .contains(&live_layer),
+                    "the layer a paused sandbox on another node reads must stay"
+                );
+            }
+
+            #[tokio::test]
+            async fn a_fan_out_with_one_node_erroring_downgrades_to_a_report() {
+                let (repository, temp) = repository().await;
+                let orphan = digest("partial-fan-out-orphan");
+                store_layer(repository.as_ref(), &orphan, 4096)
+                    .await
+                    .expect("store orphan");
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+                // One node of the fan-out failed: the merged list is complete
+                // for every other node and silently missing this one, so it
+                // cannot be treated as the cluster.
+                let live = cluster_live(
+                    Some(Err(
+                        "node agentenv-node-local-ssd-xb9bd list failed".to_owned()
+                    )),
+                    Vec::new(),
+                );
+
+                let report = collect_managed_layers(repository.as_ref(), &live, &pass)
+                    .await
+                    .expect("collect");
+
+                assert!(
+                    report.downgraded_reason.is_some(),
+                    "a partial fan-out must downgrade the pass to a report"
+                );
+                assert_eq!(report.deleted_layers, 0);
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&orphan));
+            }
+
+            #[tokio::test]
+            async fn an_unconfigured_gateway_downgrades_to_a_report() {
+                let (repository, temp) = repository().await;
+                let orphan = digest("no-gateway-orphan");
+                store_layer(repository.as_ref(), &orphan, 2048)
+                    .await
+                    .expect("store orphan");
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+                // Without a gateway this node cannot see the sandboxes other
+                // nodes hold, so it cannot prove any layer uncited.
+                let live = cluster_live(None, Vec::new());
+
+                let report = collect_managed_layers(repository.as_ref(), &live, &pass)
+                    .await
+                    .expect("collect");
+
+                assert!(
+                    report.downgraded_reason.is_some(),
+                    "an unconfigured gateway must downgrade the pass to a report"
                 );
                 assert_eq!(report.deleted_layers, 0);
                 assert!(stored_layer_keys(repository.as_ref())
