@@ -60,6 +60,38 @@ impl LiveSandboxes for LiveSandboxesUnderTest {
     }
 }
 
+/// The gateway's aggregated list, as the cluster reader consumes it.
+///
+/// `Ok` is a complete fan-out over every node; `Err` stands for any node that
+/// failed, could not be reached, or a page that did not arrive.
+pub struct GatewaySandboxListUnderTest(pub Result<Vec<String>, String>);
+
+#[async_trait]
+impl super::ClusterSandboxList for GatewaySandboxListUnderTest {
+    async fn list_snapshot_origins(&self) -> anyhow::Result<Vec<String>> {
+        match &self.0 {
+            Ok(origins) => Ok(origins.clone()),
+            Err(message) => Err(anyhow::anyhow!("{message}")),
+        }
+    }
+}
+
+/// The cluster reader the node runs: `gateway: None` is the unconfigured
+/// deployment, where only the local list exists.
+pub fn cluster_live(
+    gateway: Option<Result<Vec<String>, String>>,
+    local: Vec<String>,
+) -> super::ClusterLiveSandboxes {
+    super::ClusterLiveSandboxes::new(
+        gateway.map(|gateway| {
+            std::sync::Arc::new(GatewaySandboxListUnderTest(gateway))
+                as std::sync::Arc<dyn super::ClusterSandboxList>
+        }),
+        std::sync::Arc::new(LiveSandboxesUnderTest(local))
+            as std::sync::Arc<dyn LiveSandboxes>,
+    )
+}
+
 /// Stores one managed layer of `bytes` bytes straight through the blob
 /// primitives, which is exactly what a publication does before it writes its
 /// record.
@@ -547,6 +579,103 @@ macro_rules! behavior_table {
                 assert!(stored_layer_keys(repository.as_ref())
                     .await
                     .contains(&orphan));
+            }
+
+            #[tokio::test]
+            async fn a_layer_cited_only_by_a_paused_sandbox_on_another_node_never_leaves() {
+                let (repository, temp) = repository().await;
+                let live_layer = digest("cross-node-layer");
+                store_layer(repository.as_ref(), &live_layer, 32768)
+                    .await
+                    .expect("store live layer");
+                store_snapshot_record(repository.as_ref(), &[&live_layer]).await;
+                let pass =
+                    age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce);
+                let records = repository
+                    .read_documents(DocumentCollection::SnapshotRecords)
+                    .await
+                    .expect("read records");
+                let origin = records.first().expect("one record").0.clone();
+
+                // The sandbox is paused on another node, so this node's list is
+                // empty; only the gateway's aggregated list names it.
+                let live = cluster_live(Ok(vec![origin]), Vec::new());
+                let report = collect_managed_layers(repository.as_ref(), &live, &pass)
+                    .await
+                    .expect("collect");
+
+                assert!(
+                    report.downgraded_reason.is_none(),
+                    "a complete fan-out must not downgrade the pass: {:?}",
+                    report.downgraded_reason
+                );
+                assert_eq!(report.cited_layers, 1);
+                assert_eq!(report.cited_bytes, 32768);
+                assert_eq!(report.orphan_layers, 0);
+                assert_eq!(report.deleted_layers, 0);
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&live_layer));
+            }
+
+            #[tokio::test]
+            async fn a_fan_out_with_one_node_erroring_downgrades_to_a_report() {
+                let (repository, temp) = repository().await;
+                let orphan = digest("partial-fan-out-orphan");
+                store_layer(repository.as_ref(), &orphan, 4096)
+                    .await
+                    .expect("store orphan");
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+                // One node of the fan-out failed: the merged list is complete
+                // for every other node and silently missing this one, so it
+                // cannot be treated as the cluster.
+                let live = cluster_live(
+                    Err("node agentenv-node-local-ssd-xb9bd list failed".to_owned()),
+                    Vec::new(),
+                );
+
+                let report =
+                    collect_managed_layers(repository.as_ref(), &live, &pass).await.expect("collect");
+
+                assert!(
+                    report.downgraded_reason.is_some(),
+                    "a partial fan-out must downgrade the pass to a report"
+                );
+                assert_eq!(report.deleted_layers, 0);
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&orphan));
+            }
+
+            #[tokio::test]
+            async fn an_unconfigured_gateway_keeps_the_local_list_cited() {
+                let (repository, temp) = repository().await;
+                let local_layer = digest("local-only-layer");
+                store_layer(repository.as_ref(), &local_layer, 2048)
+                    .await
+                    .expect("store live layer");
+                store_snapshot_record(repository.as_ref(), &[&local_layer]).await;
+                let pass =
+                    age_or_shrink_grace(&temp, &local_layer, ManagedLayerCollectMode::Enforce);
+                let records = repository
+                    .read_documents(DocumentCollection::SnapshotRecords)
+                    .await
+                    .expect("read records");
+                let origin = records.first().expect("one record").0.clone();
+                let live = cluster_live(None, vec![origin]);
+
+                let report =
+                    collect_managed_layers(repository.as_ref(), &live, &pass).await.expect("collect");
+
+                assert!(
+                    report.downgraded_reason.is_none(),
+                    "without a gateway the local list is still a complete answer: {:?}",
+                    report.downgraded_reason
+                );
+                assert_eq!(report.deleted_layers, 0);
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&local_layer));
             }
 
             #[tokio::test]
