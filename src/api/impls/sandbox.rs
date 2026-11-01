@@ -1309,6 +1309,7 @@ impl Sandboxes<()> for ApiImpl {
             volume_mounts: body.volume_mounts.clone(),
             cpu_count: body.cpu_count,
             memory_mb: body.memory_mb,
+            memory_request_mb: None,
         };
         Ok(
             match self
