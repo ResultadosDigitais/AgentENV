@@ -283,7 +283,7 @@ macro_rules! behavior_table {
             // invocation, one level up.
             use super::*;
             use $crate::maintenance::behavior_table::{
-                age_layer, digest, filetime_set, request, store_image, store_layer,
+                age_layer, cluster_live, digest, filetime_set, request, store_image, store_layer,
                 store_snapshot_record, store_volume_record, stored_layer_keys,
                 write_unreadable_layer, LiveSandboxesUnderTest, NoLiveSandboxesUnderTest,
             };
