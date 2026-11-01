@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -7,8 +8,9 @@ use headers::Host;
 use http::Method;
 
 use crate::maintenance::{
-    collect_managed_layers, ManagedLayerCollectMode, ManagedLayerCollectReport,
-    ManagedLayerCollectRequest, ManagedLayerCollectorError, OrchestratorLiveSandboxes,
+    collect_managed_layers, ClusterLiveSandboxes, GatewaySandboxList, LiveSandboxes,
+    ManagedLayerCollectMode, ManagedLayerCollectReport, ManagedLayerCollectRequest,
+    ManagedLayerCollectorError, OrchestratorLiveSandboxes,
 };
 use crate::observability::{DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
 use agentenv_http_server::{apis::admin::*, models};
@@ -244,7 +246,18 @@ impl ApiImpl {
             || Duration::from_secs(collect.grace_secs),
             Duration::from_secs,
         );
-        let live = OrchestratorLiveSandboxes::new(self.orchestrator());
+        // Without the gateway this node sees only its own sandboxes, so a
+        // sandbox paused on another node reads layers the pass would call
+        // uncited. Report still runs, and says so; enforce is refused outright.
+        if mode == ManagedLayerCollectMode::Enforce && collect.gateway_url.is_none() {
+            return Err(Self::error(
+                409,
+                "enforce requires the cluster gateway URL, so that sandboxes on other nodes \
+                 keep their layers cited; set \
+                 AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL and restart",
+            ));
+        }
+        let live = self.live_sandboxes(collect.gateway_url.as_deref())?;
         let repository = self.repository();
         let report = collect_managed_layers(
             repository.as_ref(),
@@ -265,6 +278,22 @@ impl ApiImpl {
             REPORT_RAN.store(true, Ordering::SeqCst);
         }
         Ok(report)
+    }
+
+    /// The collector's live-sandbox reader: this node plus, when configured, the
+    /// gateway's list of every node.
+    ///
+    /// A pass that cannot see the sandboxes of other nodes cannot prove any
+    /// layer uncited — a sandbox paused elsewhere reads its source snapshot's
+    /// layers on resume — so without a gateway the pass may only report.
+    fn live_sandboxes(&self, gateway_url: Option<&str>) -> Result<ClusterLiveSandboxes, models::Error> {
+        let local: Arc<dyn LiveSandboxes> = Arc::new(OrchestratorLiveSandboxes::new(self.orchestrator()));
+        let Some(gateway_url) = gateway_url else {
+            return Ok(ClusterLiveSandboxes::new(local, None));
+        };
+        let gateway = GatewaySandboxList::new(gateway_url, self.api_key().clone())
+            .map_err(|error| Self::error(500, format!("invalid cluster gateway URL: {error:#}")))?;
+        Ok(ClusterLiveSandboxes::new(local, Some(Arc::new(gateway))))
     }
 }
 

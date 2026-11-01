@@ -83,12 +83,12 @@ pub fn cluster_live(
     local: Vec<String>,
 ) -> super::ClusterLiveSandboxes {
     super::ClusterLiveSandboxes::new(
+        std::sync::Arc::new(LiveSandboxesUnderTest(local))
+            as std::sync::Arc<dyn LiveSandboxes>,
         gateway.map(|gateway| {
             std::sync::Arc::new(GatewaySandboxListUnderTest(gateway))
                 as std::sync::Arc<dyn super::ClusterSandboxList>
         }),
-        std::sync::Arc::new(LiveSandboxesUnderTest(local))
-            as std::sync::Arc<dyn LiveSandboxes>,
     )
 }
 
@@ -648,34 +648,29 @@ macro_rules! behavior_table {
             }
 
             #[tokio::test]
-            async fn an_unconfigured_gateway_keeps_the_local_list_cited() {
+            async fn an_unconfigured_gateway_downgrades_to_a_report() {
                 let (repository, temp) = repository().await;
-                let local_layer = digest("local-only-layer");
-                store_layer(repository.as_ref(), &local_layer, 2048)
+                let orphan = digest("no-gateway-orphan");
+                store_layer(repository.as_ref(), &orphan, 2048)
                     .await
-                    .expect("store live layer");
-                store_snapshot_record(repository.as_ref(), &[&local_layer]).await;
-                let pass =
-                    age_or_shrink_grace(&temp, &local_layer, ManagedLayerCollectMode::Enforce);
-                let records = repository
-                    .read_documents(DocumentCollection::SnapshotRecords)
-                    .await
-                    .expect("read records");
-                let origin = records.first().expect("one record").0.clone();
-                let live = cluster_live(None, vec![origin]);
+                    .expect("store orphan");
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+                // Without a gateway this node cannot see the sandboxes other
+                // nodes hold, so it cannot prove any layer uncited.
+                let live = cluster_live(None, Vec::new());
 
-                let report =
-                    collect_managed_layers(repository.as_ref(), &live, &pass).await.expect("collect");
+                let report = collect_managed_layers(repository.as_ref(), &live, &pass)
+                    .await
+                    .expect("collect");
 
                 assert!(
-                    report.downgraded_reason.is_none(),
-                    "without a gateway the local list is still a complete answer: {:?}",
-                    report.downgraded_reason
+                    report.downgraded_reason.is_some(),
+                    "an unconfigured gateway must downgrade the pass to a report"
                 );
                 assert_eq!(report.deleted_layers, 0);
                 assert!(stored_layer_keys(repository.as_ref())
                     .await
-                    .contains(&local_layer));
+                    .contains(&orphan));
             }
 
             #[tokio::test]
