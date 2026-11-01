@@ -10,7 +10,7 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Gateway resolves `GET /nodes/{id}` via scheduler and proxies to the target node.
 - Gateway routes sandbox requests by existing sandbox-to-node binding.
 - Scheduler exposes gRPC API and supports pluggable strategy providers.
-- Built-in strategies in v1: round_robin and random.
+- Built-in strategies: round_robin, random and least_loaded.
 - Scheduler supports both static node configuration and Kubernetes EndpointSlice discovery.
 - Scheduler sandbox binding store can be in-memory or Redis-backed.
 - Scheduler can run as a primary read/write service or as query-only replicas that serve only `LookupNode` from Redis.
@@ -116,8 +116,9 @@ General config notes:
 |---|---|
 | `round_robin` (default) | Cycles through eligible nodes in stable order |
 | `random` | Picks a uniformly random eligible node |
+| `least_loaded` | Samples two distinct eligible nodes and keeps the one with the lower heartbeat load: the higher of CPU and memory pressure, plus 15 points per sandbox still starting; a node without a heartbeat loses to one with it |
 
-The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
+The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). `round_robin` and `random` ignore the snapshot; `least_loaded` reads it.
 
 ### Node resource limit
 
