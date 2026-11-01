@@ -19,6 +19,9 @@ use crate::types::{ResourceLimits, SandboxResources};
 pub struct ResourceRequest {
     pub cpu_count: Option<u32>,
     pub memory_mib: Option<u32>,
+    /// Scheduler admission request (admission_mode=request) for a sandbox
+    /// created from a template; never changes the VM size.
+    pub memory_request_mib: Option<u32>,
 }
 
 impl ResourceRequest {
@@ -221,6 +224,28 @@ impl ResizePolicy {
     }
 }
 
+/// Applies the scheduler admission request of a create from a template to the
+/// new sandbox's resources. The request must be positive and fit the sandbox's
+/// effective guest memory; without one the resources keep the template's value,
+/// which `effective_memory_request_mib` reads as the nominal memory.
+pub fn with_memory_request(
+    mut resources: SandboxResources,
+    effective_memory_mib: u32,
+    memory_request_mib: Option<u32>,
+) -> Result<SandboxResources, String> {
+    let Some(request) = memory_request_mib else {
+        return Ok(resources);
+    };
+    if request == 0 {
+        return Err("memoryRequestMB must be greater than 0".to_string());
+    }
+    if request > effective_memory_mib {
+        return Err("memoryRequestMB must not exceed memoryMB".to_string());
+    }
+    resources.memory_request_mib = Some(request);
+    Ok(resources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +270,7 @@ mod tests {
         ResourceRequest {
             cpu_count,
             memory_mib,
+            memory_request_mib: None,
         }
     }
 
@@ -406,5 +432,47 @@ mod tests {
             policy.admit_growth(limits(1, 512), limits(8, 512), 100, 0),
             Ok(())
         );
+    }
+
+    #[test]
+    fn with_memory_request_records_a_valid_request() {
+        let base = SandboxResources {
+            cpu_count: 2,
+            memory_mib: 4096,
+            disk_size_mib: 0,
+            memory_request_mib: None,
+        };
+        let out = with_memory_request(base, 2048, Some(1024)).unwrap();
+        assert_eq!(out.memory_request_mib, Some(1024));
+        assert_eq!(out.memory_mib, 4096, "the VM size never changes");
+        assert_eq!(
+            with_memory_request(base, 2048, Some(2048))
+                .unwrap()
+                .memory_request_mib,
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn with_memory_request_keeps_the_template_value_without_a_request() {
+        let base = SandboxResources {
+            cpu_count: 2,
+            memory_mib: 4096,
+            disk_size_mib: 0,
+            memory_request_mib: Some(512),
+        };
+        assert_eq!(with_memory_request(base, 4096, None).unwrap(), base);
+    }
+
+    #[test]
+    fn with_memory_request_rejects_zero_and_above_effective_memory() {
+        let base = SandboxResources {
+            cpu_count: 2,
+            memory_mib: 4096,
+            disk_size_mib: 0,
+            memory_request_mib: None,
+        };
+        assert!(with_memory_request(base, 2048, Some(0)).is_err());
+        assert!(with_memory_request(base, 2048, Some(2049)).is_err());
     }
 }

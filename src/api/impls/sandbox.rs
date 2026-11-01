@@ -1222,6 +1222,7 @@ impl Sandboxes<()> for ApiImpl {
             resources: ResourceRequest {
                 cpu_count: body.cpu_count,
                 memory_mib: body.memory_mb,
+                memory_request_mib: body.memory_request_mb,
             },
         };
 
@@ -1308,6 +1309,7 @@ impl Sandboxes<()> for ApiImpl {
             volume_mounts: body.volume_mounts.clone(),
             cpu_count: body.cpu_count,
             memory_mb: body.memory_mb,
+            memory_request_mb: None,
         };
         Ok(
             match self
@@ -1812,6 +1814,7 @@ impl Sandboxes<()> for ApiImpl {
         let request = ResourceRequest {
             cpu_count: body.cpu_count,
             memory_mib: body.memory_mb,
+            memory_request_mib: None,
         };
         match self.orchestrator.resize_sandbox(sandbox_id, request).await {
             Ok(status) => Ok(Status200_TheNewLimitsAreEnforcedByTheVMM(status.into())),

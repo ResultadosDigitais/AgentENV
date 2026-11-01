@@ -6122,6 +6122,7 @@ fn resources(cpu_count: Option<u32>, memory_mib: Option<u32>) -> ResourceRequest
     ResourceRequest {
         cpu_count,
         memory_mib,
+        memory_request_mib: None,
     }
 }
 

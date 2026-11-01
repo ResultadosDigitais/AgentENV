@@ -551,6 +551,20 @@ where
                         return Err(OrchestratorError::UnsupportedResources(message));
                     }
                 };
+                let effective_memory_mib = resource_request
+                    .memory_mib
+                    .unwrap_or(snapshot.resources().memory_mib);
+                let sandbox_resources = match super::resize::with_memory_request(
+                    *snapshot.resources(),
+                    effective_memory_mib,
+                    resource_request.memory_request_mib,
+                ) {
+                    Ok(resources) => resources,
+                    Err(message) => {
+                        self.counters.record_create_fail(1);
+                        return Err(OrchestratorError::UnsupportedResources(message));
+                    }
+                };
                 let launch_image_configs = committed.image_configs.clone();
                 let mut extra_mmds = serde_json::Map::new();
                 if !launch_image_configs.is_empty() {
@@ -582,7 +596,7 @@ where
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
                     virtualization_mode: committed.virtualization_mode,
                     runtime_versions: committed.runtime_versions.clone(),
-                    resources: *snapshot.resources(),
+                    resources: sandbox_resources,
                     resource_limits,
                     context: committed.context.clone(),
                     startup: committed.startup.clone(),
