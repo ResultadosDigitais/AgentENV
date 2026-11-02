@@ -104,7 +104,8 @@ uvm-ublk-daemon = { path = "storage/ublk-daemon" }
 shell-util = { path = "crates/shell-util" }
 linux-cap = { path = "crates/linux-cap" }
 warm-pool = { path = "crates/warm-pool" }
-ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
+# Registry, not the git rev: the sandbox git proxy reaches only the card's repo; 0.1.0 == rev c6a3e06.
+ublk-sys = { package = "libublk-rs-sys", version = "=0.1.0" }
 overlaybd = { path = "storage/overlaybd" }
 storage-util = { path = "storage/util" }
 dashmap = "6.1.0"
