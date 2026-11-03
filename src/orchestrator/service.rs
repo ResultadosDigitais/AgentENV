@@ -118,7 +118,7 @@ pub struct Orchestrator<
 > {
     store: S,
     factory: F,
-    persister: P,
+    pub(crate) persister: P,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
     template_build_ids: RwLock<HashSet<SandboxId>>,
     deletions: Mutex<HashMap<SandboxId, Arc<Mutex<DeleteProgress>>>>,

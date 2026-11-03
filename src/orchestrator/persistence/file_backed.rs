@@ -353,12 +353,8 @@ impl FileBackedSandboxPersister {
         self.root.join(RECORD_DB_DIR)
     }
 
-    fn artifacts_root(&self) -> PathBuf {
-        self.root.join("artifacts")
-    }
-
     fn sandbox_artifact_root(&self, sandbox_id: &SandboxId) -> PathBuf {
-        self.artifacts_root().join(sandbox_id.to_string())
+        self.root.join("artifacts").join(sandbox_id.to_string())
     }
 
     async fn db(&self) -> PersistenceResult<LocalKvStore> {
@@ -436,7 +432,7 @@ impl FileBackedSandboxPersister {
         &self,
         retained_sandbox_ids: &HashSet<SandboxId>,
     ) -> PersistenceResult<()> {
-        let artifacts_root = self.artifacts_root();
+        let artifacts_root = self.root.join("artifacts");
         let mut entries = match fs::read_dir(&artifacts_root).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -650,6 +646,10 @@ impl SandboxPersister for FileBackedSandboxPersister {
         self.remove_record(sandbox_id).await?;
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
         Ok(())
+    }
+
+    fn artifacts_root(&self) -> Option<PathBuf> {
+        Some(self.root.join("artifacts"))
     }
 }
 

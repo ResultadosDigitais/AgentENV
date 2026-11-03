@@ -4,6 +4,7 @@ use std::time::Duration;
 
 pub(crate) mod image;
 pub(crate) mod network;
+mod paused_artifact_reap;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::Config;
 pub use image::{
@@ -12,6 +13,7 @@ pub use image::{
 };
 pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
+pub use paused_artifact_reap::PausedArtifactReapMode;
 use serde::Deserialize;
 
 use crate::virtualization::VirtualizationMode;
@@ -780,23 +782,20 @@ pub struct OrchestratorConfig {
 
     /// Ceiling, in bytes, for the reclaimable part of the paused artifact chain
     /// of a single sandbox: its runtime-owned overlaybd generations plus the
-    /// layer each pause appends.
-    ///
-    /// The image-derived stable prefix is reported by the rejection but never
-    /// charged, because every sandbox of an image points at the same node-local
-    /// files; charging it would count one node's bytes once per sandbox. A pause
-    /// whose reclaimable part would push past this value compacts the
-    /// runtime-owned suffix into one complete generation (and reclaims
-    /// unreferenced files from stale generations). `0` disables both the ceiling
-    /// and the reclaim sweep, restoring the unbounded behavior.
-    ///
-    /// PROVISIONAL default: 48 GiB comes from the OPSAI-5494 staging
-    /// measurement of 29/10/2026 (each pause of a used productfactory-32g adds
-    /// 20-27 GB; chains ran 50-107 GB over 1-5 generations; a 40-50 GB ceiling
-    /// keeps a 488 GiB node under 85 percent). The node-by-node rollout
-    /// re-measures compaction wall clock and may adjust it.
+    /// layer each pause appends. The image-derived stable prefix is reported by
+    /// the rejection but never charged, because every sandbox of an image points
+    /// at the same node-local files. A pause whose reclaimable part would push
+    /// past this value compacts the runtime-owned suffix into one complete
+    /// generation (and reclaims unreferenced files from stale generations). `0`
+    /// disables both the ceiling and the reclaim sweep. PROVISIONAL default:
+    /// 48 GiB comes from the OPSAI-5494 staging measurement of 29/10/2026; the
+    /// node-by-node rollout re-measures compaction wall clock and may adjust it.
     #[config(default = 51539607552u64, env = "AENV_CHAIN_BYTES_CEILING")]
     pub chain_bytes_ceiling: u64,
+
+    /// Paused-artifact sweep kill switch; see [`PausedArtifactReapMode`].
+    #[config(default = "off", env = "AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP")]
+    pub paused_artifact_reap: PausedArtifactReapMode,
 }
 
 /// Custom extension service integration.

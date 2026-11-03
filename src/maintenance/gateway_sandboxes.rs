@@ -15,14 +15,16 @@
 //! page token into an error. The collector then downgrades the whole pass to a
 //! report, which deletes nothing.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use super::live_sandboxes::ClusterSandboxList;
+use super::live_sandboxes::{ClusterSandboxIds, ClusterSandboxList};
 use crate::api_key::{ApiKey, API_KEY_HEADER};
+use crate::types::SandboxId;
 
 /// Where the aggregated list lives. The path is the gateway's paginated
 /// endpoint, which fans out to every node.
@@ -40,13 +42,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One sandbox as the aggregated list reports it.
 ///
-/// Only the source snapshot is read. `templateID` carries the node's
-/// `metadata.snapshot_id` for a sandbox launched from a snapshot, which is the
-/// same field the node's own list reports; the rest of the object is ignored.
+/// Only the identity and the source snapshot are read. `templateID` carries the
+/// node's `metadata.snapshot_id` for a sandbox launched from a snapshot, which
+/// is the same field the node's own list reports; `sandboxID` is the sandbox's
+/// own id, which the paused-artifact sweep matches against its directories. The
+/// rest of the object is ignored.
 #[derive(Deserialize)]
 struct ListedSandbox {
     #[serde(rename = "templateID")]
     template_id: String,
+    #[serde(rename = "sandboxID")]
+    sandbox_id: Option<String>,
 }
 
 /// Reads every sandbox in the cluster through the gateway.
@@ -123,17 +129,56 @@ impl GatewaySandboxList {
 #[async_trait]
 impl ClusterSandboxList for GatewaySandboxList {
     async fn list_snapshot_origins(&self) -> anyhow::Result<Vec<String>> {
-        let mut origins = Vec::new();
+        Ok(self
+            .every_page()
+            .await?
+            .into_iter()
+            .map(|sandbox| sandbox.template_id)
+            .collect())
+    }
+}
+
+#[async_trait]
+impl ClusterSandboxIds for GatewaySandboxList {
+    async fn list_sandbox_ids(&self) -> anyhow::Result<BTreeSet<SandboxId>> {
+        // The request sends no state filter on purpose: the gateway's default
+        // list includes a paused sandbox, and a paused sandbox is exactly the
+        // case the sweep must keep.
+        let mut ids = BTreeSet::new();
+        for sandbox in self.every_page().await? {
+            let Some(sandbox_id) = sandbox.sandbox_id else {
+                // A page entry without an id cannot be matched against an
+                // artifact directory, so the list would silently omit a
+                // sandbox and the sweep would delete a live artifact. Fail
+                // closed instead of reading the page as short.
+                bail!("the aggregated sandbox list has an entry without a sandboxID");
+            };
+            let sandbox_id = SandboxId::parse_str(&sandbox_id).with_context(|| {
+                format!("the aggregated sandbox list has an invalid sandboxID {sandbox_id:?}")
+            })?;
+            ids.insert(sandbox_id);
+        }
+        Ok(ids)
+    }
+}
+
+impl GatewaySandboxList {
+    /// Every page of the aggregated list, following the cursor.
+    ///
+    /// Both readers share this walk, so a repeated token, a failed page and a
+    /// runaway cursor fail the same way for each of them.
+    async fn every_page(&self) -> anyhow::Result<Vec<ListedSandbox>> {
+        let mut listed = Vec::new();
         let mut token: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let (page, next) = self.page(token.as_deref()).await?;
-            origins.extend(page.into_iter().map(|sandbox| sandbox.template_id));
+            listed.extend(page);
             match next {
                 Some(next) if token.as_deref() == Some(next.as_str()) => {
                     bail!("the cluster gateway repeated the page token '{next}'")
                 }
                 Some(next) => token = Some(next),
-                None => return Ok(origins),
+                None => return Ok(listed),
             }
         }
         bail!("the cluster gateway list did not end after {MAX_PAGES} pages")
@@ -292,5 +337,112 @@ mod tests {
             error.to_string().contains("repeated the page token"),
             "{error}"
         );
+    }
+
+    // The paused-artifact sweep reads identities, not snapshot origins, so it
+    // has its own additions to the same parsed page. Every scenario below has a
+    // counterpart for the collector above; the two share `every_page`, so a
+    // pagination or fail-closed regression in one is a regression in both.
+
+    #[tokio::test]
+    async fn the_sandbox_id_reader_follows_every_page() {
+        let gateway = FakeGateway::start(vec![
+            page(
+                r#"[{"sandboxID":"01a19a17-0000-7000-8000-000000000001","templateID":"snap-a"}]"#,
+                Some("t1"),
+            ),
+            page(
+                r#"[{"sandboxID":"01a19a17-0000-7000-8000-000000000002","templateID":"snap-b"}]"#,
+                None,
+            ),
+        ])
+        .await;
+
+        let ids = reader(&gateway.endpoint)
+            .list_sandbox_ids()
+            .await
+            .expect("list");
+
+        assert_eq!(
+            ids.into_iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            vec![
+                "01a19a17-0000-7000-8000-000000000001",
+                "01a19a17-0000-7000-8000-000000000002"
+            ]
+        );
+        let requests = gateway.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("nextToken=t1"));
+    }
+
+    #[tokio::test]
+    async fn a_paused_sandbox_returned_by_the_gateway_is_in_the_id_set() {
+        // The gateway's default list includes paused sandboxes; the reader sends
+        // no state filter, so it must not drop one.
+        let paused = "01a19a17-0000-7000-8000-00000000000f";
+        let gateway = FakeGateway::start(vec![page(
+            &format!(r#"[{{"sandboxID":"{paused}","templateID":"snap-a","state":"paused"}}]"#),
+            None,
+        )])
+        .await;
+
+        let ids = reader(&gateway.endpoint)
+            .list_sandbox_ids()
+            .await
+            .expect("list");
+
+        assert!(ids.contains(&SandboxId::parse_str(paused).expect("id")));
+        let requests = gateway.requests.lock().expect("requests").clone();
+        assert!(
+            !requests[0].contains("state="),
+            "a state filter could paginate a paused sandbox out: {}",
+            requests[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_id_reader_over_a_failed_node_is_an_error() {
+        let gateway = FakeGateway::start(vec![Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from("cluster list unavailable"))
+            .expect("page")])
+        .await;
+
+        let error = reader(&gateway.endpoint)
+            .list_sandbox_ids()
+            .await
+            .expect_err("a partial fan-out must never read as a complete id set");
+
+        assert!(error.to_string().contains("502"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_page_entry_without_a_sandbox_id_is_an_error() {
+        // Dropping the entry would omit a sandbox the sweep must keep, and the
+        // remaining page would read as a short list.
+        let gateway = FakeGateway::start(vec![page(
+            r#"[{"sandboxID":"01a19a17-0000-7000-8000-000000000001","templateID":"snap-a"},
+                {"templateID":"snap-b"}]"#,
+            None,
+        )])
+        .await;
+
+        let error = reader(&gateway.endpoint)
+            .list_sandbox_ids()
+            .await
+            .expect_err("a page entry without an id must fail the whole pass closed");
+
+        assert!(error.to_string().contains("sandboxID"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_page_entry_with_an_unparsable_sandbox_id_is_an_error() {
+        let gateway = FakeGateway::start(vec![page(
+            r#"[{"sandboxID":"not-a-uuid","templateID":"snap-a"}]"#,
+            None,
+        )])
+        .await;
+
+        assert!(reader(&gateway.endpoint).list_sandbox_ids().await.is_err());
     }
 }
