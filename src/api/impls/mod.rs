@@ -3,6 +3,7 @@ mod attached_drives;
 pub(crate) mod auth;
 pub(crate) mod image_build;
 mod pagination;
+mod paused_artifacts;
 mod sandbox;
 mod snapshots;
 mod template;

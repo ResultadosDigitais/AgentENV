@@ -10,10 +10,18 @@ pub mod behavior_table;
 mod gateway_sandboxes;
 mod live_sandboxes;
 mod managed_layers;
+mod paused_artifacts;
 
 pub use gateway_sandboxes::GatewaySandboxList;
-pub use live_sandboxes::{ClusterLiveSandboxes, ClusterSandboxList, OrchestratorLiveSandboxes};
+pub use live_sandboxes::{
+    ClusterLiveSandboxes, ClusterSandboxIds, ClusterSandboxList, OrchestratorLiveSandboxes,
+};
 pub use managed_layers::{
     collect_managed_layers, LiveSandboxes, ManagedLayerCollectFailure, ManagedLayerCollectMode,
     ManagedLayerCollectReport, ManagedLayerCollectRequest, ManagedLayerCollectorError,
+};
+pub use paused_artifacts::{
+    sweep, ArtifactSweepFailure, ArtifactSweepReport, ArtifactVerdict, KeepReason, LocalSandbox,
+    PausedArtifactSubject, ReapMode, SkipReason, ARTIFACT_GRACE, SWEEP_INTERVAL, TRASH_DIR,
+    TRASH_GRACE,
 };

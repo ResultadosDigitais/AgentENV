@@ -21,6 +21,7 @@ use async_trait::async_trait;
 
 use super::LiveSandboxes;
 use crate::orchestrator::Orchestrator;
+use crate::types::SandboxId;
 
 /// Reads the source snapshot of every sandbox this node currently holds.
 ///
@@ -60,6 +61,24 @@ pub trait ClusterSandboxList: Send + Sync {
     /// The source snapshot ID of every sandbox in the cluster, running or
     /// paused, in no particular order.
     async fn list_snapshot_origins(&self) -> anyhow::Result<Vec<String>>;
+}
+
+/// The cluster's sandbox ids, as the gateway aggregates them.
+///
+/// The paused-artifact sweep needs identities, not snapshot origins: it must ask
+/// whether a *sandbox* still exists somewhere in the cluster, and a sandbox
+/// paused on another node answers that question while its source snapshot does
+/// not. It is a separate trait from [`ClusterSandboxList`] so the collector's
+/// behaviour stays byte-identical: adding a required field to its parsed page
+/// would change how an already deployed collector reads a malformed answer.
+///
+/// `Ok` means the list covers every node; `Err` means it does not, and the same
+/// fail-closed rule applies: a partial list is never read as a complete one.
+#[async_trait]
+pub trait ClusterSandboxIds: Send + Sync {
+    /// The id of every sandbox in the cluster, running or paused, in no
+    /// particular order.
+    async fn list_sandbox_ids(&self) -> anyhow::Result<BTreeSet<SandboxId>>;
 }
 
 /// The collector's live-sandbox reader: the whole cluster, or an error.

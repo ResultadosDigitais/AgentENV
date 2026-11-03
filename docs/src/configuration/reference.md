@@ -341,6 +341,7 @@ Sandbox lifecycle management.
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
 | `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |
 | `chain_bytes_ceiling` | integer (bytes) | `51539607552` (48 GiB) | Ceiling for the reclaimable part of one sandbox's paused artifact chain: its runtime-owned overlaybd generations plus the layer each pause appends. The image-derived stable prefix is reported but not charged, since every sandbox of an image shares those files. A pause that would exceed it compacts the runtime-owned generations into one and sweeps unreferenced files from stale generations; a reclaimable part that stays above it fails with `CHAIN_BYTES_CEILING_EXCEEDED` and the sandbox keeps running. `0` disables both the ceiling and the sweep. The default is provisional, derived from the OPSAI-5494 staging measurement. |
+| `paused_artifact_reap` | string | `"off"` | Periodic sweep of `persisted_sandboxes/artifacts/` reclaiming a sandbox directory no record and no cluster list names any more: `off`, `report` (list and count only) or `enforce` (move to `artifacts/.trash/{epoch}/`, then delete after a second grace). A failed or unconfigured cluster list degrades a pass to a report. See [Orchestrator Persistence](../internals/persistence-artifact-inventory.md#orchestrator-persistence). |
 
 ## `[pool]`
 
@@ -367,15 +368,11 @@ Component sections:
 | `[pool.firecracker]` | `fill_concurrency` | integer | `4` | Maximum number of warm Firecracker processes created concurrently by one maintenance refill batch |
 | `[pool.firecracker]` | `idle_ttl_secs` | integer | `600` | Seconds without warm-process acquisitions before the refill target decays back to the low watermark and excess warm processes are drained (`0` disables decay) |
 
-Validation rules:
-
-- `low_watermark <= high_watermark`
-- `[pool.firecracker].fill_concurrency > 0`
+Validation rules: `low_watermark <= high_watermark`, and `[pool.firecracker].fill_concurrency > 0`.
 
 ## `[node_identity]`
 
-Stable identity fields for this node. These values appear in node API responses
-and scheduler heartbeats.
+Stable identity fields for this node. These values appear in node API responses and scheduler heartbeats.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

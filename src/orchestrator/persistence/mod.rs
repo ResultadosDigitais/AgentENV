@@ -59,6 +59,22 @@ impl SandboxPersistenceError {
     }
 }
 
+impl<S, F, P> crate::orchestrator::Orchestrator<S, F, P>
+where
+    S: crate::orchestrator::MetadataStore,
+    F: SandboxBackendFactory,
+    P: SandboxPersister,
+{
+    /// The paused artifacts root this node's persister owns, when it owns one.
+    ///
+    /// The paused-artifact sweep runs over it; exposing it here keeps the
+    /// persister's layout out of every caller that only needs the directory,
+    /// and out of `service.rs`, which is already past the file-size ceiling.
+    pub fn artifacts_root(&self) -> Option<PathBuf> {
+        self.persister.artifacts_root()
+    }
+}
+
 #[async_trait]
 /// Persistence interface for sandbox records and artifacts.
 pub trait SandboxPersister: Send + Sync {
@@ -95,6 +111,16 @@ pub trait SandboxPersister: Send + Sync {
 
     /// Delete the persistence record and all associated artifacts.
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+
+    /// The directory holding one entry per sandbox id, or `None` when this
+    /// persister keeps no artifacts of its own.
+    ///
+    /// The paused-artifact sweep needs the root to reclaim a directory no
+    /// sandbox owns any more, and it must not learn the layout to get it: it
+    /// asks the persister, which is the only owner of the arrangement.
+    fn artifacts_root(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 #[derive(Default)]
