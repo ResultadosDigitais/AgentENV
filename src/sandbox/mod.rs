@@ -7,6 +7,7 @@ mod extra_drive;
 mod firecracker;
 mod guest_volumes;
 pub(crate) mod logs;
+mod memory_containment;
 mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
@@ -46,6 +47,7 @@ pub use firecracker::{
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
 pub use logs::SandboxLogEntry;
+pub use memory_containment::{MemoryContainment, SandboxMemoryCgroup};
 pub use metrics::SandboxMetric;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{

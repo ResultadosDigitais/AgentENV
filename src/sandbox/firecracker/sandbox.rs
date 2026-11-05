@@ -42,6 +42,7 @@ use crate::sandbox::cpu_quota::{CpuQuota, SandboxCpuCgroup};
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
 use crate::sandbox::guest_volumes;
+use crate::sandbox::memory_containment::{MemoryContainment, SandboxMemoryCgroup};
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
@@ -225,6 +226,12 @@ pub struct FirecrackerSandbox {
     /// Holds the VMM process once its CPU time is capped below the VM's vCPU
     /// count. Removed after the process exits.
     cpu_cgroup: Option<SandboxCpuCgroup>,
+    /// The VM's own cgroup domain with `memory.max` at the VM shape and
+    /// `memory.high` below it, when memory containment is enabled on the node.
+    ///
+    /// Declared after `cpu_cgroup` so the threaded CPU child is removed before
+    /// the domain that contains it.
+    memory_cgroup: Option<SandboxMemoryCgroup>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -1340,6 +1347,9 @@ impl FirecrackerSandbox {
             &dirty_ranges,
             &mem_overlaybd_dir,
             memory_output,
+            ConfigManager::global_config()
+                .memory_snapshot
+                .drop_page_cache_after_write,
         )
         .await
         .context("convert dirty memory ranges to overlaybd layer")
@@ -1385,8 +1395,11 @@ impl FirecrackerSandbox {
             envd.invalidate();
         }
         self.frozen_volume_mounts.clear();
-        // The VMM has exited, so its CPU cgroup is empty and can go.
+        // The VMM has exited, so its cgroups are empty and can go. The nested
+        // CPU cgroup goes first, because it must be empty before the per-VM
+        // memory domain that contains it can be removed.
         self.cpu_cgroup = None;
+        self.memory_cgroup = None;
 
         self.resources.release(timeout).await?;
 
@@ -1800,7 +1813,29 @@ impl FirecrackerSandbox {
                 .chain_bytes_ceiling,
             persisted_sandbox_store_root: super::overlaybd_snapshot::persisted_sandbox_store_root(),
             cpu_cgroup: None,
+            memory_cgroup: None,
         })
+    }
+
+    /// Move the VMM into its own cgroup v2 domain with `memory.max` equal to
+    /// the VM shape and `memory.high` below it, so node memory pressure
+    /// throttles or kills one VM instead of evicting the shared pod.
+    ///
+    /// Does nothing when containment is disabled, or when startup could not
+    /// prepare the subtree on this node.
+    fn apply_memory_containment(&mut self, memory_max_bytes: u64) -> Result<()> {
+        let Some(containment) = MemoryContainment::global() else {
+            return Ok(());
+        };
+        let ratio = ConfigManager::global_config()
+            .memory_containment
+            .memory_high_ratio
+            .context("memory_containment.enabled needs memory_containment.memory_high_ratio")?;
+        let pid = self.fc_instance.pid()?;
+        let cgroup = containment.create(self.id, memory_max_bytes, ratio)?;
+        cgroup.attach(pid.as_raw().unsigned_abs())?;
+        self.memory_cgroup = Some(cgroup);
+        Ok(())
     }
 
     /// Cap the VMM at `cpus` vCPUs of CPU time, or lift the cap. The VMM moves
@@ -1816,7 +1851,14 @@ impl FirecrackerSandbox {
             "CPU limits below the VM's vCPU count need the cgroup v2 CPU quota ([resize].cpu_quota), which is unavailable on this node",
         )?;
         let pid = self.fc_instance.pid()?;
-        let cgroup = quota.create(self.id)?;
+        // With memory containment the CPU cgroup nests inside the VM's memory
+        // domain, so both limits apply to the same VMM and nothing is left in
+        // a threaded root the container can no longer host.
+        let parent = self
+            .memory_cgroup
+            .as_ref()
+            .map(|cgroup| cgroup.path().to_path_buf());
+        let cgroup = quota.create(self.id, parent.as_deref())?;
         cgroup.attach(pid.as_raw().unsigned_abs())?;
         cgroup.set_cpu_limit(Some(cpus))?;
         self.cpu_cgroup = Some(cgroup);
@@ -1918,6 +1960,10 @@ impl FirecrackerSandbox {
             add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
 
         self.spawn_firecracker(&config.common, &netns).await?;
+        let memory_max_bytes = u64::from(config.mem_size_mib)
+            .checked_mul(MIB)
+            .context("VM memory shape overflows bytes")?;
+        self.apply_memory_containment(memory_max_bytes)?;
         self.init_envd_instance(interaction_ip, &config.common);
 
         // ── Configure microVM: tools drive as rootfs + user image + extras ──
@@ -1995,6 +2041,8 @@ impl FirecrackerSandbox {
             let netns = self.allocate_network_slot()?.namespace_path();
             self.spawn_firecracker(&config.common, &netns).await?;
         }
+        // A restored VM's shape is the memory image it loads.
+        self.apply_memory_containment(config.mem_virtual_size)?;
         let slot = self
             .resources
             .network_slot

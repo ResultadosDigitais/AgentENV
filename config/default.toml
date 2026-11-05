@@ -190,6 +190,17 @@ deflate_on_oom = true
 # GET /sandboxes/{sandboxID}/resources report the memory the balloon holds.
 stats_polling_interval_s = 0
 
+[memory_containment]
+# One cgroup v2 domain per microVM with memory.max equal to the VM shape and
+# memory.high below it, so memory pressure on the node throttles or kills a
+# single VM and never evicts the runtime pod that holds all of them.
+# Needs a delegated cgroup v2 hierarchy; when startup cannot prepare it the
+# reason is logged and the runtime keeps today's shared-pod behavior.
+enabled = false
+# memory.high as a fraction of memory.max, strictly between 0 and 1. Required
+# when enabled: the fraction is measured on the node, so it has no default.
+# memory_high_ratio = 0.9
+
 [resize]
 # Per-sandbox cpuCount/memoryMB below the VM shape on snapshot-based creates,
 # and live resize through PATCH /sandboxes/{sandboxID}/resources.
@@ -418,6 +429,12 @@ idle_ttl_secs = 600
 # It is automatically disabled for PVM. Memory snapshot packaging always uses the direct
 # OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 track_dirty_pages = true
+
+# Sync each sealed memory snapshot layer and drop its page cache
+# (posix_fadvise(DONTNEED)) so the snapshot write stops counting toward the
+# runtime pod's working set. Off keeps today's behavior and adds no fsync to the
+# pause path. See docs/src/internals/memory-containment.md.
+drop_page_cache_after_write = false
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd

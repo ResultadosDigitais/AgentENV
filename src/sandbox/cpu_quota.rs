@@ -29,15 +29,21 @@ use crate::types::SandboxId;
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 const SANDBOXES_DIR: &str = "agentenv-sandboxes";
+/// Threaded child of a per-VM memory cgroup that carries `cpu.max`.
+const CPU_DIR: &str = "cpu";
 /// CFS bandwidth period: one vCPU of quota is one full period.
 const CPU_PERIOD_US: u64 = 100_000;
 
 static GLOBAL: OnceLock<Option<CpuQuota>> = OnceLock::new();
 
 /// The cgroup that holds one cgroup per CPU-limited sandbox.
+///
+/// `root` is `None` when per-VM memory containment owns the container's
+/// children: a cgroup cannot have both domain and threaded children, so the
+/// threaded CPU cgroup nests under each VM's memory cgroup instead.
 #[derive(Debug)]
 pub struct CpuQuota {
-    root: PathBuf,
+    root: Option<PathBuf>,
 }
 
 impl CpuQuota {
@@ -58,7 +64,14 @@ impl CpuQuota {
             };
             match Self::setup(Path::new(CGROUP_MOUNT), &proc_self_cgroup) {
                 Ok(quota) => {
-                    info!(root = %quota.root.display(), "per-sandbox CPU quota enabled");
+                    match quota.root.as_deref() {
+                        Some(root) => {
+                            info!(root = %root.display(), "per-sandbox CPU quota enabled")
+                        }
+                        None => info!(
+                            "per-sandbox CPU quota enabled; sandboxes nest their CPU cgroup under the per-VM memory cgroup"
+                        ),
+                    }
                     Some(quota)
                 }
                 Err(error) => {
@@ -87,6 +100,13 @@ impl CpuQuota {
             );
         }
 
+        if super::memory_containment::MemoryContainment::global().is_some() {
+            // The memory containment subtree already enabled `cpu` for the
+            // container's children; the container cannot also hold a threaded
+            // root, so per-VM CPU cgroups nest under the memory cgroup.
+            return Ok(Self { root: None });
+        }
+
         let root = own.join(SANDBOXES_DIR);
         match fs::create_dir(&root) {
             Ok(()) => {}
@@ -99,14 +119,23 @@ impl CpuQuota {
         enable_cpu_controller(&own)?;
         enable_cpu_controller(&root)?;
 
-        let quota = Self { root };
+        let quota = Self { root: Some(root) };
         quota.remove_stale_cgroups();
         Ok(quota)
     }
 
     /// Create the cgroup a sandbox's VMM is moved into.
-    pub fn create(&self, sandbox_id: SandboxId) -> Result<SandboxCpuCgroup> {
-        let path = self.root.join(sandbox_id.to_string());
+    ///
+    /// `parent` is the sandbox's per-VM memory cgroup when memory containment
+    /// is active; the CPU cgroup then nests under it as a threaded child.
+    pub fn create(&self, sandbox_id: SandboxId, parent: Option<&Path>) -> Result<SandboxCpuCgroup> {
+        let path = match (parent, self.root.as_deref()) {
+            (Some(parent), _) => parent.join(CPU_DIR),
+            (None, Some(root)) => root.join(sandbox_id.to_string()),
+            (None, None) => bail!(
+                "per-sandbox CPU quota needs the sandbox's per-VM memory cgroup, but memory containment is not active on this node"
+            ),
+        };
         match fs::create_dir(&path) {
             Ok(()) => {}
             // Left over by a VMM of the same sandbox that is gone (resume
@@ -115,6 +144,9 @@ impl CpuQuota {
             Err(error) => {
                 return Err(error).with_context(|| format!("create {}", path.display()));
             }
+        }
+        if let Some(parent) = parent {
+            enable_cpu_controller(parent)?;
         }
         let cgroup = SandboxCpuCgroup { path: Some(path) };
         make_threaded(cgroup.path())?;
@@ -125,7 +157,10 @@ impl CpuQuota {
     /// VMMs were reaped at startup, so they are empty; one still in use
     /// fails `rmdir` and is kept.
     fn remove_stale_cgroups(&self) {
-        let Ok(entries) = fs::read_dir(&self.root) else {
+        let Some(root) = self.root.as_deref() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(root) else {
             return;
         };
         for entry in entries.flatten() {
@@ -192,7 +227,7 @@ impl Drop for SandboxCpuCgroup {
     }
 }
 
-fn own_cgroup_dir(cgroup_mount: &Path, proc_self_cgroup: &str) -> Result<PathBuf> {
+pub(super) fn own_cgroup_dir(cgroup_mount: &Path, proc_self_cgroup: &str) -> Result<PathBuf> {
     let relative = proc_self_cgroup
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
@@ -226,7 +261,7 @@ fn enable_cpu_controller(dir: &Path) -> Result<()> {
         .with_context(|| format!("enable the cpu controller in {}", subtree_control.display()))
 }
 
-fn read_trimmed(path: &Path) -> Result<String> {
+pub(super) fn read_trimmed(path: &Path) -> Result<String> {
     fs::read_to_string(path)
         .map(|content| content.trim().to_string())
         .with_context(|| format!("read {}", path.display()))
@@ -310,7 +345,7 @@ mod tests {
         let quota = CpuQuota::setup(mount.path(), "0::/agentenv\n")?;
 
         let root = own.join(SANDBOXES_DIR);
-        assert_eq!(quota.root, root);
+        assert_eq!(quota.root.as_deref(), Some(root.as_path()));
         assert_eq!(read_trimmed(&root.join("cgroup.type"))?, "threaded");
         assert_eq!(read_trimmed(&own.join("cgroup.subtree_control"))?, "+cpu");
         assert_eq!(read_trimmed(&root.join("cgroup.subtree_control"))?, "+cpu");
@@ -338,7 +373,7 @@ mod tests {
         fs::create_dir(&path)?;
         fs::write(path.join("cgroup.type"), "domain invalid\n")?;
 
-        let cgroup = quota.create(sandbox_id)?;
+        let cgroup = quota.create(sandbox_id, None)?;
         assert_eq!(read_trimmed(&path.join("cgroup.type"))?, "threaded");
 
         cgroup.attach(4242)?;
@@ -351,6 +386,29 @@ mod tests {
         cgroup.set_cpu_limit(None)?;
         assert_eq!(read_trimmed(&path.join("cpu.max"))?, "max 100000");
         assert_eq!(cgroup.cpu_limit()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_cgroup_nests_under_the_per_vm_memory_cgroup() -> Result<()> {
+        let (mount, own) = fake_cgroupfs("/agentenv", "cpu memory")?;
+        let quota = CpuQuota::setup(mount.path(), "0::/agentenv\n")?;
+        let sandbox_id = SandboxId::new();
+        let parent = own.join("agentenv-vms").join(sandbox_id.to_string());
+        fs::create_dir_all(&parent)?;
+        fs::write(parent.join("cgroup.type"), "domain\n")?;
+        fs::write(parent.join("cgroup.controllers"), "cpu memory\n")?;
+        fs::write(parent.join("cgroup.subtree_control"), "")?;
+
+        let cgroup = quota.create(sandbox_id, Some(&parent))?;
+
+        let cpu_path = parent.join(CPU_DIR);
+        assert_eq!(cgroup.path(), cpu_path.as_path());
+        assert_eq!(read_trimmed(&cpu_path.join("cgroup.type"))?, "threaded");
+        assert_eq!(
+            read_trimmed(&parent.join("cgroup.subtree_control"))?,
+            "+cpu"
+        );
         Ok(())
     }
 

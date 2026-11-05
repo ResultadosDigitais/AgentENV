@@ -109,6 +109,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub machine: MachineConfig,
     #[config(nested)]
+    pub memory_containment: MemoryContainmentConfig,
+    #[config(nested)]
     pub resize: ResizeConfig,
     #[config(nested)]
     pub backend: BackendConfig,
@@ -347,6 +349,23 @@ pub struct BalloonConfig {
     /// the balloon actually holds.
     #[config(default = 0u32)]
     pub stats_polling_interval_s: u32,
+}
+
+/// One cgroup v2 domain per microVM, so memory pressure on a node throttles or
+/// kills a single VM instead of evicting the runtime pod that holds all of
+/// them.
+#[derive(Debug, Config, Clone)]
+pub struct MemoryContainmentConfig {
+    /// Move every VMM into its own cgroup v2 domain with `memory.max` equal to
+    /// the VM shape and `memory.high` below it. Needs a delegated cgroup v2
+    /// hierarchy where the container may create domain sub-cgroups; startup
+    /// logs the reason and continues without containment when it is not.
+    #[config(default = false)]
+    pub enabled: bool,
+    /// `memory.high` as a fraction of `memory.max`, strictly between 0 and 1.
+    /// Required when `enabled` is true: the fraction has to be measured on the
+    /// node, so there is deliberately no default.
+    pub memory_high_ratio: Option<f64>,
 }
 
 /// Per-sandbox resources inside the VM shape: `cpuCount`/`memoryMB` on
@@ -658,6 +677,11 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
+    /// After a memory snapshot layer is sealed, sync it and drop its page cache
+    /// (`posix_fadvise(DONTNEED)`) so the snapshot write does not stay in the
+    /// runtime pod's working set. Off keeps today's behavior.
+    #[config(default = false)]
+    pub drop_page_cache_after_write: bool,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -1180,6 +1204,7 @@ impl AppConfig {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }
         self.validate_memory_snapshot_options()?;
+        self.validate_memory_containment()?;
         if self.ublk.overlaybd.remote_io_workers == 0 {
             bail!("invalid ublk.overlaybd config: remote_io_workers must be > 0");
         }
@@ -1286,6 +1311,25 @@ impl AppConfig {
         if self.virtualization_mode == VirtualizationMode::Pvm {
             bail!(
                 "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
+            );
+        }
+        Ok(())
+    }
+
+    /// The per-VM `memory.high` fraction is measured per node, so enabling
+    /// containment without it would force the code to invent a number.
+    fn validate_memory_containment(&self) -> Result<()> {
+        let containment = &self.memory_containment;
+        if !containment.enabled {
+            return Ok(());
+        }
+        let ratio = containment.memory_high_ratio.context(
+            "memory_containment.enabled requires memory_containment.memory_high_ratio \
+             (0 < ratio < 1), measured on the node",
+        )?;
+        if !(ratio.is_finite() && ratio > 0.0 && ratio < 1.0) {
+            bail!(
+                "memory_containment.memory_high_ratio must be strictly between 0 and 1, got {ratio}"
             );
         }
         Ok(())
@@ -1865,6 +1909,37 @@ mod tests {
                 None => result.expect("supported memory snapshot options should be valid"),
             }
         }
+    }
+
+    #[test]
+    fn validate_memory_containment_requires_a_measured_ratio() {
+        let mut config = AppConfig {
+            memory_containment: MemoryContainmentConfig {
+                enabled: true,
+                memory_high_ratio: None,
+            },
+            ..Default::default()
+        };
+        assert!(config.validate_memory_containment().is_err());
+
+        for invalid in [0.0, 1.0, -0.5, 1.5, f64::NAN, f64::INFINITY] {
+            config.memory_containment.memory_high_ratio = Some(invalid);
+            assert!(
+                config.validate_memory_containment().is_err(),
+                "ratio {invalid} must be rejected"
+            );
+        }
+
+        config.memory_containment.memory_high_ratio = Some(0.9);
+        config
+            .validate_memory_containment()
+            .expect("a measured ratio in (0, 1) is valid");
+
+        config.memory_containment.enabled = false;
+        config.memory_containment.memory_high_ratio = None;
+        config
+            .validate_memory_containment()
+            .expect("disabled containment needs no ratio");
     }
 
     #[test]
