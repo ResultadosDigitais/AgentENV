@@ -433,6 +433,15 @@ impl ObservabilityReporter {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
             }),
+            paused_sandboxes: snapshot
+                .paused_sandboxes
+                .into_iter()
+                .map(|paused| scheduler::PausedSandboxResources {
+                    sandbox_id: paused.sandbox_id.to_string(),
+                    cpu_count: paused.cpu_count,
+                    memory_bytes: paused.memory_bytes,
+                })
+                .collect(),
         }
     }
 
@@ -599,5 +608,96 @@ mod tests {
             !err.is::<HeartbeatNodeNotConfigured>(),
             "generic errors must not be mistaken for HeartbeatNodeNotConfigured"
         );
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_maps_paused_sandbox_shapes() {
+        let sandbox_id = crate::types::SandboxId::new();
+        let snapshot = crate::observability::NodeSnapshot {
+            version: "0.2.4".to_string(),
+            commit: "abc123".to_string(),
+            node_id: "node-a".to_string(),
+            service_instance_id: "svc-a".to_string(),
+            cluster_id: uuid::Uuid::new_v4(),
+            machine_info: crate::observability::MachineInfo {
+                cpu_family: "6".to_string(),
+                cpu_model: "158".to_string(),
+                cpu_model_name: "Intel".to_string(),
+                cpu_architecture: "x86_64".to_string(),
+                cpu_config_json: None,
+            },
+            sandbox_count: 0,
+            sandbox_ids: vec![sandbox_id],
+            metrics: crate::observability::NodeMetricsSnapshot {
+                allocated_cpu: 0,
+                allocated_memory_bytes: 0,
+                requested_memory_bytes: 0,
+                cpu_percent: 0,
+                cpu_count: 8,
+                memory_used_bytes: 0,
+                memory_total_bytes: 128 * 1024 * 1024 * 1024,
+                disks: Vec::new(),
+                paused_allocated_cpu: 4,
+                paused_allocated_memory_bytes: 16 * 1024 * 1024 * 1024,
+            },
+            create_successes: 0,
+            create_fails: 0,
+            sandbox_starting_count: 0,
+            paused_sandbox_count: 1,
+            paused_sandboxes: vec![crate::observability::PausedSandboxResources {
+                sandbox_id,
+                cpu_count: 4,
+                memory_bytes: 16 * 1024 * 1024 * 1024,
+            }],
+        };
+
+        let req = ObservabilityReporter::build_heartbeat_request(snapshot, 123, None);
+        assert_eq!(req.paused_sandboxes.len(), 1);
+        assert_eq!(req.paused_sandboxes[0].sandbox_id, sandbox_id.to_string());
+        assert_eq!(req.paused_sandboxes[0].cpu_count, 4);
+        assert_eq!(
+            req.paused_sandboxes[0].memory_bytes,
+            16 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_keeps_paused_list_empty_when_none() {
+        let snapshot = crate::observability::NodeSnapshot {
+            version: String::new(),
+            commit: String::new(),
+            node_id: "node-a".to_string(),
+            service_instance_id: "svc-a".to_string(),
+            cluster_id: uuid::Uuid::new_v4(),
+            machine_info: crate::observability::MachineInfo {
+                cpu_family: String::new(),
+                cpu_model: String::new(),
+                cpu_model_name: String::new(),
+                cpu_architecture: String::new(),
+                cpu_config_json: None,
+            },
+            sandbox_count: 0,
+            sandbox_ids: Vec::new(),
+            metrics: crate::observability::NodeMetricsSnapshot {
+                allocated_cpu: 0,
+                allocated_memory_bytes: 0,
+                requested_memory_bytes: 0,
+                cpu_percent: 0,
+                cpu_count: 0,
+                memory_used_bytes: 0,
+                memory_total_bytes: 0,
+                disks: Vec::new(),
+                paused_allocated_cpu: 0,
+                paused_allocated_memory_bytes: 0,
+            },
+            create_successes: 0,
+            create_fails: 0,
+            sandbox_starting_count: 0,
+            paused_sandbox_count: 0,
+            paused_sandboxes: Vec::new(),
+        };
+
+        let req = ObservabilityReporter::build_heartbeat_request(snapshot, 0, None);
+        assert!(req.paused_sandboxes.is_empty());
     }
 }

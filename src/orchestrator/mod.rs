@@ -10,7 +10,7 @@ mod types;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
-pub use metrics::OrchestratorMetrics;
+pub use metrics::{OrchestratorMetrics, PausedSandboxResources};
 pub use persistence::paused_store_cost::{MonthlyCost, PausedStoreCost};
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,

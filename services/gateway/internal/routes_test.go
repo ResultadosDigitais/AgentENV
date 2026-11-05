@@ -27,6 +27,7 @@ func TestMatchPathRoute(t *testing.T) {
 		{name: "v2 sandbox connect", method: http.MethodPost, path: "/v2/sandboxes/sbx-123/connect", owner: ownerSandbox, id: "sbx-123"},
 		{name: "v2 connect wrong method", method: http.MethodGet, path: "/v2/sandboxes/sbx-123/connect"},
 		{name: "sandbox pause", method: http.MethodPost, path: "/sandboxes/sbx-123/pause", owner: ownerSandbox, id: "sbx-123"},
+		{name: "sandbox resume", method: http.MethodPost, path: "/sandboxes/sbx-123/resume", owner: ownerSandboxResume, id: "sbx-123"},
 		{name: "sandbox pause blank ID", method: http.MethodPost, path: "/sandboxes/ /pause"},
 		{name: "sandbox pause empty segment", method: http.MethodPost, path: "/sandboxes//pause"},
 		{name: "sandbox fork", method: http.MethodPost, path: "/sandboxes/sbx-123/fork", owner: ownerSandboxFork, id: "sbx-123"},

@@ -15,7 +15,17 @@
         "id": "node-b",
         "endpoint": "http://agentenv-b:8000"
       }
-    ]
+    ],
+    "node_resource_limit": {
+      "memory_capacity_source": "total",
+      "shape_admission": "on",
+      "admission_layers": [
+        {"memory_gb": 8},
+        {"memory_gb": 16},
+        {"memory_gb": 32},
+        {"memory_gb": 64}
+      ]
+    }
   },
   "gateway": {
     "http_listen_addr": ":8080",

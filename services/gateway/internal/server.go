@@ -67,6 +67,7 @@ type Server struct {
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
 	debugMode           bool
 	sandboxProxyDomains []string
+	sandboxShapes       *sandboxShapeCache
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
@@ -94,6 +95,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		apiKey:              []byte(options.APIKey),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
+		sandboxShapes:       newSandboxShapeCache(),
 	}, nil
 }
 
@@ -226,6 +228,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	sandboxID, hasSandbox := "", false
 	buildReadRequest := false
+	resumeRequest := false
 	routeSource := routeSourceHeader
 	if hostRoute != nil {
 		s.logHostRoutingHeaderConflicts(r, hostRoute)
@@ -238,6 +241,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		} else {
 			sandboxID, hasSandbox = route.id, true
 			buildReadRequest = route.owner == ownerBuildRead
+			resumeRequest = route.owner == ownerSandboxResume
 			routeSource = routeSourcePath
 		}
 	} else {
@@ -248,8 +252,30 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
+	var scheduledShape *sandboxShape
 
-	if hasSandbox {
+	if hasSandbox && resumeRequest {
+		resumeReq := &schedulerv1.ScheduleResumeRequest{
+			SandboxId: sandboxID,
+			ClusterId: strings.TrimSpace(r.URL.Query().Get("clusterID")),
+		}
+		if shape, ok := s.sandboxShapes.get(sandboxID); ok {
+			resumeReq.CpuCount = shape.CPUCount
+			resumeReq.MemoryBytes = shape.MemoryBytes
+		}
+		rpcStart := time.Now()
+		resp, err := s.scheduler.ScheduleResume(routingCtx, resumeReq)
+		recordGatewaySchedulerRPC("ScheduleResume", rpcStart, err)
+		if err != nil {
+			s.writeSchedulerError(w, err)
+			return
+		}
+		if !resp.GetAdmitted() {
+			writeCapacityDeferred(w, resp.GetReason())
+			return
+		}
+		node = resp.GetNode()
+	} else if hasSandbox {
 		rpcStart := time.Now()
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
@@ -276,6 +302,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			)
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
+		}
+		if cold := hint.GetNewColdSandbox(); cold != nil && cold.GetMemoryMb() > 0 {
+			scheduledShape = &sandboxShape{
+				CPUCount:    cold.GetCpuCount(),
+				MemoryBytes: cold.GetMemoryMb() << 20,
+			}
 		}
 		rpcStart := time.Now()
 		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
@@ -324,9 +356,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		upstreamURL,
 		node,
 		proxyRequestOptions{
-			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
+			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox) && !resumeRequest,
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
+			shape:            scheduledShape,
 		},
 	)
 }
@@ -353,6 +386,10 @@ type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
 	flushImmediately bool
+	// shape is the template shape of a newly scheduled cold sandbox, cached
+	// under the sandbox ID the upstream returns so a later resume can project
+	// it before the heartbeat reports paused resources.
+	shape *sandboxShape
 }
 
 func (s *Server) proxyRequest(
@@ -398,7 +435,7 @@ func (s *Server) proxyRequest(
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
 			}
-			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.Method, proxyReq.URL.Path)
+			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.Method, proxyReq.URL.Path, options.shape)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
@@ -465,7 +502,7 @@ func (e *proxyResponseError) Error() string {
 	return e.message
 }
 
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath string) error {
+func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath string, shape *sandboxShape) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
 	route, _ := matchPathRoute(requestMethod, requestPath)
@@ -490,6 +527,9 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	}
 
 	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
+		if shape != nil {
+			s.sandboxShapes.set(sandboxID, *shape)
+		}
 		s.recordAssignment(recordCtx, sandboxID, node, "response_header")
 		return nil
 	}
@@ -527,9 +567,30 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 		ids = extractForkSandboxIDsFromResponse(body)
 	}
 	for _, sandboxID := range ids {
+		if shape != nil {
+			s.sandboxShapes.set(sandboxID, *shape)
+		}
 		s.recordAssignment(recordCtx, sandboxID, node, "response_body")
 	}
 	return nil
+}
+
+// writeCapacityDeferred answers a resume the scheduler deferred because the
+// paused shape does not fit the owner. It is retryable: Retry-After tells the
+// client when to try again and the body carries a stable code plus the closed
+// admission reason (empty when the shape is not known yet).
+func writeCapacityDeferred(w http.ResponseWriter, reason string) {
+	w.Header().Set("Retry-After", "5")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	body := struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason,omitempty"`
+	}{
+		Code:   "sandbox_capacity_deferred",
+		Reason: reason,
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, source string) error {

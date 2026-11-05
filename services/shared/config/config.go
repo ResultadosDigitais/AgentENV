@@ -84,6 +84,33 @@ type NodeResourceLimit struct {
 	MaxSandboxCountIncludingPaused         *uint32 `json:"max_sandbox_count_including_paused"`
 	MaxAllocatedCPUIncludingPaused         *uint32 `json:"max_allocated_cpu_including_paused"`
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
+
+	// AdmissionLayers are the VM shapes whose admission is published per node
+	// by the scheduler and read by the gateway's /nodes response. When absent
+	// the default layers (8, 16, 32 and 64 GiB) apply. CPUCount is optional:
+	// the scheduler does not know the layer-to-vCPU map, so an absent value
+	// projects no extra CPU and the cpu reason reflects only the node's
+	// current CPU state.
+	AdmissionLayers []AdmissionLayer `json:"admission_layers"`
+	// MemoryCapacitySource selects the memory base the admission ceiling is
+	// computed over: "allocatable" (default) uses the Kubernetes node's
+	// status.allocatable.memory minus the runtime overhead; "total" is the
+	// kill switch that restores the historical memory_total math.
+	MemoryCapacitySource *string `json:"memory_capacity_source"`
+	// ShapeAdmission enables the published per-layer verdict and the resume
+	// gating that projects the paused sandbox shape. Default "on"; "off" is
+	// the kill switch that restores the pre-OPSAI-6200 routing.
+	ShapeAdmission *string `json:"shape_admission"`
+	// CrossNodeResume allows a paused sandbox rejected on its owner to resume
+	// on another admitted node. Off by default: moving a resume before the
+	// paused artifacts are cluster-readable loses the sandbox.
+	CrossNodeResume *bool `json:"cross_node_resume"`
+}
+
+// AdmissionLayer is one VM shape whose admission the scheduler publishes.
+type AdmissionLayer struct {
+	MemoryGB uint64  `json:"memory_gb"`
+	CPUCount *uint32 `json:"cpu_count"`
 }
 
 // Admission modes accepted by NodeResourceLimit.AdmissionMode.
@@ -100,7 +127,72 @@ const (
 	// disk_mount_point is unset. Sandbox state, persisted paused sandboxes and
 	// the image cache all live on the node's /workspace volume.
 	DefaultDiskMountPoint = "/workspace"
+
+	// Memory capacity sources accepted by
+	// NodeResourceLimit.MemoryCapacitySource.
+	MemoryCapacitySourceAllocatable = "allocatable"
+	MemoryCapacitySourceTotal       = "total"
+
+	// Shape admission modes accepted by NodeResourceLimit.ShapeAdmission.
+	ShapeAdmissionOn  = "on"
+	ShapeAdmissionOff = "off"
 )
+
+// DefaultAdmissionLayerMemoryGB is the set of VM shapes published per node
+// when admission_layers is absent.
+var DefaultAdmissionLayerMemoryGB = []uint64{8, 16, 32, 64}
+
+// ResolvedMemoryCapacitySource returns the configured memory capacity source,
+// defaulting to allocatable. Unknown values resolve to allocatable so a typo
+// cannot silently restore the total math; Validate rejects them at startup.
+func (l *NodeResourceLimit) ResolvedMemoryCapacitySource() string {
+	if l == nil || l.MemoryCapacitySource == nil {
+		return MemoryCapacitySourceAllocatable
+	}
+	switch source := strings.ToLower(strings.TrimSpace(*l.MemoryCapacitySource)); source {
+	case MemoryCapacitySourceTotal:
+		return MemoryCapacitySourceTotal
+	default:
+		return MemoryCapacitySourceAllocatable
+	}
+}
+
+// ResolvedShapeAdmission returns "on" or "off", defaulting to "on".
+func (l *NodeResourceLimit) ResolvedShapeAdmission() string {
+	if l == nil || l.ShapeAdmission == nil {
+		return ShapeAdmissionOn
+	}
+	if strings.ToLower(strings.TrimSpace(*l.ShapeAdmission)) == ShapeAdmissionOff {
+		return ShapeAdmissionOff
+	}
+	return ShapeAdmissionOn
+}
+
+// ShapeAdmissionEnabled reports whether the per-layer verdict and resume
+// projection are active.
+func (l *NodeResourceLimit) ShapeAdmissionEnabled() bool {
+	return l.ResolvedShapeAdmission() == ShapeAdmissionOn
+}
+
+// ResolvedAdmissionLayers returns the configured layers, or the 8/16/32/64 GiB
+// defaults when admission_layers is absent.
+func (l *NodeResourceLimit) ResolvedAdmissionLayers() []AdmissionLayer {
+	if l == nil || len(l.AdmissionLayers) == 0 {
+		layers := make([]AdmissionLayer, 0, len(DefaultAdmissionLayerMemoryGB))
+		for _, memoryGB := range DefaultAdmissionLayerMemoryGB {
+			layers = append(layers, AdmissionLayer{MemoryGB: memoryGB})
+		}
+		return layers
+	}
+	layers := make([]AdmissionLayer, len(l.AdmissionLayers))
+	copy(layers, l.AdmissionLayers)
+	return layers
+}
+
+// CrossNodeResumeEnabled reports whether a resume may move off its owner.
+func (l *NodeResourceLimit) CrossNodeResumeEnabled() bool {
+	return l != nil && l.CrossNodeResume != nil && *l.CrossNodeResume
+}
 
 // ResolvedAdmissionMode returns the configured mode, defaulting to nominal.
 // Unknown values resolve to nominal (fail-safe); Validate rejects them at
@@ -152,6 +244,30 @@ func (l *NodeResourceLimit) Validate() error {
 	}
 	if l.MaxDiskUsedPercent != nil && *l.MaxDiskUsedPercent > 100 {
 		return fmt.Errorf("scheduler.node_resource_limit.max_disk_used_percent must be at most 100, got %d", *l.MaxDiskUsedPercent)
+	}
+	if l.MemoryCapacitySource != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.MemoryCapacitySource)) {
+		case MemoryCapacitySourceAllocatable, MemoryCapacitySourceTotal:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.memory_capacity_source must be one of allocatable, total, got %q", *l.MemoryCapacitySource)
+		}
+	}
+	if l.ShapeAdmission != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.ShapeAdmission)) {
+		case ShapeAdmissionOn, ShapeAdmissionOff:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.shape_admission must be one of on, off, got %q", *l.ShapeAdmission)
+		}
+	}
+	seenLayers := make(map[uint64]struct{}, len(l.AdmissionLayers))
+	for _, layer := range l.AdmissionLayers {
+		if layer.MemoryGB == 0 {
+			return errors.New("scheduler.node_resource_limit.admission_layers memory_gb must be greater than zero")
+		}
+		if _, duplicate := seenLayers[layer.MemoryGB]; duplicate {
+			return fmt.Errorf("scheduler.node_resource_limit.admission_layers has duplicate memory_gb %d", layer.MemoryGB)
+		}
+		seenLayers[layer.MemoryGB] = struct{}{}
 	}
 	return nil
 }

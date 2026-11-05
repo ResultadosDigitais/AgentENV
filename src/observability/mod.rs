@@ -17,6 +17,6 @@ mod reporter;
 mod service;
 
 pub use host::{DiskMetric, HostMetrics, HostMetricsCollector};
-pub use model::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
+pub use model::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot, PausedSandboxResources};
 pub use reporter::ObservabilityReporter;
 pub use service::ObservabilityService;

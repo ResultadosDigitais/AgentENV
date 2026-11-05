@@ -96,6 +96,15 @@ impl ObservabilityService {
             create_fails: runtime.create_fails,
             sandbox_starting_count: runtime.starting_sandbox_count,
             paused_sandbox_count: runtime.paused_sandbox_count,
+            paused_sandboxes: runtime
+                .paused_sandboxes
+                .into_iter()
+                .map(|paused| super::PausedSandboxResources {
+                    sandbox_id: paused.sandbox_id,
+                    cpu_count: paused.cpu_count,
+                    memory_bytes: paused.memory_bytes,
+                })
+                .collect(),
         })
     }
 

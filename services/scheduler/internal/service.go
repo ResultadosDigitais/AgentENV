@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,12 +18,13 @@ import (
 
 type Service struct {
 	schedulerv1.UnimplementedSchedulerServer
-	logger        *zap.Logger
-	nodes         NodeRegistry
-	strategy      Strategy
-	store         BindingStore
-	artifacts     ArtifactStore
-	resourceLimit *config.NodeResourceLimit
+	logger           *zap.Logger
+	nodes            NodeRegistry
+	strategy         Strategy
+	store            BindingStore
+	artifacts        ArtifactStore
+	resourceLimit    *config.NodeResourceLimit
+	capacityProvider NodeCapacityProvider
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -61,6 +63,14 @@ func WithArtifactStore(store ArtifactStore) ServiceOption {
 	}
 }
 
+// WithNodeCapacityProvider sets the source of the Kubernetes allocatable
+// memory used by the admission rule. Without it the rule keeps memory_total.
+func WithNodeCapacityProvider(provider NodeCapacityProvider) ServiceOption {
+	return func(s *Service) {
+		s.capacityProvider = provider
+	}
+}
+
 type QueryOnlyService struct {
 	schedulerv1.UnimplementedSchedulerServer
 	logger *zap.Logger
@@ -92,6 +102,7 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 			Snapshot: s.nodes.PeekObserved(n.ID),
 		})
 	}
+	rich = s.annotateCapacity(rich)
 
 	eligible := FilterByResourceLimitReported(rich, s.resourceLimit, func(nodeID string, nominal, request bool, detail string) {
 		s.logger.Info("admission shadow divergence",
@@ -119,6 +130,13 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 			zap.String("detail", violation.Detail),
 		)
 	})
+
+	// Project the cold-sandbox shape onto each candidate so a node only
+	// admits the new sandbox when it fits the same capacity rule the resume
+	// path uses.
+	if cold := req.GetHint().GetNewColdSandbox(); cold != nil && cold.GetMemoryMb() > 0 {
+		eligible = filterByShape(eligible, cold.GetMemoryMb()<<20, cold.GetCpuCount(), s.resourceLimit)
+	}
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
 	if selectErr != nil {
@@ -291,9 +309,185 @@ func (s *Service) refreshObservedNodesMetrics(now time.Time) {
 
 func (s *Service) ListObservedNodes(_ context.Context, req *schedulerv1.ListObservedNodesRequest) (*schedulerv1.ListObservedNodesResponse, error) {
 	nodes := s.nodes.ListObserved(req.GetClusterId(), time.Now())
+	rich := make([]RichNode, 0, len(nodes))
+	for _, node := range nodes {
+		rich = append(rich, RichNode{
+			Node:     Node{ID: node.GetNodeId(), Endpoint: node.GetEndpoint()},
+			Snapshot: node.GetSnapshot(),
+		})
+	}
+	rich = s.annotateCapacity(rich)
+	for i, node := range nodes {
+		node.Admission = s.nodeAdmission(rich[i])
+	}
 	return &schedulerv1.ListObservedNodesResponse{
 		Nodes: nodes,
 	}, nil
+}
+
+// nodeAdmission publishes the per-layer verdict for one observed node, along
+// with the capacity facts it was computed over.
+func (s *Service) nodeAdmission(n RichNode) *schedulerv1.NodeAdmission {
+	if n.Snapshot == nil || s.resourceLimit == nil || !s.resourceLimit.ShapeAdmissionEnabled() {
+		return nil
+	}
+	verdicts := EvaluateNodeAdmission(n, s.resourceLimit)
+	capacity, source := capacityMemoryBytes(n.Snapshot, n.Capacity, s.resourceLimit)
+	admission := &schedulerv1.NodeAdmission{
+		RuntimeOverheadBytes: runtimeOverheadBytes(n.Snapshot),
+		CapacityMemoryBytes:  capacity,
+		CapacitySource:       source,
+	}
+	if n.Capacity != nil {
+		admission.AllocatableMemoryBytes = n.Capacity.AllocatableMemoryBytes
+	}
+	for _, verdict := range verdicts {
+		admission.Layers = append(admission.Layers, &schedulerv1.AdmissionVerdict{
+			MemoryGb: verdict.MemoryGB,
+			Admitted: verdict.Admitted,
+			Reason:   verdict.Reason,
+		})
+		reason := verdict.Reason
+		if reason == "" {
+			reason = "none"
+		}
+		schedulerNodeAdmission.WithLabelValues(
+			strconv.FormatUint(verdict.MemoryGB, 10),
+			strconv.FormatBool(verdict.Admitted),
+			reason,
+		).Inc()
+	}
+	return admission
+}
+
+// ScheduleResume gates a paused sandbox resume with the same capacity rule a
+// new sandbox goes through. The owner is returned when the shape fits; when it
+// does not, the sandbox is deferred (or moved to an admitted node when
+// cross_node_resume is on). The binding changes only after a node is selected.
+func (s *Service) ScheduleResume(_ context.Context, req *schedulerv1.ScheduleResumeRequest) (*schedulerv1.ScheduleResumeResponse, error) {
+	sandboxID := strings.TrimSpace(req.GetSandboxId())
+	if sandboxID == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
+	}
+	now := time.Now()
+	owner, ok, getErr := s.store.Get(sandboxID, now)
+	if getErr != nil {
+		return nil, status.Error(codes.Unavailable, "binding store unavailable")
+	}
+	if !ok {
+		return nil, status.Error(codes.NotFound, "sandbox assignment not found")
+	}
+
+	if s.resourceLimit == nil || !s.resourceLimit.ShapeAdmissionEnabled() {
+		recordResumeAdmission("disabled")
+		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: true}, nil
+	}
+
+	memoryBytes, cpuCount, known := s.pausedShape(owner.ID, sandboxID, req)
+	if !known {
+		// No shape means the projection cannot be evaluated. Defer instead of
+		// over-admitting: fail-closed on an unknown shape.
+		recordResumeAdmission("unknown_shape")
+		s.logger.Warn("scheduler deferred resume with unknown paused shape",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("node_id", owner.ID),
+		)
+		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: false}, nil
+	}
+
+	ownerRich := s.richNode(owner.ID)
+	admitted, reason := EvaluateShapeAdmission(ownerRich, memoryBytes, cpuCount, s.resourceLimit)
+	if admitted {
+		recordResumeAdmission("owner")
+		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: true}, nil
+	}
+	if !s.resourceLimit.CrossNodeResumeEnabled() {
+		recordResumeAdmission("deferred")
+		s.logger.Info("scheduler deferred resume that does not fit the owner",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("node_id", owner.ID),
+			zap.String("reason", reason),
+		)
+		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: false, Reason: reason}, nil
+	}
+
+	candidates := s.resumeCandidates(owner.ID, memoryBytes, cpuCount)
+	selected, selectErr := s.strategy.Select(candidates, nil)
+	if selectErr != nil {
+		recordResumeAdmission("deferred")
+		s.logger.Info("scheduler deferred resume without an alternative node",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("node_id", owner.ID),
+			zap.String("reason", reason),
+		)
+		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: false, Reason: reason}, nil
+	}
+	if recordErr := s.store.Record(sandboxID, selected.Node, time.Now()); recordErr != nil {
+		recordResumeAdmission("error")
+		return nil, status.Error(codes.Unavailable, "binding store unavailable")
+	}
+	recordResumeAdmission("moved")
+	s.logger.Info("scheduler moved a resume to another node",
+		zap.String("sandbox_id", sandboxID),
+		zap.String("from_node_id", owner.ID),
+		zap.String("to_node_id", selected.ID),
+		zap.String("reason", reason),
+	)
+	return &schedulerv1.ScheduleResumeResponse{Node: selected.Node.ToProto(), Admitted: true}, nil
+}
+
+// pausedShape resolves the persisted shape of a paused sandbox: the owner's
+// heartbeat report first, then the gateway-supplied template shape.
+func (s *Service) pausedShape(nodeID, sandboxID string, req *schedulerv1.ScheduleResumeRequest) (uint64, uint32, bool) {
+	if cpuCount, memoryBytes, ok := s.nodes.PausedSandboxResources(nodeID, sandboxID); ok && memoryBytes > 0 {
+		return memoryBytes, cpuCount, true
+	}
+	if req.GetMemoryBytes() > 0 {
+		return req.GetMemoryBytes(), req.GetCpuCount(), true
+	}
+	return 0, 0, false
+}
+
+// richNode returns the rich view of one discovered node, with its capacity.
+func (s *Service) richNode(nodeID string) RichNode {
+	node, _ := s.nodes.Resolve(nodeID)
+	rich := []RichNode{{Node: node, Snapshot: s.nodes.PeekObserved(nodeID)}}
+	return s.annotateCapacity(rich)[0]
+}
+
+// resumeCandidates returns every node except the owner that admits the paused
+// shape, using the existing scheduling filters.
+func (s *Service) resumeCandidates(ownerID string, memoryBytes uint64, cpuCount uint32) []RichNode {
+	discovered := s.nodes.Snapshot( /* allowLingering */ false)
+	rich := make([]RichNode, 0, len(discovered))
+	for _, node := range discovered {
+		if node.ID == ownerID {
+			continue
+		}
+		rich = append(rich, RichNode{Node: node, Snapshot: s.nodes.PeekObserved(node.ID)})
+	}
+	rich = s.annotateCapacity(rich)
+	rich = FilterByResourceLimit(rich, s.resourceLimit)
+	return filterByShape(rich, memoryBytes, cpuCount, s.resourceLimit)
+}
+
+// filterByShape drops nodes whose projected snapshot with the given shape
+// violates a capacity limit.
+func filterByShape(nodes []RichNode, memoryBytes uint64, cpuCount uint32, limit *config.NodeResourceLimit) []RichNode {
+	if limit == nil {
+		return nodes
+	}
+	admitted := make([]RichNode, 0, len(nodes))
+	for _, node := range nodes {
+		if ok, _ := EvaluateShapeAdmission(node, memoryBytes, cpuCount, limit); ok {
+			admitted = append(admitted, node)
+		}
+	}
+	return admitted
+}
+
+func recordResumeAdmission(outcome string) {
+	schedulerResumeAdmission.WithLabelValues(outcome).Inc()
 }
 
 func (s *Service) ListP2PPeers(_ context.Context, req *schedulerv1.ListP2PPeersRequest) (*schedulerv1.ListP2PPeersResponse, error) {
