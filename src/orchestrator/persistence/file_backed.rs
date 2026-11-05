@@ -19,6 +19,63 @@ use crate::virtualization::VirtualizationMode;
 const RECORD_VERSION: u32 = 1;
 const RECORD_DB_DIR: &str = "records.db";
 
+/// What `load_all` decided about one paused record. Every branch of the load
+/// path ends in exactly one of these, so the "nothing was lost" acceptance is a
+/// query over `agentenv_paused_sandbox_load_total` instead of a log read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadOutcome {
+    /// The runtime state decoded here and its artifacts are on this node.
+    LoadedFromLocal,
+    /// The record was readable but this node holds no resumable runtime state
+    /// for it (incompatible virtualization mode). It stays listed as `Paused`
+    /// and its artifacts are kept.
+    RetainedWithoutRuntimeState,
+    /// The record or its artifacts cannot be used by this node. It is deleted.
+    Discarded,
+}
+
+impl LoadOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadedFromLocal => "loaded_from_local",
+            Self::RetainedWithoutRuntimeState => "retained_unreachable",
+            Self::Discarded => "discarded",
+        }
+    }
+
+    /// Records the outcome. Label values come from this closed set; a sandbox ID
+    /// is never a label value, because its cardinality is unbounded.
+    fn record(self) {
+        metrics::counter!(
+            "agentenv_paused_sandbox_load_total",
+            "outcome" => self.as_str(),
+        )
+        .increment(1);
+    }
+}
+
+/// The per-outcome tally of one `load_all` pass.
+///
+/// One call per decided record keeps the metric and the summary log line from
+/// drifting apart: a branch cannot count without also emitting.
+#[derive(Default)]
+struct LoadOutcomes {
+    loaded_from_local: usize,
+    retained_unreachable: usize,
+    discarded: usize,
+}
+
+impl LoadOutcomes {
+    fn observe(&mut self, outcome: LoadOutcome) {
+        outcome.record();
+        match outcome {
+            LoadOutcome::LoadedFromLocal => self.loaded_from_local += 1,
+            LoadOutcome::RetainedWithoutRuntimeState => self.retained_unreachable += 1,
+            LoadOutcome::Discarded => self.discarded += 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PersistedPausedLifecycle {
@@ -37,22 +94,28 @@ struct PersistedPausedRecord {
 }
 
 impl PersistedPausedRecord {
-    fn into_metadata<F>(mut self, factory: &F) -> PersistenceResult<SandboxMetadata>
+    /// Metadata for this record with its runtime state decoded by `factory`.
+    ///
+    /// Borrows the record so a decode failure can still fall back to
+    /// [`Self::into_metadata_without_runtime_state`]: the failure may mean the
+    /// artifacts live on another node, not that the record is junk.
+    fn decode_runtime_metadata<F>(&self, factory: &F) -> PersistenceResult<SandboxMetadata>
     where
         F: SandboxBackendFactory,
     {
         ensure_supported_version(self.version)?;
 
         let paused_state = factory
-            .decode_paused_state(self.artifact_root, self.state)
+            .decode_paused_state(self.artifact_root.clone(), self.state.clone())
             .map_err(|source| SandboxPersistenceError::InvalidRecord {
                 reason: "failed to decode paused sandbox state".to_string(),
                 source: Some(source),
             })?;
-        self.metadata.state = SandboxState::Paused;
-        self.metadata.paused_state = Some(paused_state);
+        let mut metadata = self.metadata.clone();
+        metadata.state = SandboxState::Paused;
+        metadata.paused_state = Some(paused_state);
 
-        Ok(self.metadata)
+        Ok(metadata)
     }
 
     fn into_metadata_without_runtime_state(mut self) -> SandboxMetadata {
@@ -186,11 +249,40 @@ impl FileBackedSandboxPersister {
         }
     }
 
+    /// Drops a record this node can never use: the bytes are not a paused
+    /// record at all, or a resumed record was abandoned mid-flight.
+    ///
+    /// Deliberately *not* used for a record whose runtime state fails to decode:
+    /// that failure is also what a node with missing artifacts looks like, and
+    /// deleting it is the step that turns a pod swap into permanent loss. Such a
+    /// record is retained by [`Self::retain_unusable_record`] instead.
     async fn cleanup_invalid_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "cleaning up invalid paused sandbox record");
         self.remove_record(sandbox_id).await?;
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
         Ok(())
+    }
+
+    /// Keeps a record whose runtime state could not be decoded here, so a retry
+    /// — on a node that does hold its artifacts, or here once they arrive — can
+    /// still resume it. The record is reported, never silently dropped.
+    ///
+    /// Retention is not unbounded, and the sweep that bounds it is deliberately
+    /// *not* the orphan sweep: that one only reclaims a sandbox whose record is
+    /// gone, so counting on it would let a retained record keep its artifacts
+    /// forever. Retention is bounded instead by two things this branch can see:
+    /// the record still being replaced on the next successful pause of the same
+    /// sandbox, and the operator-facing counter plus log line below, which is what
+    /// the seven-day acceptance watches. Reclaiming a retained record on a timer
+    /// is a separate decision, because a timer that is too short destroys exactly
+    /// the record this branch exists to save.
+    fn retain_unusable_record(&self, sandbox_id: &SandboxId, error: &SandboxPersistenceError) {
+        warn!(
+            sandbox_id = %sandbox_id,
+            artifacts = %self.sandbox_artifact_root(sandbox_id).display(),
+            error = %error,
+            "retaining paused sandbox record whose runtime state is unavailable on this node"
+        );
     }
 
     async fn cleanup_orphan_artifacts(
@@ -258,6 +350,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         })?;
         let mut sandboxes = Vec::new();
         let mut retained_artifacts = HashSet::new();
+        let mut outcomes = LoadOutcomes::default();
 
         for (key, bytes) in records {
             let sandbox_id_from_key = std::str::from_utf8(&key)
@@ -270,6 +363,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
                     if let Some(sandbox_id) = sandbox_id_from_key {
                         let _ = self.remove_record(&sandbox_id).await;
                     }
+                    outcomes.observe(LoadOutcome::Discarded);
                     continue;
                 }
             };
@@ -278,6 +372,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             if record.lifecycle == PersistedPausedLifecycle::Resuming {
                 warn!(sandbox_id = %sandbox_id, "discarding paused sandbox record left in resuming state");
                 self.cleanup_invalid_record(&sandbox_id).await?;
+                outcomes.observe(LoadOutcome::Discarded);
                 continue;
             }
 
@@ -290,17 +385,21 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 );
                 retained_artifacts.insert(sandbox_id);
                 sandboxes.push(record.into_metadata_without_runtime_state());
+                outcomes.observe(LoadOutcome::RetainedWithoutRuntimeState);
                 continue;
             }
 
-            match record.into_metadata(factory) {
+            match record.decode_runtime_metadata(factory) {
                 Ok(metadata) => {
                     retained_artifacts.insert(sandbox_id);
                     sandboxes.push(metadata);
+                    outcomes.observe(LoadOutcome::LoadedFromLocal);
                 }
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, error = %err, "discarding unusable paused sandbox record");
-                    self.cleanup_invalid_record(&sandbox_id).await?;
+                    self.retain_unusable_record(&sandbox_id, &err);
+                    retained_artifacts.insert(sandbox_id);
+                    sandboxes.push(record.into_metadata_without_runtime_state());
+                    outcomes.observe(LoadOutcome::RetainedWithoutRuntimeState);
                 }
             }
         }
@@ -310,6 +409,9 @@ impl SandboxPersister for FileBackedSandboxPersister {
         info!(
             loaded = sandboxes.len(),
             retained = retained_artifacts.len(),
+            loaded_from_local = outcomes.loaded_from_local,
+            retained_unreachable = outcomes.retained_unreachable,
+            discarded = outcomes.discarded,
             "loaded paused sandbox records"
         );
 
@@ -844,8 +946,15 @@ mod tests {
         Ok(())
     }
 
+    /// A record this node cannot decode is not junk: its artifacts may be on
+    /// another node, and only a record kept is a record a pod swap can resume.
+    /// Deleting here is the step that turned a node replacement into permanent
+    /// loss, so the record and its artifacts must both survive the load.
+    ///
+    /// This replaces the previous assertion that such a record was discarded
+    /// and its artifacts removed.
     #[tokio::test]
-    async fn load_all_discards_unusable_record_and_artifacts() -> anyhow::Result<()> {
+    async fn load_all_retains_record_whose_runtime_state_is_unavailable() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -864,9 +973,87 @@ mod tests {
 
         let loaded = persister.load_all(&RejectingFactory).await?;
 
-        assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+        let retained = loaded
+            .iter()
+            .find(|loaded| loaded.id == sandbox_id)
+            .expect("a record whose runtime state is unavailable must stay listed");
+        assert_eq!(retained.state, SandboxState::Paused);
+        assert!(
+            retained.paused_state.is_none(),
+            "a record without decodable runtime state must not advertise one"
+        );
+        assert!(has_record(&persister, &sandbox_id).await?);
+        assert!(snapshot_root.exists());
         Ok(())
+    }
+
+    /// The three outcomes must stay distinguishable: one that loaded, one whose
+    /// runtime state is unavailable here, and one that is genuinely corrupt.
+    /// The corrupt one keeps its cleanup, so this test also pins that the
+    /// retention above did not simply disable the cleanup path.
+    #[tokio::test]
+    async fn load_all_distinguishes_loaded_retained_and_discarded_records() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let loaded_root = temp.path().join("loaded-artifacts");
+        let (loaded_id, _loaded_state) = persist_test_record(&persister, &loaded_root).await?;
+
+        let unavailable_id = SandboxId::new();
+        let unavailable_root = persister
+            .sandbox_artifact_root(&unavailable_id)
+            .join("snapshot");
+        let unavailable_state = paused_state(&unavailable_root);
+        let unavailable_metadata = SandboxMetadata {
+            id: unavailable_id,
+            paused_state: Some(Arc::clone(&unavailable_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(
+                &unavailable_metadata,
+                Some(&unavailable_root),
+                unavailable_state.as_ref(),
+            )
+            .await?;
+
+        let corrupt_id = SandboxId::new();
+        persister
+            .db()
+            .await?
+            .put(corrupt_id.to_string(), b"not-json")
+            .await?;
+
+        let mut loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        loaded.sort_by_key(|metadata| metadata.id);
+
+        assert_eq!(loaded.len(), 2, "loaded and retained records stay listed");
+        assert!(loaded.iter().any(|metadata| metadata.id == loaded_id));
+
+        let unavailable = loaded
+            .iter()
+            .find(|metadata| metadata.id == unavailable_id)
+            .expect("the unavailable record stays listed");
+        assert!(unavailable.paused_state.is_none());
+
+        assert!(!has_record(&persister, &corrupt_id).await?);
+        assert!(has_record(&persister, &unavailable_id).await?);
+        assert!(unavailable_root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn load_outcome_labels_are_a_closed_set() {
+        let labels = [
+            LoadOutcome::LoadedFromLocal.as_str(),
+            LoadOutcome::RetainedWithoutRuntimeState.as_str(),
+            LoadOutcome::Discarded.as_str(),
+        ];
+
+        let unique: HashSet<_> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), labels.len(), "labels must not collide");
+        assert!(
+            labels.iter().all(|label| label.is_ascii()),
+            "label values stay greppable in metrics output"
+        );
     }
 }

@@ -85,6 +85,7 @@
 - [Template Builder and Testing](./internals/template-builder-testing.md)
 - [BuildKit Template Builds](./internals/buildkit-template-builds.md)
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)
+- [Paused Sandbox Cross-Node Routing](./internals/paused-sandbox-cross-node-routing.md)
 - [Proxy Design](./internals/proxy-design.md)
 - [Distributed Control Plane](./internals/services.md)
 - [P2P Artifact Transport](./internals/p2p-design.md)

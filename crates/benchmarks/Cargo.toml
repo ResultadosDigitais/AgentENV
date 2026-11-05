@@ -39,3 +39,8 @@ harness = false
 name = "oci_conversion_pipeline"
 path = "benches/oci_conversion_pipeline_benchmark.rs"
 harness = false
+
+[[bench]]
+name = "paused_store"
+path = "benches/paused_store_benchmark.rs"
+harness = false
