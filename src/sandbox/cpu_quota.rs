@@ -399,10 +399,15 @@ mod tests {
         fs::write(parent.join("cgroup.type"), "domain\n")?;
         fs::write(parent.join("cgroup.controllers"), "cpu memory\n")?;
         fs::write(parent.join("cgroup.subtree_control"), "")?;
+        // The kernel creates `cgroup.type` with the cgroup directory, and
+        // `make_threaded` reads it before converting. The fake has to seed it
+        // for the `cpu/` child the code creates.
+        let cpu_path = parent.join(CPU_DIR);
+        fs::create_dir(&cpu_path)?;
+        fs::write(cpu_path.join("cgroup.type"), "domain\n")?;
 
         let cgroup = quota.create(sandbox_id, Some(&parent))?;
 
-        let cpu_path = parent.join(CPU_DIR);
         assert_eq!(cgroup.path(), cpu_path.as_path());
         assert_eq!(read_trimmed(&cpu_path.join("cgroup.type"))?, "threaded");
         assert_eq!(
