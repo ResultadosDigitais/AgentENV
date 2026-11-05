@@ -265,6 +265,44 @@ sum by (node_id) (increase(agentenv_paused_sandbox_load_total{outcome="loaded_fr
 A node that keeps reporting only `loaded_from_local` across pod swaps is still
 serving from the SSD, so its bucket path is not exercised.
 
+### Where a paused record and its artifacts live
+
+Both live in the same directory, and that is what makes a recreated pod on the
+same node find one with the other. The store root is
+`persisted_sandbox_store_path`, default `$AENV_HOME/persisted-sandboxes`
+(`src/cfg.rs`); `$AENV_HOME` is `home_path`, which `AENV_HOME_PATH` overrides
+because the environment is the first source the config builder adds
+(`src/cfg.rs`, `Config::builder().env().file(path)`; see
+[Configuration reference](../configuration/reference.md)). In the runtime image
+`AENV_HOME_PATH=/workspace/env` (`deploy/docker/Dockerfile.agentenv`), and
+`/workspace` is the DaemonSet's `hostPath` `/var/lib/aenv`
+(`deploy/k8s/base/agentenv-daemonset.yaml`) — the node's local SSD. So on a
+cluster node:
+
+- the record DB is `/workspace/env/persisted-sandboxes/records.db`;
+- the generations are
+  `/workspace/env/persisted-sandboxes/artifacts/{sandbox_id}/{uuid}/...`;
+- both are on the local SSD and survive a pod recreation on the same node; no
+  paused record is ever written to an `emptyDir` or to the container overlay.
+
+The record therefore cannot disappear in an eviction while its generation
+stays: a generation found without a record was either never given one or had it
+removed. Two paths produce that state, and both run against the same SSD. The
+first is resume, which deletes the record and keeps the generation
+(`Orchestrator::launch` calls `delete_record`, not `delete_record_and_artifacts`);
+nothing reclaims the directory while `paused_artifact_reap` is at its default
+`off`. The second is an eviction inside the window between
+`allocate_artifact_root` and `persist_paused`. The log line that separates them
+for one sandbox id is `persisting paused sandbox`: present in the evicted pod's
+log means its pause reached the record write, absent means it did not. The lv72
+measurement of 05/11/2026 found five generations and three records: the replica
+that replaced the evicted pod read the three and reported `loaded=3 retained=3`,
+so the record DB was intact on the SSD and no record was lost with the pod —
+and a record write is fsynced before it is acknowledged, so a record cannot be
+torn. The five were generations of sandboxes that had already resumed.
+Whichever of the two produced them, the boot path now quarantines them instead
+of deleting them.
+
 ## P2P Artifact Transport
 
 Owned by `src/p2p/*`.
