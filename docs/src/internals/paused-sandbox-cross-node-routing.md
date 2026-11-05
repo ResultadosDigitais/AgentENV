@@ -48,6 +48,12 @@ elsewhere) is deleted, so the recreated node reports nothing and no binding is
 ever written. The storage and load fix is what makes premise 1 reachable; the
 routing itself needs no change.
 
+An artifact generation boot moves to `artifacts/.quarantine/` because no record
+names it does **not** enter this chain: an interrupted pause produces metadata
+that never existed, so there is no record for the recreated node to list, no
+binding to write, and quarantine preserves bytes without putting the sandbox
+back in the cluster list.
+
 ## Premise 2: no path other than `LookupNode` refreshes ownership
 
 **Result: none exists that a paused sandbox can reach.**

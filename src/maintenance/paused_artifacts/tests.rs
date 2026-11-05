@@ -509,6 +509,238 @@ async fn the_trash_directory_is_never_a_sandbox_dir_and_never_reaped_as_an_inval
 }
 
 // ---------------------------------------------------------------------------
+// Quarantine: where boot puts a generation no record names, emptied only by an
+// explicit TTL.
+// ---------------------------------------------------------------------------
+
+/// Creates `artifacts/.quarantine/{moved_at}/{id}`, as boot leaves it, with one
+/// file so the deletion has bytes to count.
+fn quarantined(root: &Path, id: SandboxId, moved_at: SystemTime) -> PathBuf {
+    let path = root
+        .join(QUARANTINE_DIR)
+        .join(epoch_seconds(moved_at).to_string())
+        .join(id.to_string());
+    std::fs::create_dir_all(&path).expect("create quarantined generation");
+    // One allocation block of 4096 bytes: the reaper counts allocated blocks,
+    // not apparent size, so the assertion below can name the exact number.
+    std::fs::write(path.join("vm_state.bin"), vec![0u8; 4096]).expect("write quarantined artifact");
+    path
+}
+
+#[tokio::test]
+async fn a_quarantined_generation_is_deleted_after_the_ttl_and_counts_its_bytes() -> Result<()> {
+    let temp = TempDir::new()?;
+    let id = SandboxId::new();
+    let path = quarantined(
+        temp.path(),
+        id,
+        SystemTime::now() - QUARANTINE_TTL - Duration::from_secs(60),
+    );
+
+    let report = sweep(
+        &subject(temp.path(), Vec::new()),
+        Some(&cluster(&[])),
+        ReapMode::Enforce,
+        SystemTime::now(),
+    )
+    .await?;
+
+    assert_eq!(
+        verdicts(&report),
+        vec![&ArtifactVerdict::QuarantineRemoved {
+            sandbox_id: id,
+            bytes: 4096
+        }],
+        "the only verdict is the quarantine deletion, carrying the id and the bytes"
+    );
+    assert_eq!(report.quarantine_expired, 0);
+    assert_eq!(report.quarantine_removed, 1);
+    assert_eq!(report.reclaimed_bytes, 4096);
+    assert!(!path.exists(), "an expired quarantined generation is gone");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_quarantined_generation_inside_the_ttl_stays() -> Result<()> {
+    let temp = TempDir::new()?;
+    let id = SandboxId::new();
+    let path = quarantined(
+        temp.path(),
+        id,
+        SystemTime::now() - QUARANTINE_TTL + Duration::from_secs(60),
+    );
+
+    let report = sweep(
+        &subject(temp.path(), Vec::new()),
+        Some(&cluster(&[])),
+        ReapMode::Enforce,
+        SystemTime::now(),
+    )
+    .await?;
+
+    assert!(report.verdicts.is_empty(), "the TTL has not elapsed yet");
+    assert_eq!(report.quarantine_removed, 0);
+    assert!(
+        path.join("vm_state.bin").is_file(),
+        "the quarantined bytes must survive until the TTL"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn report_mode_counts_quarantined_expiry_and_deletes_nothing() -> Result<()> {
+    let temp = TempDir::new()?;
+    let id = SandboxId::new();
+    let path = quarantined(
+        temp.path(),
+        id,
+        SystemTime::now() - QUARANTINE_TTL - Duration::from_secs(60),
+    );
+
+    let report = sweep(
+        &subject(temp.path(), Vec::new()),
+        Some(&cluster(&[])),
+        ReapMode::Report,
+        SystemTime::now(),
+    )
+    .await?;
+
+    assert_eq!(
+        verdicts(&report),
+        vec![&ArtifactVerdict::QuarantineExpired {
+            sandbox_id: id,
+            bytes: 4096
+        }],
+        "report mode still names what it would delete"
+    );
+    assert_eq!(report.quarantine_expired, 1);
+    assert_eq!(report.quarantine_removed, 0);
+    assert_eq!(report.reclaimed_bytes, 0);
+    assert!(path.is_dir(), "report mode must delete nothing");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cluster_error_deletes_no_quarantined_generation() -> Result<()> {
+    let temp = TempDir::new()?;
+    let id = SandboxId::new();
+    let path = quarantined(
+        temp.path(),
+        id,
+        SystemTime::now() - QUARANTINE_TTL - Duration::from_secs(60),
+    );
+
+    let report = sweep(
+        &subject(temp.path(), Vec::new()),
+        Some(&FailingCluster),
+        ReapMode::Enforce,
+        SystemTime::now(),
+    )
+    .await?;
+
+    assert_eq!(
+        (report.quarantine_expired, report.quarantine_removed),
+        (1, 0),
+        "a downgraded pass reports the expired generation and deletes nothing"
+    );
+    assert!(path.is_dir(), "the quarantined bytes must survive");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_quarantine_epoch_with_a_malformed_name_is_skipped() -> Result<()> {
+    let temp = TempDir::new()?;
+    let id = SandboxId::new();
+    let epoch = temp.path().join(QUARANTINE_DIR).join("not-an-epoch");
+    std::fs::create_dir_all(epoch.join(id.to_string()))?;
+
+    let report = sweep(
+        &subject(temp.path(), Vec::new()),
+        Some(&cluster(&[])),
+        ReapMode::Enforce,
+        SystemTime::now(),
+    )
+    .await?;
+
+    assert_eq!(
+        verdicts(&report),
+        vec![&ArtifactVerdict::Skipped {
+            name: "not-an-epoch".to_string(),
+            reason: SkipReason::InvalidName
+        }],
+        "an epoch name that does not parse is reported, never interpreted"
+    );
+    assert!(epoch.is_dir(), "nothing is deleted on a skipped epoch");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_quarantined_symlink_is_skipped_and_its_target_survives() -> Result<()> {
+    let temp = TempDir::new()?;
+    let id = SandboxId::new();
+    // The target lives outside the artifacts root: if the pass ever followed
+    // the link it would find a name that is not a sandbox id.
+    let target = TempDir::new()?;
+    std::fs::write(target.path().join("keep"), b"keep")?;
+    let epoch = temp.path().join(QUARANTINE_DIR).join(
+        epoch_seconds(SystemTime::now() - QUARANTINE_TTL - Duration::from_secs(60)).to_string(),
+    );
+    std::fs::create_dir_all(&epoch)?;
+    std::os::unix::fs::symlink(target.path(), epoch.join(id.to_string()))?;
+
+    let report = sweep(
+        &subject(temp.path(), Vec::new()),
+        Some(&cluster(&[])),
+        ReapMode::Enforce,
+        SystemTime::now(),
+    )
+    .await?;
+
+    assert_eq!(
+        verdicts(&report),
+        vec![&ArtifactVerdict::Skipped {
+            name: id.to_string(),
+            reason: SkipReason::Symlink
+        }],
+        "a symlink is never followed, so it is never deleted through"
+    );
+    assert!(
+        target.path().join("keep").is_file(),
+        "the target must survive"
+    );
+    assert!(epoch.join(id.to_string()).is_symlink());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_quarantine_directory_is_never_a_sandbox_dir_in_the_entry_phase() -> Result<()> {
+    let temp = TempDir::new()?;
+    std::fs::create_dir_all(temp.path().join(QUARANTINE_DIR))?;
+    age(
+        &temp.path().join(QUARANTINE_DIR),
+        ARTIFACT_GRACE + Duration::from_secs(3600),
+    );
+
+    let report = sweep(
+        &subject(temp.path(), Vec::new()),
+        Some(&cluster(&[])),
+        ReapMode::Enforce,
+        SystemTime::now(),
+    )
+    .await?;
+
+    assert!(
+        !report.verdicts.iter().any(|verdict| matches!(
+            verdict,
+            ArtifactVerdict::Skipped { name, .. } if name == QUARANTINE_DIR
+        )),
+        "the quarantine is the pass's own directory, not an invalid sandbox name: {:?}",
+        report.verdicts
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Report mode and fail-closed.
 // ---------------------------------------------------------------------------
 

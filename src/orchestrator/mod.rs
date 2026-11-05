@@ -16,6 +16,9 @@ pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
     SandboxPersistenceError, SandboxPersister,
 };
+// Shared so the periodic reaper skips and expires exactly the directory the
+// boot path writes.
+pub(crate) use persistence::{QUARANTINE_DIR, QUARANTINE_TTL};
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use resize::{NodeCapacity, ResizePolicy, ResourceRequest};
 pub use service::{MemoryLimitState, Orchestrator, SandboxResourceStatus};
