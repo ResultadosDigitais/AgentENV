@@ -820,6 +820,57 @@ mod tests {
         }
     }
 
+    /// Stands in for a node that holds the runtime artifacts of some paused
+    /// sandboxes and not others: decode succeeds only for the artifact roots
+    /// this node was given and fails the way the real factory fails when the
+    /// runtime is elsewhere.
+    ///
+    /// [`MockBackendFactory`] cannot express that: it decodes every payload
+    /// into [`MockSnapshot`], so a record is never unavailable under it.
+    struct PartialRuntimeFactory {
+        decodable_roots: Vec<PathBuf>,
+    }
+
+    impl SandboxBackendFactory for PartialRuntimeFactory {
+        fn build(
+            &self,
+            _build_spec: FreshSandboxBuildSpec,
+            _launch_config: SandboxLaunchConfig,
+        ) -> Result<Box<dyn SandboxBackend>> {
+            unreachable!("persister tests only decode state")
+        }
+
+        fn build_from_snapshot(
+            &self,
+            _snapshot: &RunnableSnapshot,
+            _launch_config: SandboxLaunchConfig,
+        ) -> Result<Box<dyn SandboxBackend>> {
+            unreachable!("persister tests only decode state")
+        }
+
+        fn build_from_paused_state(
+            &self,
+            _sandbox_id: SandboxId,
+            _state: &dyn PausedSandboxState,
+            _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
+        ) -> Result<Box<dyn SandboxBackend>> {
+            unreachable!("persister tests only decode state")
+        }
+
+        fn decode_paused_state(
+            &self,
+            artifact_root: PathBuf,
+            _state: Value,
+        ) -> Result<Arc<dyn PausedSandboxState>> {
+            anyhow::ensure!(
+                self.decodable_roots.contains(&artifact_root),
+                "runtime state is not available on this node: {}",
+                artifact_root.display()
+            );
+            Ok(Arc::new(MockSnapshot))
+        }
+    }
+
     fn paused_state(root: &Path) -> Arc<dyn PausedSandboxState> {
         std::fs::create_dir_all(root).expect("create test artifact root");
         Arc::new(MockSnapshot)
@@ -1582,17 +1633,36 @@ mod tests {
             .put(corrupt_id.to_string(), b"not-json")
             .await?;
 
-        let mut loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        // Only the loaded record's runtime is on this node, which is the whole
+        // point of the test: with a factory that decodes everything, the
+        // unavailable record would load and the assertion below would pass
+        // without ever exercising the retention path.
+        let factory = PartialRuntimeFactory {
+            decodable_roots: vec![loaded_root.clone()],
+        };
+        let mut loaded = persister.load_all(&factory).await?;
         loaded.sort_by_key(|metadata| metadata.id);
 
         assert_eq!(loaded.len(), 2, "loaded and retained records stay listed");
-        assert!(loaded.iter().any(|metadata| metadata.id == loaded_id));
+
+        let decoded = loaded
+            .iter()
+            .find(|metadata| metadata.id == loaded_id)
+            .expect("the decodable record stays listed");
+        assert!(
+            decoded.paused_state.is_some(),
+            "a record whose runtime state decodes must carry it, so the two outcomes are distinguishable"
+        );
 
         let unavailable = loaded
             .iter()
             .find(|metadata| metadata.id == unavailable_id)
             .expect("the unavailable record stays listed");
-        assert!(unavailable.paused_state.is_none());
+        assert_eq!(unavailable.state, SandboxState::Paused);
+        assert!(
+            unavailable.paused_state.is_none(),
+            "a record without decodable runtime state must not advertise one"
+        );
 
         assert!(!has_record(&persister, &corrupt_id).await?);
         assert!(has_record(&persister, &unavailable_id).await?);
