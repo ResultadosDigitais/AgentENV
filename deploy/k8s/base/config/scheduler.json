@@ -12,6 +12,10 @@
         "port": 8000,
         "scheme": "http"
       }
+    },
+    "node_resource_limit": {
+      "max_disk_used_percent": 75,
+      "disk_mount_point": "/workspace"
     }
   }
 }

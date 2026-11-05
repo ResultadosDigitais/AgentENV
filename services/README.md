@@ -138,6 +138,8 @@ All fields are optional. Omitting a field (or setting the whole block to `null`)
 | `max_memory_allocated_percent` | uint32 | Maximum allocated-memory-to-physical-memory ratio; can exceed 100 when overcommit is allowed |
 | `admission_mode` | string | `nominal` (default), `request` or `shadow`; see "Memory admission modes" below |
 | `max_memory_limit_overcommit_ratio` | float | In `request`/`shadow` mode: cap on (sum of nominal VM sizes) / node memory. Default `1.5`; ignored in `nominal` |
+| `max_disk_used_percent` | uint32 | Maximum used percentage of the filesystem at `disk_mount_point` (0–100). Always effective: unlike the memory limits it does not take part in `admission_mode` |
+| `disk_mount_point` | string | Mount point of the heartbeat disk metric the disk limit reads, matched exactly. Default `/workspace`; only used when `max_disk_used_percent` is set |
 
 Example:
 
@@ -148,9 +150,13 @@ Example:
   "max_cpu_used_percent": 90,
   "max_cpu_allocated_percent": 150,
   "max_memory_used_percent": 85,
-  "max_memory_allocated_percent": 150
+  "max_memory_allocated_percent": 150,
+  "max_disk_used_percent": 75,
+  "disk_mount_point": "/workspace"
 }
 ```
+
+The disk limit reads the real used/total ratio of one mount point and rejects the node when it is strictly above the limit. A heartbeat that does not carry that mount (an older agent) is admitted — fail-open — and counted in `agentenv_scheduler_disk_admission_total{outcome="mount_missing"}`, so an inert limit is visible instead of silent. Pausing a sandbox writes a chain of roughly one VM's worth of state to this filesystem, so the limit protects the next pause, not only the current usage.
 
 ### Memory admission modes
 

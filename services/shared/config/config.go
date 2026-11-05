@@ -65,6 +65,17 @@ type NodeResourceLimit struct {
 	// that the default behavior is unchanged.
 	MaxMemoryLimitOvercommitRatio *float64 `json:"max_memory_limit_overcommit_ratio"`
 
+	// MaxDiskUsedPercent caps the real filesystem usage of DiskMountPoint.
+	// It is a usage ratio, so unlike the allocated limits it can never
+	// legitimately exceed 100. The check runs in every admission mode;
+	// Pausing a sandbox writes a chain of about one VM's worth of state to
+	// this filesystem, so a node near full loses VMs when a pause fails.
+	MaxDiskUsedPercent *uint32 `json:"max_disk_used_percent"`
+	// DiskMountPoint selects the heartbeat disk entry the disk limit reads,
+	// matched exactly against DiskMetric.mount_point. Defaults to
+	// DefaultDiskMountPoint when absent.
+	DiskMountPoint *string `json:"disk_mount_point"`
+
 	// Limits that apply to the sum of the active running set plus paused
 	// sandboxes. Paused sandboxes have released their VM-side CPU / memory
 	// but still occupy persisted state on the node, so operators may want a
@@ -84,6 +95,11 @@ const (
 	// DefaultMaxMemoryLimitOvercommitRatio applies when
 	// MaxMemoryLimitOvercommitRatio is unset.
 	DefaultMaxMemoryLimitOvercommitRatio = 1.5
+
+	// DefaultDiskMountPoint is the filesystem the disk limit reads when
+	// disk_mount_point is unset. Sandbox state, persisted paused sandboxes and
+	// the image cache all live on the node's /workspace volume.
+	DefaultDiskMountPoint = "/workspace"
 )
 
 // ResolvedAdmissionMode returns the configured mode, defaulting to nominal.
@@ -109,7 +125,17 @@ func (l *NodeResourceLimit) ResolvedMaxMemoryLimitOvercommitRatio() float64 {
 	return *l.MaxMemoryLimitOvercommitRatio
 }
 
-// Validate rejects unknown admission modes and non-positive ratios.
+// ResolvedDiskMountPoint returns the mount point the disk limit reads,
+// defaulting to DefaultDiskMountPoint when it is unset or blank.
+func (l *NodeResourceLimit) ResolvedDiskMountPoint() string {
+	if l == nil || l.DiskMountPoint == nil || strings.TrimSpace(*l.DiskMountPoint) == "" {
+		return DefaultDiskMountPoint
+	}
+	return strings.TrimSpace(*l.DiskMountPoint)
+}
+
+// Validate rejects unknown admission modes, non-positive ratios and disk
+// percentages above 100.
 func (l *NodeResourceLimit) Validate() error {
 	if l == nil {
 		return nil
@@ -123,6 +149,9 @@ func (l *NodeResourceLimit) Validate() error {
 	}
 	if l.MaxMemoryLimitOvercommitRatio != nil && !(*l.MaxMemoryLimitOvercommitRatio > 0) {
 		return errors.New("scheduler.node_resource_limit.max_memory_limit_overcommit_ratio must be greater than zero")
+	}
+	if l.MaxDiskUsedPercent != nil && *l.MaxDiskUsedPercent > 100 {
+		return fmt.Errorf("scheduler.node_resource_limit.max_disk_used_percent must be at most 100, got %d", *l.MaxDiskUsedPercent)
 	}
 	return nil
 }

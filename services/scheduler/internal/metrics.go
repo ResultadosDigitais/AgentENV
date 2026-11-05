@@ -44,6 +44,13 @@ var (
 		},
 		[]string{"outcome"},
 	)
+	schedulerDiskAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_disk_admission_total",
+			Help: "Per-node disk admission outcomes by outcome (within_limit, over_limit, mount_missing). Counted once per node with a heartbeat.",
+		},
+		[]string{"outcome"},
+	)
 	schedulerObservedNodes = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "agentenv_scheduler_observed_nodes",
