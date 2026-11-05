@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,23 @@ const RECORD_DB_DIR: &str = "records.db";
 /// Allocation unit reported by `st_blocks`, matching the chain measurement in
 /// `sandbox::firecracker::overlaybd_snapshot`.
 const ALLOCATION_BLOCK_SIZE: u64 = 512;
+
+/// The directory, inside the artifacts root, that holds a generation boot found
+/// without a record.
+///
+/// It is crate-visible so the reaper and the boot path cannot drift on the
+/// name: the boot path writes here and the reaper must skip and expire exactly
+/// this directory.
+pub(crate) const QUARANTINE_DIR: &str = ".quarantine";
+
+/// How long a quarantined generation is kept before the reaper may delete it.
+///
+/// A constant, not a config key, for the same reason as `ARTIFACT_GRACE` and
+/// `TRASH_GRACE`: an operator turning enforce on is the explicit decision, and
+/// the window only has to outlive the longest investigation that could still
+/// find the record. It is enforced by the reaper in enforce mode only; the boot
+/// path never deletes.
+pub(crate) const QUARANTINE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Graceful-shutdown state, handed to a persister instead of read from a
 /// process-wide static.
@@ -86,6 +104,10 @@ enum LoadOutcome {
     /// for it (incompatible virtualization mode). It stays listed as `Paused`
     /// and its artifacts are kept.
     RetainedWithoutRuntimeState,
+    /// The artifacts of a sandbox no record on this node names. They are moved
+    /// to `artifacts/.quarantine/{epoch}/` and kept: the record may be on
+    /// another node, lost in an eviction, or never written.
+    QuarantinedNoRecord,
     /// The record or its artifacts cannot be used by this node. It is deleted.
     Discarded,
 }
@@ -95,6 +117,7 @@ impl LoadOutcome {
         match self {
             Self::LoadedFromLocal => "loaded_from_local",
             Self::RetainedWithoutRuntimeState => "retained_unreachable",
+            Self::QuarantinedNoRecord => "quarantined_no_record",
             Self::Discarded => "discarded",
         }
     }
@@ -118,7 +141,12 @@ impl LoadOutcome {
 struct LoadOutcomes {
     loaded_from_local: usize,
     retained_unreachable: usize,
+    quarantined: usize,
     discarded: usize,
+    /// Generations the boot path could not move to quarantine. They stay where
+    /// they are, so this is a warning field, never a loss: nothing is deleted
+    /// on that branch.
+    quarantine_failed: usize,
 }
 
 impl LoadOutcomes {
@@ -127,6 +155,7 @@ impl LoadOutcomes {
         match outcome {
             LoadOutcome::LoadedFromLocal => self.loaded_from_local += 1,
             LoadOutcome::RetainedWithoutRuntimeState => self.retained_unreachable += 1,
+            LoadOutcome::QuarantinedNoRecord => self.quarantined += 1,
             LoadOutcome::Discarded => self.discarded += 1,
         }
     }
@@ -520,9 +549,26 @@ impl FileBackedSandboxPersister {
         );
     }
 
+    /// Moves, and never deletes, every generation no retained record names.
+    ///
+    /// A directory under `artifacts/{sandbox_id}` with no record is not proof
+    /// that the sandbox is gone: the record can be on another node, lost when a
+    /// pod was evicted between `allocate_artifact_root` and `persist_paused`,
+    /// or discarded by an earlier boot while the bytes stayed. The old branch
+    /// deleted it, which is what turned a recreated pod on the same node into
+    /// permanent loss. The generation is renamed to
+    /// `artifacts/.quarantine/{epoch}/{sandbox_id}` instead, where it keeps its
+    /// bytes and only an explicit decision (the reaper's TTL in enforce mode, or
+    /// a control-plane delete) removes it.
+    ///
+    /// A rename that fails logs the id and both paths and is counted; startup
+    /// must not be blocked by one unreadable entry, and this branch contains no
+    /// reachable delete.
     async fn cleanup_orphan_artifacts(
         &self,
         retained_sandbox_ids: &HashSet<SandboxId>,
+        now: SystemTime,
+        outcomes: &mut LoadOutcomes,
     ) -> PersistenceResult<()> {
         let artifacts_root = self.root.join("artifacts");
         let mut entries = match fs::read_dir(&artifacts_root).await {
@@ -551,6 +597,9 @@ impl FileBackedSandboxPersister {
                 continue;
             }
 
+            // The quarantine and trash directories are never sandbox ids; their
+            // names do not parse as one, so this check is also what keeps the
+            // sweep from renaming its own destination.
             let Some(sandbox_id) = entry
                 .file_name()
                 .to_str()
@@ -559,18 +608,126 @@ impl FileBackedSandboxPersister {
                 continue;
             };
 
-            if !retained_sandbox_ids.contains(&sandbox_id) {
-                info!(
-                    sandbox_id = %sandbox_id,
-                    artifacts = %entry.path().display(),
-                    "removing orphaned paused sandbox artifacts"
-                );
-                Self::remove_artifact_root(&entry.path()).await?;
+            if retained_sandbox_ids.contains(&sandbox_id) {
+                continue;
+            }
+
+            let from = entry.path();
+            let destination = self
+                .root
+                .join("artifacts")
+                .join(QUARANTINE_DIR)
+                .join(epoch_seconds(now).to_string())
+                .join(sandbox_id.to_string());
+            match Self::quarantine_artifacts(&from, &destination).await {
+                Ok(()) => {
+                    outcomes.observe(LoadOutcome::QuarantinedNoRecord);
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        from = %from.display(),
+                        to = %destination.display(),
+                        reason = "no_record",
+                        "quarantined paused sandbox artifacts whose record this node does not have"
+                    );
+                }
+                Err(error) => {
+                    // Nothing is deleted on failure: the generation stays in
+                    // `artifacts/`, and the next boot retries the move.
+                    outcomes.quarantine_failed += 1;
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        from = %from.display(),
+                        to = %destination.display(),
+                        error = %error,
+                        "failed to quarantine paused sandbox artifacts whose record this node does not have"
+                    );
+                }
             }
         }
 
         Ok(())
     }
+
+    /// Renames one generation directory into the quarantine, creating the epoch
+    /// parent first. A rename, never a copy: a generation is multi-GiB and boot
+    /// must not walk it.
+    async fn quarantine_artifacts(from: &Path, destination: &Path) -> PersistenceResult<()> {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await.map_err(|source| {
+                SandboxPersistenceError::io(
+                    "create paused sandbox artifact quarantine",
+                    parent,
+                    source,
+                )
+            })?;
+        }
+        fs::rename(from, destination).await.map_err(|source| {
+            SandboxPersistenceError::io("quarantine paused sandbox artifacts", from, source)
+        })
+    }
+
+    /// Removes a control-plane-deleted sandbox's artifacts from the quarantine.
+    ///
+    /// A sandbox deleted while its generation sat in quarantine has no record
+    /// and no `artifacts/{id}` directory, so without this the bytes would wait
+    /// for the TTL even though the delete was explicit. Everything not
+    /// quarantined keeps the existing behavior.
+    async fn remove_quarantined_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        let quarantine_root = self.root.join("artifacts").join(QUARANTINE_DIR);
+        let mut epochs = match fs::read_dir(&quarantine_root).await {
+            Ok(epochs) => epochs,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "read paused sandbox quarantine",
+                    &quarantine_root,
+                    source,
+                ));
+            }
+        };
+        while let Some(epoch) = epochs.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan paused sandbox quarantine", &quarantine_root, source)
+        })? {
+            let metadata = match fs::symlink_metadata(epoch.path()).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "inspect paused sandbox quarantine",
+                        epoch.path(),
+                        source,
+                    ));
+                }
+            };
+            // Only a real epoch directory is inspected; a symlink is never
+            // followed, and a regular file is not a quarantine layout.
+            if !metadata.is_dir() {
+                continue;
+            }
+            let candidate = epoch.path().join(sandbox_id.to_string());
+            match fs::symlink_metadata(&candidate).await {
+                Ok(metadata) if metadata.is_dir() => {
+                    Self::remove_artifact_root(&candidate).await?;
+                }
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "inspect quarantined paused sandbox artifacts",
+                        &candidate,
+                        source,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn epoch_seconds(now: SystemTime) -> u64 {
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -639,7 +796,8 @@ impl SandboxPersister for FileBackedSandboxPersister {
             }
         }
 
-        self.cleanup_orphan_artifacts(&retained_artifacts).await?;
+        self.cleanup_orphan_artifacts(&retained_artifacts, SystemTime::now(), &mut outcomes)
+            .await?;
 
         info!(
             loaded = sandboxes.len(),
@@ -647,6 +805,8 @@ impl SandboxPersister for FileBackedSandboxPersister {
             loaded_from_local = outcomes.loaded_from_local,
             retained_unreachable = outcomes.retained_unreachable,
             discarded = outcomes.discarded,
+            quarantined = outcomes.quarantined,
+            quarantine_failed = outcomes.quarantine_failed,
             "loaded paused sandbox records"
         );
 
@@ -747,6 +907,9 @@ impl SandboxPersister for FileBackedSandboxPersister {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
         self.remove_record(sandbox_id).await?;
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
+        // A control-plane delete is the explicit decision the quarantine waits
+        // for; without this the bytes would sit there until the TTL.
+        self.remove_quarantined_artifacts(sandbox_id).await?;
         Ok(())
     }
 
@@ -897,6 +1060,30 @@ mod tests {
             .persist_paused(&metadata, Some(snapshot_root), paused_state.as_ref())
             .await?;
         Ok((sandbox_id, paused_state))
+    }
+
+    /// Persists one paused record whose artifact root is a real generation
+    /// directory under `artifacts/{sandbox_id}/`, as a pause leaves it.
+    async fn persist_test_record_with_generation(
+        persister: &FileBackedSandboxPersister,
+        sandbox_id: SandboxId,
+    ) -> anyhow::Result<SandboxId> {
+        let artifact_root = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("allocate artifact root");
+        std::fs::write(artifact_root.join("vm_state.bin"), b"generation bytes")?;
+        let paused_state = paused_state(&artifact_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            virtualization_mode: persister.virtualization_mode,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+            .await?;
+        Ok(sandbox_id)
     }
 
     async fn has_record(
@@ -1440,8 +1627,102 @@ mod tests {
         Ok(())
     }
 
+    /// Every `artifacts/.quarantine/{epoch}/{sandbox_id}` directory for one id,
+    /// sorted. The epoch is the boot's clock, so the test must not compute it.
+    fn quarantined_dirs(artifacts_root: &Path, sandbox_id: &SandboxId) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(artifacts_root.join(QUARANTINE_DIR))
+            .map(|epochs| {
+                epochs
+                    .map(|epoch| epoch.expect("read quarantine epoch").path())
+                    .filter(|epoch| epoch.is_dir())
+                    .map(|epoch| epoch.join(sandbox_id.to_string()))
+                    .filter(|dir| dir.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        dirs.sort();
+        dirs
+    }
+
+    /// A boot over a root with generations no record names must keep them.
+    ///
+    /// This is the card's reproduction at persister level, with no VM: the
+    /// records a clean shutdown wrote, five artifact generations written
+    /// without a record (what a SIGKILL between `allocate_artifact_root` and
+    /// `persist_paused` leaves, and also what a resumed sandbox's last
+    /// generation looks like), and a new persister over the same root standing
+    /// in for the pod recreated on the same node. The old branch deleted the
+    /// five; it must quarantine them instead.
     #[tokio::test]
-    async fn load_all_removes_orphan_artifacts_without_records() -> anyhow::Result<()> {
+    async fn restarted_node_quarantines_generations_whose_record_never_existed(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        // Sync durability so the records survive dropping and reopening the
+        // store, which is what the pod restart does.
+        let persister = test_persister(&root).with_durability(LocalStoreDurability::Sync);
+        let mut recorded_ids = Vec::new();
+        for _ in 0..3 {
+            recorded_ids
+                .push(persist_test_record_with_generation(&persister, SandboxId::new()).await?);
+        }
+
+        let artifacts_root = root.join("artifacts");
+        let mut unrecorded_ids = Vec::new();
+        for _ in 0..5 {
+            let sandbox_id = SandboxId::new();
+            let generation = artifacts_root
+                .join(sandbox_id.to_string())
+                .join("generation-without-record");
+            tokio::fs::create_dir_all(&generation).await?;
+            tokio::fs::write(generation.join("vm_state.bin"), b"generation bytes").await?;
+            unrecorded_ids.push(sandbox_id);
+        }
+        drop(persister);
+
+        // The pod comes back on the same node: same root, new process.
+        let restarted = test_persister(&root).with_durability(LocalStoreDurability::Sync);
+        let mut loaded = restarted.load_all(&MockBackendFactory::new()).await?;
+        loaded.sort_by_key(|metadata| metadata.id);
+
+        assert_eq!(loaded.len(), 3, "the three records must still load");
+        for recorded_id in &recorded_ids {
+            assert!(
+                artifacts_root.join(recorded_id.to_string()).is_dir(),
+                "a loaded record keeps its artifacts in place"
+            );
+            assert!(
+                quarantined_dirs(&artifacts_root, recorded_id).is_empty(),
+                "a loaded record is never quarantined"
+            );
+        }
+        for unrecorded_id in &unrecorded_ids {
+            assert!(
+                !artifacts_root.join(unrecorded_id.to_string()).exists(),
+                "the generation must leave artifacts/{{id}}"
+            );
+            let quarantined = quarantined_dirs(&artifacts_root, unrecorded_id);
+            assert_eq!(
+                quarantined.len(),
+                1,
+                "the generation must be under artifacts/.quarantine/{{epoch}}/{{id}}"
+            );
+            assert_eq!(
+                std::fs::read(quarantined[0].join("generation-without-record/vm_state.bin"))?,
+                b"generation bytes",
+                "the bytes must survive the move: this is the loss the card reports"
+            );
+        }
+        Ok(())
+    }
+
+    /// The previous behavior, now deliberately inverted: a generation with no
+    /// record is moved to the quarantine, never deleted.
+    ///
+    /// This replaces `load_all_removes_orphan_artifacts_without_records`, and
+    /// the rename is the signal that the deletion branch is gone.
+    #[tokio::test]
+    async fn load_all_quarantines_orphan_artifacts() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -1449,11 +1730,124 @@ mod tests {
             .sandbox_artifact_root(&sandbox_id)
             .join("resumed-generation");
         tokio::fs::create_dir_all(&artifact_root).await?;
+        tokio::fs::write(artifact_root.join("vm_state.bin"), b"generation bytes").await?;
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
-        assert!(loaded.is_empty());
-        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+        assert!(loaded.is_empty(), "no record means nothing is listed");
+        assert!(
+            !persister.sandbox_artifact_root(&sandbox_id).exists(),
+            "the generation must leave artifacts/{{id}}"
+        );
+        let quarantined = quarantined_dirs(&temp.path().join("artifacts"), &sandbox_id);
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the generation must be under artifacts/.quarantine/{{epoch}}/{{id}}"
+        );
+        assert_eq!(
+            std::fs::read(quarantined[0].join("resumed-generation/vm_state.bin"))?,
+            b"generation bytes",
+            "quarantine preserves the bytes; deletion is what the card forbids"
+        );
+        Ok(())
+    }
+
+    /// A control-plane delete is the explicit decision: it must clear a
+    /// generation that is already quarantined, not leave it for the TTL.
+    #[tokio::test]
+    async fn delete_record_and_artifacts_removes_a_quarantined_generation() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let quarantined = temp
+            .path()
+            .join("artifacts")
+            .join(QUARANTINE_DIR)
+            .join(epoch_seconds(std::time::SystemTime::now()).to_string())
+            .join(sandbox_id.to_string());
+        tokio::fs::create_dir_all(quarantined.join("generation")).await?;
+
+        persister.delete_record_and_artifacts(&sandbox_id).await?;
+
+        assert!(
+            !quarantined.exists(),
+            "an explicit delete must not leave the bytes for the TTL"
+        );
+        Ok(())
+    }
+
+    /// One entry that cannot be moved must not abort the boot: it stays where it
+    /// is, the pass counts it, and the caller still gets its records.
+    #[tokio::test]
+    async fn a_quarantine_rename_failure_keeps_the_directory_and_does_not_abort_boot(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let artifacts_root = temp.path().join("artifacts");
+        let sandbox_id = SandboxId::new();
+        let generation = artifacts_root
+            .join(sandbox_id.to_string())
+            .join("generation");
+        tokio::fs::create_dir_all(&generation).await?;
+
+        // The epoch directory is computed from the injected clock, so the test
+        // can make the destination a non-empty directory: a rename onto it
+        // fails with ENOTEMPTY, exactly the collision two boots quarantining
+        // the same id into the same epoch would hit.
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let blocked = artifacts_root
+            .join(QUARANTINE_DIR)
+            .join(epoch_seconds(now).to_string())
+            .join(sandbox_id.to_string());
+        tokio::fs::create_dir_all(&blocked).await?;
+        tokio::fs::write(blocked.join("occupied"), b"occupied").await?;
+
+        let mut outcomes = LoadOutcomes::default();
+        persister
+            .cleanup_orphan_artifacts(&HashSet::new(), now, &mut outcomes)
+            .await?;
+
+        assert_eq!(outcomes.quarantine_failed, 1);
+        assert_eq!(outcomes.quarantined, 0);
+        assert!(
+            generation.is_dir(),
+            "a failed move must leave the generation in place, never delete it"
+        );
+        assert!(
+            blocked.join("occupied").is_file(),
+            "the existing epoch entry must not be clobbered"
+        );
+        Ok(())
+    }
+
+    /// The quarantine directory is the boot path's own destination, never a
+    /// sandbox id, and a generation moved this boot is not moved again.
+    #[tokio::test]
+    async fn a_second_boot_does_not_move_the_quarantine_directory_itself() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let generation = persister
+            .sandbox_artifact_root(&sandbox_id)
+            .join("generation");
+        tokio::fs::create_dir_all(&generation).await?;
+
+        persister.load_all(&MockBackendFactory::new()).await?;
+        let quarantined = quarantined_dirs(&temp.path().join("artifacts"), &sandbox_id);
+        assert_eq!(quarantined.len(), 1);
+        // The first process is gone before the second starts: RocksDB's lock is
+        // process-scoped, and the restart is what the test reproduces.
+        drop(persister);
+
+        let second = test_persister(temp.path());
+        second.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(
+            quarantined_dirs(&temp.path().join("artifacts"), &sandbox_id),
+            quarantined,
+            "a second boot must leave the quarantined generation exactly where it is"
+        );
         Ok(())
     }
 
@@ -1675,6 +2069,7 @@ mod tests {
         let labels = [
             LoadOutcome::LoadedFromLocal.as_str(),
             LoadOutcome::RetainedWithoutRuntimeState.as_str(),
+            LoadOutcome::QuarantinedNoRecord.as_str(),
             LoadOutcome::Discarded.as_str(),
         ];
 

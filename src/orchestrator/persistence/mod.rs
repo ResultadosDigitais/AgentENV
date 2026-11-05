@@ -12,6 +12,7 @@ use crate::types::SandboxId;
 
 pub(crate) use file_backed::begin_graceful_shutdown;
 pub use file_backed::FileBackedSandboxPersister;
+pub(crate) use file_backed::{QUARANTINE_DIR, QUARANTINE_TTL};
 #[cfg(test)]
 pub(crate) use mock::{RecordingCall, RecordingPersister};
 

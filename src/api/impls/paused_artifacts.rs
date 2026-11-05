@@ -69,7 +69,8 @@ impl ApiImpl {
     ///
     /// The task holds a `Weak` handle so a shutting-down server is not kept
     /// alive by it, and it waits one interval before the first pass: the boot
-    /// sweep inside `load_all` has already reclaimed the records it could see.
+    /// sweep inside `load_all` has already classified the artifact directories
+    /// it could see, quarantining every generation no record names.
     pub fn start_paused_artifact_reap(
         self: &Arc<Self>,
         mode: PausedArtifactReapMode,
