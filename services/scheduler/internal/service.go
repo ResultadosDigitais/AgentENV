@@ -93,13 +93,24 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		})
 	}
 
-	eligible := FilterByResourceLimitObserved(rich, s.resourceLimit, func(nodeID string, nominal, request bool, detail string) {
+	eligible := FilterByResourceLimitRejected(rich, s.resourceLimit, func(nodeID string, nominal, request bool, detail string) {
 		s.logger.Info("admission shadow divergence",
 			zap.String("node_id", nodeID),
 			zap.Bool("nominal_admits", nominal),
 			zap.Bool("request_admits", request),
 			zap.String("detail", detail),
 		)
+	}, func(nodeID string, violation LimitViolation) {
+		fields := []zap.Field{
+			zap.String("node_id", nodeID),
+			zap.String("limit", violation.Limit),
+			zap.String("observed", violation.Observed),
+			zap.String("threshold", violation.Threshold),
+		}
+		if violation.Detail != "" {
+			fields = append(fields, zap.String("detail", violation.Detail))
+		}
+		s.logger.Info("scheduler rejected node by resource limit", fields...)
 	})
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
