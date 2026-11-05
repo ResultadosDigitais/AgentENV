@@ -3,18 +3,31 @@
 //! A paused sandbox stores its Firecracker artifacts under
 //! `<persisted_sandbox_store_path>/artifacts/{sandbox_id}/{generation}/`. Every
 //! path that removes that directory requires the runtime to still know the
-//! sandbox: the explicit delete removes it, and `load_all` removes it for a
-//! record it discards at boot. Two cases leave the directory behind for good:
+//! sandbox: only the explicit delete removes it, and boot no longer deletes one
+//! at all — a generation no record names is moved to
+//! `artifacts/.quarantine/{epoch}/` instead. A directory still ends up
+//! unreachable when:
 //!
 //! - the delete answered `404` because the runtime had already forgotten the
 //!   sandbox, and the caller treated the `404` as a completed destroy;
 //! - the record disappeared (an invalid record discarded by `load_all`, or a
 //!   crash between `allocate_artifact_root` and `persist_paused`) and the
-//!   directory stayed.
+//!   directory stayed;
+//! - a pause succeeded, the sandbox resumed, and the resumed sandbox's record
+//!   was deleted while its last generation stayed on the SSD.
 //!
 //! [`sweep`] is the periodic pass that reclaims them. It lives in `maintenance`
 //! rather than next to the persister because it needs the cluster's sandbox
 //! list, and `orchestrator` may not import `maintenance`.
+//!
+//! # Three phases
+//!
+//! The pass first classifies every `artifacts/{sandbox_id}` directory, moving a
+//! proven orphan to `artifacts/.trash/{epoch}/`. It then expires two directories
+//! that are never sandbox ids: the trash, after [`TRASH_GRACE`], and the boot
+//! quarantine, after [`QUARANTINE_TTL`]. Neither the boot path nor this pass
+//! deletes a generation on a guess: the trash and the quarantine are the two
+//! explicit decisions, and both are enforced only in enforce mode.
 //!
 //! # What keeps a directory
 //!
@@ -55,6 +68,7 @@ use tokio::fs;
 use tracing::{debug, info, warn};
 
 use super::ClusterSandboxIds;
+use crate::orchestrator::{QUARANTINE_DIR, QUARANTINE_TTL};
 use crate::types::SandboxId;
 
 /// The directory, inside the artifacts root, that holds a moved generation
@@ -131,6 +145,11 @@ pub enum ArtifactVerdict {
     /// A trash entry the pass would have deleted, reported because the pass
     /// could not enforce.
     Expired { sandbox_id: SandboxId, bytes: u64 },
+    /// A quarantined generation older than `QUARANTINE_TTL`: it was deleted.
+    QuarantineRemoved { sandbox_id: SandboxId, bytes: u64 },
+    /// A quarantined generation the pass would have deleted, reported because
+    /// the pass could not enforce.
+    QuarantineExpired { sandbox_id: SandboxId, bytes: u64 },
 }
 
 /// Why a directory was kept.
@@ -199,6 +218,11 @@ pub struct ArtifactSweepReport {
     pub reapable: u64,
     /// Trash entries the pass did not delete because it could not enforce.
     pub expired: u64,
+    /// Quarantined generations older than `QUARANTINE_TTL` the pass saw. In
+    /// enforce mode they are also deleted; in report mode this is only a count.
+    pub quarantine_expired: u64,
+    /// Quarantined generations the pass deleted.
+    pub quarantine_removed: u64,
     /// Bytes a deletion actually freed. Always zero until the deletion phase,
     /// because a rename frees nothing.
     pub reclaimed_bytes: u64,
@@ -310,9 +334,9 @@ pub async fn sweep(
         .with_context(|| format!("scan paused sandbox artifacts at {}", root.display()))?
     {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == TRASH_DIR {
-            // The trash has its own phase below; it is never a sandbox dir, and
-            // its name is never judged as an invalid one.
+        if name == TRASH_DIR || name == QUARANTINE_DIR {
+            // Both have their own phase below; neither is a sandbox dir, and
+            // neither name is ever judged as an invalid one.
             continue;
         }
         let outcome = classify(
@@ -348,6 +372,7 @@ pub async fn sweep(
     }
 
     reap_trash(&root, enforce, now, &mut report).await?;
+    reap_quarantine(&root, enforce, now, &mut report).await?;
     record_pass_metrics(&report);
     info!(
         mode = report.mode.as_str(),
@@ -356,6 +381,8 @@ pub async fn sweep(
         reclaimable_bytes = report.reclaimed_bytes,
         reapable = report.reapable,
         expired = report.expired,
+        quarantine_expired = report.quarantine_expired,
+        quarantine_removed = report.quarantine_removed,
         kept = report
             .verdicts
             .iter()
@@ -465,31 +492,95 @@ async fn classify(
 }
 
 /// Deletes the trash entries whose epoch is older than [`TRASH_GRACE`].
-///
-/// The trash is laid out as `.trash/{epoch}/{sandbox_id}`, so the epoch records
-/// when the move happened and no mtime is needed.
 async fn reap_trash(
     root: &Path,
     enforce: bool,
     now: SystemTime,
     report: &mut ArtifactSweepReport,
 ) -> anyhow::Result<()> {
-    let trash_root = root.join(TRASH_DIR);
-    let mut epochs = match fs::read_dir(&trash_root).await {
+    reap_expired_area(root, ExpiryArea::Trash, enforce, now, report).await
+}
+
+/// Deletes the quarantined generations whose epoch is older than
+/// [`QUARANTINE_TTL`].
+///
+/// The quarantine is where boot puts a generation no record names. It is the one
+/// place a pod swap cannot lose bytes, so it is only emptied here, in enforce
+/// mode, after the TTL: a generation moved by mistake can still be renamed back
+/// to `artifacts/{sandbox_id}` by hand while its record is recoverable.
+async fn reap_quarantine(
+    root: &Path,
+    enforce: bool,
+    now: SystemTime,
+    report: &mut ArtifactSweepReport,
+) -> anyhow::Result<()> {
+    reap_expired_area(root, ExpiryArea::Quarantine, enforce, now, report).await
+}
+
+/// The two directories laid out as `{area}/{epoch}/{sandbox_id}` and emptied
+/// only after their grace elapses.
+///
+/// They share one implementation so the two phases cannot drift on the checks
+/// that matter: an epoch name that does not parse, a symlink, a non-directory
+/// and a non-canonical sandbox id are treated identically in both.
+#[derive(Clone, Copy)]
+enum ExpiryArea {
+    Trash,
+    Quarantine,
+}
+
+impl ExpiryArea {
+    const fn dir(self) -> &'static str {
+        match self {
+            Self::Trash => TRASH_DIR,
+            Self::Quarantine => QUARANTINE_DIR,
+        }
+    }
+
+    const fn grace(self) -> Duration {
+        match self {
+            Self::Trash => TRASH_GRACE,
+            Self::Quarantine => QUARANTINE_TTL,
+        }
+    }
+
+    const fn deleted_message(self) -> &'static str {
+        match self {
+            Self::Trash => "deleted a trashed paused sandbox artifact",
+            Self::Quarantine => "deleted a quarantined paused sandbox artifact",
+        }
+    }
+}
+
+/// Walks `{area}/{epoch}` and expires every epoch older than the area's grace.
+///
+/// The epoch records when the move happened, so no mtime is needed.
+async fn reap_expired_area(
+    root: &Path,
+    area: ExpiryArea,
+    enforce: bool,
+    now: SystemTime,
+    report: &mut ArtifactSweepReport,
+) -> anyhow::Result<()> {
+    let area_root = root.join(area.dir());
+    let mut epochs = match fs::read_dir(&area_root).await {
         Ok(epochs) => epochs,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
             return Err(anyhow::Error::new(source).context(format!(
-                "read the paused artifact trash at {}",
-                trash_root.display()
+                "read the paused artifact {} at {}",
+                area.dir(),
+                area_root.display()
             )));
         }
     };
-    while let Some(epoch) = epochs
-        .next_entry()
-        .await
-        .with_context(|| format!("scan the paused artifact trash at {}", trash_root.display()))?
-    {
+    while let Some(epoch) = epochs.next_entry().await.with_context(|| {
+        format!(
+            "scan the paused artifact {} at {}",
+            area.dir(),
+            area_root.display()
+        )
+    })? {
         let epoch_name = epoch.file_name().to_string_lossy().into_owned();
         let mut verdict = |reason| {
             report.verdicts.push(ArtifactVerdict::Skipped {
@@ -502,7 +593,8 @@ async fn reap_trash(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(source) => {
                 return Err(anyhow::Error::new(source).context(format!(
-                    "inspect the paused artifact trash entry {}",
+                    "inspect the paused artifact {} entry {}",
+                    area.dir(),
                     epoch.path().display()
                 )));
             }
@@ -523,30 +615,36 @@ async fn reap_trash(
             .duration_since(SystemTime::UNIX_EPOCH)
             .ok()
             .and_then(|since| since.as_secs().checked_sub(moved_at))
-            .is_none_or(|age| age < TRASH_GRACE.as_secs())
+            .is_none_or(|age| age < area.grace().as_secs())
         {
             continue;
         }
-        reap_trash_epoch(&epoch.path(), enforce, report).await?;
+        reap_expired_epoch(&epoch.path(), area, enforce, report).await?;
     }
     Ok(())
 }
 
-/// Deletes, or reports, every sandbox generation inside one expired trash
-/// epoch.
-async fn reap_trash_epoch(
+/// Deletes, or reports, every sandbox generation inside one expired epoch.
+async fn reap_expired_epoch(
     epoch: &Path,
+    area: ExpiryArea,
     enforce: bool,
     report: &mut ArtifactSweepReport,
 ) -> anyhow::Result<()> {
-    let mut entries = fs::read_dir(epoch)
-        .await
-        .with_context(|| format!("read the paused artifact trash epoch {}", epoch.display()))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .with_context(|| format!("scan the paused artifact trash epoch {}", epoch.display()))?
-    {
+    let mut entries = fs::read_dir(epoch).await.with_context(|| {
+        format!(
+            "read the paused artifact {} epoch {}",
+            area.dir(),
+            epoch.display()
+        )
+    })?;
+    while let Some(entry) = entries.next_entry().await.with_context(|| {
+        format!(
+            "scan the paused artifact {} epoch {}",
+            area.dir(),
+            epoch.display()
+        )
+    })? {
         let name = entry.file_name().to_string_lossy().into_owned();
         let verdict = |report: &mut ArtifactSweepReport, reason| {
             report.verdicts.push(ArtifactVerdict::Skipped {
@@ -559,7 +657,8 @@ async fn reap_trash_epoch(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(source) => {
                 return Err(anyhow::Error::new(source).context(format!(
-                    "inspect the trashed paused sandbox artifact {}",
+                    "inspect a paused artifact {} entry {}",
+                    area.dir(),
                     entry.path().display()
                 )));
             }
@@ -578,33 +677,44 @@ async fn reap_trash_epoch(
         };
         let bytes = directory_bytes(&entry.path()).await?;
         if !enforce {
-            report
-                .verdicts
-                .push(ArtifactVerdict::Expired { sandbox_id, bytes });
-            report.expired += 1;
+            report.verdicts.push(match area {
+                ExpiryArea::Trash => ArtifactVerdict::Expired { sandbox_id, bytes },
+                ExpiryArea::Quarantine => ArtifactVerdict::QuarantineExpired { sandbox_id, bytes },
+            });
+            match area {
+                ExpiryArea::Trash => report.expired += 1,
+                ExpiryArea::Quarantine => report.quarantine_expired += 1,
+            }
             continue;
         }
         if let Err(error) = fs::remove_dir_all(entry.path()).await {
             // One directory that cannot be removed must not stop the pass; it
-            // stays in the trash and the next pass retries it.
+            // stays in place and the next pass retries it.
             warn!(
                 sandbox_id = %sandbox_id,
+                area = area.dir(),
                 error = %error,
                 path = %entry.path().display(),
-                "failed to delete a trashed paused sandbox artifact"
+                "failed to delete an expired paused sandbox artifact"
             );
             continue;
         }
         info!(
             sandbox_id = %sandbox_id,
+            area = area.dir(),
             bytes_freed = bytes,
             path = %entry.path().display(),
-            "deleted a trashed paused sandbox artifact"
+            "{}",
+            area.deleted_message()
         );
-        report
-            .verdicts
-            .push(ArtifactVerdict::Removed { sandbox_id, bytes });
-        report.removed += 1;
+        report.verdicts.push(match area {
+            ExpiryArea::Trash => ArtifactVerdict::Removed { sandbox_id, bytes },
+            ExpiryArea::Quarantine => ArtifactVerdict::QuarantineRemoved { sandbox_id, bytes },
+        });
+        match area {
+            ExpiryArea::Trash => report.removed += 1,
+            ExpiryArea::Quarantine => report.quarantine_removed += 1,
+        }
         report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(bytes);
     }
     // The epoch directory is only removed once it is empty; a failed deletion
@@ -626,6 +736,11 @@ fn record(report: &mut ArtifactSweepReport, verdict: ArtifactVerdict) {
         }
         ArtifactVerdict::Reapable { .. } => report.reapable += 1,
         ArtifactVerdict::Expired { .. } => report.expired += 1,
+        ArtifactVerdict::QuarantineExpired { .. } => report.quarantine_expired += 1,
+        ArtifactVerdict::QuarantineRemoved { bytes, .. } => {
+            report.quarantine_removed += 1;
+            report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(*bytes);
+        }
         ArtifactVerdict::Kept { .. } | ArtifactVerdict::Skipped { .. } => {}
     }
     report.verdicts.push(verdict);
@@ -722,6 +837,33 @@ fn record_pass_metrics(report: &ArtifactSweepReport) {
                     "mode" => mode,
                 )
                 .increment(*bytes);
+            }
+            // The quarantine's own counters, so an operator can tell the boot
+            // quarantine from the reaper's trash without reading the log.
+            ArtifactVerdict::QuarantineRemoved { bytes, .. } => {
+                metrics::counter!(
+                    "agentenv_paused_sandbox_quarantine_expired_total",
+                    "mode" => mode,
+                )
+                .increment(1);
+                metrics::counter!(
+                    "agentenv_paused_sandbox_quarantine_reclaimed_bytes_total",
+                    "mode" => mode,
+                )
+                .increment(*bytes);
+            }
+            ArtifactVerdict::QuarantineExpired { sandbox_id, bytes } => {
+                metrics::counter!(
+                    "agentenv_paused_sandbox_quarantine_expired_total",
+                    "mode" => mode,
+                )
+                .increment(1);
+                warn!(
+                    mode,
+                    sandbox_id = %sandbox_id,
+                    pending_bytes = *bytes,
+                    "a quarantined paused sandbox artifact is expired, but this pass may not enforce"
+                );
             }
             ArtifactVerdict::Kept { sandbox_id, reason } => debug!(
                 mode,
