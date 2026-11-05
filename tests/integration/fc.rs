@@ -1087,6 +1087,245 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
     Ok(())
 }
 
+/// A breach on the **rootfs** chain must keep the VM Running, not stop it.
+///
+/// This is the card's incident shape. The rootfs chain is restacked under the
+/// ceiling on every pause, and before the fix a breach there was classified
+/// terminal because the restack had already mutated the live runtime: the
+/// orchestrator then stopped the VM, which is the SIGKILL after
+/// `CHAIN_BYTES_CEILING_EXCEEDED` the card reports. The measurement has to land
+/// on the rootfs restack, so the unique regions are written to the guest's
+/// overlay rootfs (`/tmp`, a plain directory on it) instead of `/dev/shm`, whose
+/// pages belong to the memory chain.
+///
+/// The pause goes through [`SandboxBackend::pause`] with a caller artifact
+/// directory, which is the path the orchestrator takes: the backend must resume
+/// the VM itself before returning the recoverable error, or the caller would
+/// find a paused-but-not-stopped VM it cannot serve.
+#[tokio::test]
+async fn rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running() -> Result<()> {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!(
+            "skipping rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running: /dev/kvm is not \
+             available on this host"
+        );
+        return Ok(());
+    }
+    common::setup().await;
+
+    let sandbox_config = common::default_sandbox_config()?;
+    let mem_size_mib = u64::from(sandbox_config.mem_size_mib);
+    let unique_mib = (mem_size_mib / 8).max(1);
+
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    sandbox.start().await?;
+    write_disk_marker(&mut sandbox).await?;
+    if !rootfs_unique_dir_is_rootfs_backed(&mut sandbox).await? {
+        eprintln!(
+            "skipping rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running: \
+             {ROOTFS_UNIQUE_DIR} is not on the overlay rootfs in this guest, so the unique \
+             regions would not reach the rootfs restack"
+        );
+        sandbox.stop().await?;
+        return Ok(());
+    }
+    let output = sandbox
+        .run_command("mkdir", &["-p", ROOTFS_UNIQUE_DIR])
+        .await
+        .context("create the rootfs unique-data directory")?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "create {ROOTFS_UNIQUE_DIR} failed: {}",
+        output.stderr
+    );
+
+    // Two measured pauses: the first carries one unique region and defines the
+    // base rootfs chain, the second adds one more. The difference is what one
+    // more disjoint region costs the rootfs chain and compaction cannot reclaim.
+    write_rootfs_unique_chain_data(&mut sandbox, unique_mib, 0).await?;
+    let artifact_root = tempfile::tempdir()?;
+    let base_dir = artifact_root.path().join("base");
+    let base_snapshot = FirecrackerSandbox::pause_to_dir(&mut sandbox, &base_dir)
+        .await
+        .context("base pause for the rootfs ceiling fixture")?
+        .0;
+    let (base_rootfs_reclaimable, base_rootfs_prefix) =
+        rootfs_chain_parts(&sandbox, &base_snapshot)?;
+    assert!(
+        base_rootfs_reclaimable > 0,
+        "the rootfs unique region must allocate a generation to bound"
+    );
+    let mut measure_sandbox =
+        FirecrackerSandbox::from_snapshot_config(&base_snapshot)?.with_chain_bytes_ceiling(0);
+    measure_sandbox.start().await?;
+    write_rootfs_unique_chain_data(&mut measure_sandbox, unique_mib, 1).await?;
+    let measure_dir = artifact_root.path().join("measure");
+    let grown_snapshot = FirecrackerSandbox::pause_to_dir(&mut measure_sandbox, &measure_dir)
+        .await
+        .context("measurement pause for the rootfs ceiling fixture")?
+        .0;
+    let (grown_rootfs_reclaimable, _) = rootfs_chain_parts(&measure_sandbox, &grown_snapshot)?;
+    drop(measure_sandbox);
+    let marginal_bytes = grown_rootfs_reclaimable.saturating_sub(base_rootfs_reclaimable);
+    assert!(
+        marginal_bytes > 0,
+        "a second disjoint rootfs region must grow the reclaimable part: base \
+         {base_rootfs_reclaimable} bytes, grown {grown_rootfs_reclaimable}"
+    );
+    // The ceiling holds the base rootfs chain and half of one more region: the
+    // base fits, the next disjoint region cannot. `0` is the disabled value, so
+    // it must stay a real bound.
+    let ceiling = base_rootfs_reclaimable.saturating_add(marginal_bytes / 2);
+    assert!(
+        ceiling > 0 && ceiling >= base_rootfs_reclaimable,
+        "the ceiling must hold the base rootfs chain and still be a real bound: \
+         {base_rootfs_reclaimable} vs {ceiling}"
+    );
+    assert!(
+        ceiling < base_rootfs_reclaimable.saturating_add(marginal_bytes),
+        "the ceiling must be below the base chain plus one more region, or nothing would be \
+         refused: {ceiling} vs {base_rootfs_reclaimable} + {marginal_bytes} (rootfs prefix \
+         {base_rootfs_prefix} is reported but never charged)"
+    );
+    eprintln!(
+        "rootfs ceiling fixture: base rootfs {base_rootfs_reclaimable} reclaimable over a \
+         {base_rootfs_prefix} byte prefix, marginal growth per region {marginal_bytes} bytes, \
+         unique region {unique_mib} MiB, ceiling {ceiling} bytes"
+    );
+
+    // Resume the base chain under the tight ceiling and add one more rootfs
+    // region. The rootfs restack runs, compaction cannot reclaim the new region,
+    // and the pause must come back recoverable with the VM still running.
+    //
+    // The negative control is the same fixture below the ceiling: it pauses
+    // normally, proving the refusal above is the ceiling and not a broken
+    // fixture.
+    let mut resumed =
+        FirecrackerSandbox::from_snapshot_config(&base_snapshot)?.with_chain_bytes_ceiling(ceiling);
+    resumed.start().await?;
+    write_rootfs_unique_chain_data(&mut resumed, unique_mib, 1).await?;
+    let rejected_dir = artifact_root.path().join("rejected");
+    let error = SandboxBackend::pause(&mut resumed, Some(&rejected_dir))
+        .await
+        .expect_err("a rootfs chain of disjoint generations cannot fit a fixed ceiling");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("CHAIN_BYTES_CEILING_EXCEEDED"),
+        "the rootfs rejection must carry the named code: {message}"
+    );
+    assert!(
+        !error.is_terminal(),
+        "a rootfs ceiling breach must be recoverable, never terminal: {message}"
+    );
+    eprintln!("expected rootfs ceiling rejection: {message}");
+
+    // The VM was resumed in place by the backend, so it still serves: the marker
+    // and both regions are readable, which only works on a running VM.
+    verify_disk_marker(&mut resumed).await?;
+    let output = resumed
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                &format!("test -s {ROOTFS_UNIQUE_DIR}/gen-0 && test -s {ROOTFS_UNIQUE_DIR}/gen-1"),
+            ],
+        )
+        .await
+        .context("check the rootfs regions survived the rejection")?;
+    assert_eq!(
+        output.exit_code, 0,
+        "both rootfs regions must survive the rejected pause: {}",
+        output.stderr
+    );
+    // The rejected generation directory must be gone: leaving it behind is the
+    // 78 GB / 30 GB leak the card reports for terminal failures, and a rejected
+    // pause writes artifacts just the same.
+    assert!(
+        !rejected_dir.exists(),
+        "a rejected pause must not leave its artifact directory behind: {}",
+        rejected_dir.display()
+    );
+
+    // Negative control: the same sandbox pauses once the ceiling is lifted.
+    let mut resumed = resumed.with_chain_bytes_ceiling(0);
+    let lifted_dir = artifact_root.path().join("lifted");
+    FirecrackerSandbox::pause_to_dir(&mut resumed, &lifted_dir)
+        .await
+        .context("a rejected rootfs pause must be retryable once the ceiling is lifted")?;
+    Ok(())
+}
+
+/// Guest directory on the overlay **rootfs** the rootfs-ceiling test writes to.
+///
+/// `/tmp` is created on the user image's rootfs by the guest init — it is not a
+/// tmpfs there — so its dirty pages belong to the rootfs chain, which is the
+/// device the rootfs-ceiling test exercises. The test verifies that with
+/// [`rootfs_unique_dir_is_rootfs_backed`] instead of trusting the layout.
+const ROOTFS_UNIQUE_DIR: &str = "/tmp/aenv-rootfs-unique";
+
+/// Whether [`ROOTFS_UNIQUE_DIR`] really lives on a non-tmpfs mount.
+///
+/// Returns `false` — and the caller skips with a message — instead of writing to
+/// whatever filesystem happens to back the path: on tmpfs the pages would belong
+/// to the memory chain, whose breach is already recoverable, so the assertion
+/// would never reach the rootfs restack this test exists to cover.
+async fn rootfs_unique_dir_is_rootfs_backed(sandbox: &mut FirecrackerSandbox) -> Result<bool> {
+    // Longest-prefix match over `/proc/mounts`, in pure shell: the guest carries
+    // no guaranteed `findmnt`, and the mount with the longest matching prefix is
+    // the one that owns the path.
+    let output = sandbox
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "best=''; best_type=''; while read -r _ mount type _; do \
+                       case {ROOTFS_UNIQUE_DIR} in \"$mount\"|\"$mount\"/*) \
+                         if [ ${{#mount}} -ge ${{#best}} ]; then best=\"$mount\"; \
+                           best_type=\"$type\"; fi ;; \
+                       esac; \
+                     done < /proc/mounts; echo \"$best_type\""
+                ),
+            ],
+        )
+        .await
+        .context("inspect the guest filesystem type backing the rootfs unique dir")?;
+    let mount_type = output.stdout.trim();
+    Ok(output.exit_code == 0 && !mount_type.is_empty() && mount_type != "tmpfs")
+}
+
+/// Grow the guest's rootfs unique-data footprint by `size_mib` MiB, never
+/// rewriting the earlier region, so every generation carries a new disjoint
+/// extent compaction cannot reclaim.
+async fn write_rootfs_unique_chain_data(
+    sandbox: &mut FirecrackerSandbox,
+    size_mib: u64,
+    pause_index: usize,
+) -> Result<()> {
+    let path = format!("{ROOTFS_UNIQUE_DIR}/gen-{pause_index}");
+    let output = sandbox
+        .run_command(
+            "dd",
+            &[
+                "if=/dev/urandom",
+                &format!("of={path}"),
+                "bs=1M",
+                &format!("count={size_mib}"),
+            ],
+        )
+        .await
+        .with_context(|| {
+            format!("write {size_mib} MiB of unique rootfs chain data for pause {pause_index}")
+        })?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "rootfs unique chain data write failed ({}): {}",
+        output.exit_code,
+        output.stderr
+    );
+    Ok(())
+}
+
 /// Guest tmpfs directory the ceiling tests write their data into.
 ///
 /// The data has to live in guest RAM: a file on the overlay rootfs would be

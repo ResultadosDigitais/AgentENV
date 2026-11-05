@@ -19,7 +19,8 @@ use super::config::{
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs, RestackSnapshotDevice,
+    relocate_sealed_layer_for_rejected_pause, restack_snapshot_overlaybd_device,
+    restack_snapshot_overlaybd_rootfs, RestackSnapshotDevice,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
@@ -1142,7 +1143,16 @@ impl FirecrackerSandbox {
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
-                Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
+                // A rejected pause still leaves the live runtime referencing
+                // layers written inside `snapshot_dir`: the rootfs, drive and
+                // volume restacks re-seal the old upper into a file under this
+                // directory and repoint the live config at it. Deleting the
+                // directory without first moving those layers out would free a
+                // file a running device still has open, so the cleanup is
+                // retention-aware: the layers the live configs name are moved to
+                // the sandbox's own snapshot tree first, and only then does the
+                // generation directory go.
+                self.cleanup_failed_snapshot_dir(snapshot_dir).await;
                 Err(err)
             }
         }
@@ -1537,8 +1547,28 @@ impl FirecrackerSandbox {
 
     /// Best-effort cleanup of a caller-managed snapshot directory after a failed pause.
     ///
-    /// Removes the directory contents so the caller isn't left with a partially-written snapshot.
-    async fn cleanup_failed_snapshot_dir(path: &Path) {
+    /// Removes the directory contents so the caller isn't left with a partially-written snapshot,
+    /// but never frees a layer a still-live runtime config references. A restack
+    /// that succeeded before a later step failed leaves the live runtime pointing
+    /// at the sealed layer it wrote here; deleting the directory would then turn
+    /// a rejected pause into a sandbox whose device reads a deleted file. Every
+    /// such layer is moved into the sandbox's snapshot tree and the config
+    /// repointed before the directory goes, and if that move fails the directory
+    /// is kept rather than deleted — wasted bytes are recoverable, a dangling
+    /// live reference is not.
+    async fn cleanup_failed_snapshot_dir(&self, path: &Path) {
+        match self.retain_layers_referenced_by_runtime_configs(path).await {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(
+                    snapshot_dir = %path.display(),
+                    error = %format_args!("{error:#}"),
+                    "keeping the partially-written snapshot directory: a live runtime config \
+                     still references a layer inside it"
+                );
+                return;
+            }
+        }
         match tokio::fs::remove_dir_all(path).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1550,6 +1580,71 @@ impl FirecrackerSandbox {
                 );
             }
         }
+    }
+
+    /// Move every layer the live runtime configs reference under `path` into the
+    /// sandbox's snapshot tree, rewriting each config to the retained copy.
+    ///
+    /// Runs before the failed pause's directory is deleted, so the deletion only
+    /// ever frees layers nothing references. A config that cannot be loaded is
+    /// skipped with a warning — there is nothing of ours to repoint — but a layer
+    /// that cannot be retained fails the whole pass so the caller keeps the
+    /// directory instead of deleting a referenced file.
+    async fn retain_layers_referenced_by_runtime_configs(&self, path: &Path) -> Result<()> {
+        // A fresh directory per cleanup, not one shared for the sandbox's life:
+        // a retried pause restacks again and seals another layer under the same
+        // file name, and a shared directory would overwrite the copy an earlier
+        // retry already repointed a live config at.
+        let retained_dir = self
+            .sandbox_snapshot_tree()
+            .join("retained-layers")
+            .join(Uuid::now_v7().to_string());
+        for config_path in self.runtime_image_config_paths() {
+            let image_config = match overlaybd::config::load_image_config(&config_path) {
+                Ok(image_config) => image_config,
+                Err(error) => {
+                    warn!(
+                        config = %config_path.display(),
+                        error = %format_args!("{error:#}"),
+                        "failed to load a live runtime config while retaining layers from a \
+                         failed pause; nothing to repoint for it"
+                    );
+                    continue;
+                }
+            };
+            for lower in &image_config.lowers {
+                if lower.file.is_empty() {
+                    continue;
+                }
+                let lower_path = PathBuf::from(&lower.file);
+                let canonical =
+                    std::fs::canonicalize(&lower_path).unwrap_or_else(|_| lower_path.clone());
+                if !canonical.starts_with(path) {
+                    continue;
+                }
+                let retained = relocate_sealed_layer_for_rejected_pause(
+                    &config_path,
+                    &lower_path,
+                    &retained_dir,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "retain layer {} referenced by {} before deleting {}",
+                        lower_path.display(),
+                        config_path.display(),
+                        path.display()
+                    )
+                })?;
+                debug!(
+                    config = %config_path.display(),
+                    from = %lower_path.display(),
+                    to = %retained.display(),
+                    "retained a layer a failed pause wrote for a live runtime config"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

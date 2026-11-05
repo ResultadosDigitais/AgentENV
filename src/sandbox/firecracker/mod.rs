@@ -25,4 +25,10 @@ pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerCaptureArtifacts, FirecrackerPausedState, FirecrackerSandbox};
+// Re-exported for the orchestrator's recoverable-pause branch: it must recognize
+// the named chain-ceiling refusal by error type, never by message text, so the
+// classification cannot drift from the code that produces it.
+#[cfg(test)]
+pub(crate) use overlaybd_snapshot::chain_ceiling_error;
+pub(crate) use overlaybd_snapshot::is_chain_bytes_ceiling_exceeded;
 pub(crate) use startup_pack::record_startup_pack;

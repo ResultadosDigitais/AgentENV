@@ -66,9 +66,27 @@ pub enum MockOperation {
 pub enum MockAction {
     Succeed,
     SucceedAfter(Duration),
-    Fail { message: String },
-    FailTerminal { message: String },
-    FailAfter { delay: Duration, message: String },
+    Fail {
+        message: String,
+    },
+    FailTerminal {
+        message: String,
+    },
+    FailAfter {
+        delay: Duration,
+        message: String,
+    },
+    /// Fail with the real `ChainBytesCeilingExceeded` type, not a message that
+    /// spells the code.
+    ///
+    /// The orchestrator's recoverable-pause branch classifies the refusal by
+    /// error TYPE, so a message-carrying variant would exercise the string path
+    /// and leave the typed one untested. This variant lets a test drive the
+    /// branch with the exact error the backend produces.
+    FailChainCeiling {
+        observed_bytes: u64,
+        ceiling_bytes: u64,
+    },
 }
 
 #[derive(Default)]
@@ -189,6 +207,12 @@ impl MockBehavior {
                 sleep(delay).await;
                 Err(fail(message))
             }
+            // Only the capture path carries a typed ceiling error; the generic
+            // action runners never see this variant, and reaching it there is a
+            // test bug rather than a runtime case.
+            MockAction::FailChainCeiling { .. } => {
+                unreachable!("FailChainCeiling is only produced by apply_capture_result")
+            }
         }
     }
 
@@ -213,17 +237,33 @@ impl MockBehavior {
                 thread::sleep(delay);
                 Err(fail(message))
             }
+            MockAction::FailChainCeiling { .. } => {
+                unreachable!("FailChainCeiling is only produced by apply_capture_result")
+            }
         }
     }
 
     async fn apply_capture_result(&self, operation: MockOperation) -> SandboxCaptureResult<()> {
         self.run_operation_hook(operation);
-        Self::run_async_action(
-            self.pop_action(operation),
-            |message| SandboxCaptureError::recoverable(anyhow!(message)),
-            |message| SandboxCaptureError::terminal(anyhow!(message)),
-        )
-        .await
+        // Pop once: the typed ceiling variant produces the real error the backend
+        // would, so the orchestrator's type-based classification is what the test
+        // exercises, not a string that happens to spell the code.
+        match self.pop_action(operation) {
+            MockAction::FailChainCeiling {
+                observed_bytes,
+                ceiling_bytes,
+            } => Err(SandboxCaptureError::recoverable(
+                super::firecracker::chain_ceiling_error(observed_bytes, ceiling_bytes),
+            )),
+            action => {
+                Self::run_async_action(
+                    action,
+                    |message| SandboxCaptureError::recoverable(anyhow!(message)),
+                    |message| SandboxCaptureError::terminal(anyhow!(message)),
+                )
+                .await
+            }
+        }
     }
 
     async fn apply_async(&self, operation: MockOperation) -> Result<()> {
