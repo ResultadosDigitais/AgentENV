@@ -15,11 +15,11 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
-    FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, ResourceLimitPlan,
-    ResourceLimitStatus, RuntimeArtifactSet, SandboxAccessTokenGenerator, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec, SandboxLaunchConfig,
-    SandboxLogEntry, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    is_chain_bytes_ceiling_exceeded, CustomExtensionClient, CustomExtensionParams, EnvdAccessToken,
+    EnvdApi, FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState,
+    ResourceLimitPlan, ResourceLimitStatus, RuntimeArtifactSet, SandboxAccessTokenGenerator,
+    SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec,
+    SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, ResourceLimits, SandboxId, SandboxResources};
@@ -1634,6 +1634,28 @@ where
                             &[SandboxState::Pausing],
                         )
                         .await;
+                    // The chain-ceiling refusal is measured in the backend, but
+                    // the paused-sandbox count that decides the 48 GiB question
+                    // lives only here, where the metadata store is. One log line
+                    // per refusal carries it beside the named code, so the
+                    // seven-day measurement reads a single query:
+                    //   message =~ "CHAIN_BYTES_CEILING_EXCEEDED"
+                    // joined on the same `observed_bytes` / `ceiling_bytes`
+                    // fields the backend line emits. The id is a field, never a
+                    // metric label.
+                    if is_chain_bytes_ceiling_exceeded(err.inner()) {
+                        let paused_sandboxes = self
+                            .metrics_snapshot()
+                            .await
+                            .map(|metrics| metrics.paused_sandbox_count)
+                            .unwrap_or(0);
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            node_paused_sandboxes = paused_sandboxes,
+                            "chain byte ceiling refused a pause; the sandbox was resumed in \
+                             place and is still Running"
+                        );
+                    }
                 }
                 self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                     .await;

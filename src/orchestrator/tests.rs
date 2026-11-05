@@ -3915,6 +3915,17 @@ async fn pause_chain_ceiling_exceeded_keeps_running_and_allows_retry_after_raise
     )
     .await;
 
+    // The incident shape: the VM was never stopped. A ceiling refusal that
+    // reached the stop path would SIGKILL the sandbox (the card's two lost VMs),
+    // so the recoverable branch must leave `stop` untouched. The mock records
+    // every stop call, which is the only observation that distinguishes "still
+    // Running" from "torn down and re-registered".
+    let stop_calls = behavior.stop_calls();
+    assert_eq!(
+        stop_calls, 0,
+        "a chain ceiling refusal must never stop the VM: {stop_calls} stop call(s)"
+    );
+
     // Once the operator raises the ceiling, the very same sandbox pauses.
     orchestrator.pause_sandbox(sandbox_id).await?;
     let paused = orchestrator
@@ -3924,6 +3935,76 @@ async fn pause_chain_ceiling_exceeded_keeps_running_and_allows_retry_after_raise
     assert_eq!(paused.state, SandboxState::Paused);
     assert!(paused.paused_state.is_some());
     assert_proxy_paused(&orchestrator, &sandbox_id).await?;
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+/// The recoverable branch recognizes the refusal by TYPE, not by message.
+///
+/// The sibling test above drives the branch with a message that spells
+/// `CHAIN_BYTES_CEILING_EXCEEDED`, which is what a string match would pass on.
+/// The backend actually returns the concrete `ChainBytesCeilingExceeded` error,
+/// so this test hands the branch exactly that error and asserts the same
+/// outcome: the VM is never stopped, the handle and route come back, and the
+/// sandbox is `Running` again — the card's "no ceiling path kills the VM".
+#[tokio::test]
+async fn chain_ceiling_pause_failure_is_classified_by_error_type_and_keeps_the_vm() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::FailChainCeiling {
+            observed_bytes: 61_167_910_912,
+            ceiling_bytes: 51_539_607_552,
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "pause-ceiling-typed")]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("a real chain ceiling error must fail the pause");
+    assert!(
+        matches!(
+            err,
+            OrchestratorError::SandboxOperationFailed {
+                operation: SandboxOperation::Pause,
+                ..
+            }
+        ),
+        "a typed ceiling refusal must stay a recoverable pause failure"
+    );
+
+    // The VM was never torn down, the handle is back, the route is ready and the
+    // sandbox is Running — the whole point of the recoverable classification.
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "a typed ceiling refusal must never stop the VM"
+    );
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("the sandbox must survive the refusal");
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert!(metadata.paused_state.is_none());
+    assert!(
+        orchestrator
+            .sandboxes
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "the runtime handle must be reinserted"
+    );
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
 
     orchestrator.delete_sandbox(sandbox_id).await?;
     Ok(())

@@ -25,6 +25,7 @@ use overlaybd::index::{Segment, SegmentMapping};
 use overlaybd::index_file::compact_to;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::process_vm_reader::ProcessVmReader;
 use crate::cfg::ConfigManager;
@@ -202,6 +203,125 @@ fn chain_ceiling_exceeded(
     })
 }
 
+/// A [`ChainBytesCeilingExceeded`] with no breakdown detail.
+///
+/// Test-only: the orchestrator's recoverable-pause branch classifies by error
+/// type, and the mock backend needs to produce that exact type (never a message
+/// that merely spells the code) for the branch to be exercised for real.
+#[cfg(test)]
+pub(crate) fn chain_ceiling_error(observed_bytes: u64, ceiling_bytes: u64) -> anyhow::Error {
+    chain_ceiling_exceeded(
+        observed_bytes,
+        ceiling_bytes,
+        ChainCeilingBreakdown::default(),
+    )
+}
+
+/// Whether `error` carries a [`ChainBytesCeilingExceeded`] anywhere in its
+/// `context` chain.
+///
+/// The pause path wraps the ceiling rejection with context at several layers
+/// (the restack of one device, the staging of its snapshot config, the pause
+/// itself), so matching the concrete error type through the chain is the only
+/// classification that survives that nesting. Matching on message text would
+/// also reclassify an unrelated error that merely mentions the code.
+pub(crate) fn is_chain_bytes_ceiling_exceeded(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ChainBytesCeilingExceeded>().is_some())
+}
+
+/// The chain measured **before** the pause mutates the live runtime.
+///
+/// A restack is the point of no return: it seals the writable upper and reopens
+/// a fresh one, so the pause can only learn the size compaction produced after
+/// the device has already been mutated. This pre-flight answers the cheaper
+/// question first — does the chain plus the writable upper's allocated bytes
+/// already fit the ceiling? Compaction only ever drops blocks, so when that
+/// already fits, the post-compaction rejection cannot be the reason to refuse
+/// and is skipped; the pause then never pays for a refusal it provably does not
+/// need.
+///
+/// It is deliberately *not* a refusal. `measured_bytes` is an upper bound, not a
+/// floor: the appended bytes are the writable upper's allocated blocks, and
+/// compaction folds those same blocks into the generation it writes. Refusing on
+/// an upper bound would reject pauses that would have fit, which is worse than
+/// the recoverable refusal it replaces, so an over-ceiling pre-flight only logs
+/// and lets the post-compaction check decide.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChainPreflight {
+    /// Reclaimable chain bytes plus the writable upper's allocated bytes.
+    pub(super) measured_bytes: u64,
+    /// Ceiling in force; `0` means the ceiling is disabled.
+    pub(super) ceiling_bytes: u64,
+}
+
+impl ChainPreflight {
+    /// Ceiling disabled: nothing to pre-flight and nothing to skip.
+    pub(super) fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Measure the live chain plus its writable upper.
+    pub(super) fn measure(
+        chain: impl IntoIterator<Item = LayerConfig>,
+        upper_paths: &[PathBuf],
+        runtime_owned_roots: &[PathBuf],
+        ceiling_bytes: u64,
+    ) -> Self {
+        if ceiling_bytes == 0 {
+            return Self::disabled();
+        }
+        let accounting = ChainByteAccounting::measure(chain, None, runtime_owned_roots);
+        let upper_bytes = chain_allocated_bytes(upper_paths.iter().map(PathBuf::as_path));
+        Self {
+            measured_bytes: accounting.reclaimable_bytes.saturating_add(upper_bytes),
+            ceiling_bytes,
+        }
+    }
+
+    /// Whether the measured chain already fits, so compaction cannot push it
+    /// past the ceiling and the post-compaction rejection is provably moot.
+    pub(super) fn guaranteed_fit(&self) -> bool {
+        self.ceiling_bytes != 0 && self.measured_bytes <= self.ceiling_bytes
+    }
+}
+
+/// Measure a live runtime's chain plus its writable upper pair.
+///
+/// Reads the same config the restack is about to mutate, so the number belongs
+/// to the chain the pause will actually append to. A config without a writable
+/// upper answers [`ChainPreflight::disabled`]: there is nothing to append there
+/// and the post-compaction check keeps deciding alone.
+fn preflight_chain_before_restack(
+    live_runtime_image_config_path: &Path,
+    runtime_owned_roots: &[PathBuf],
+    chain_bytes_ceiling: u64,
+) -> Result<ChainPreflight> {
+    if chain_bytes_ceiling == 0 {
+        return Ok(ChainPreflight::disabled());
+    }
+    let image_config = overlaybd::config::load_image_config(live_runtime_image_config_path)
+        .with_context(|| {
+            format!(
+                "load live overlaybd runtime config before restack {}",
+                live_runtime_image_config_path.display()
+            )
+        })?;
+    let mut upper_paths = Vec::new();
+    for path in [&image_config.upper.data, &image_config.upper.index] {
+        if !path.is_empty() {
+            upper_paths.push(PathBuf::from(path));
+        }
+    }
+    Ok(ChainPreflight::measure(
+        image_config.lowers,
+        &upper_paths,
+        runtime_owned_roots,
+        chain_bytes_ceiling,
+    ))
+}
+
 /// Byte ceiling observability for the paused artifact chain.
 ///
 /// Labels stay bounded: `kind` is one of `rootfs` / `memory`, never a sandbox
@@ -211,6 +331,14 @@ mod chain_metrics {
     pub(super) const COMPACTIONS: &str = "agentenv_paused_sandbox_chain_compactions_total";
     pub(super) const CEILING_EXCEEDED: &str =
         "agentenv_paused_sandbox_chain_ceiling_exceeded_total";
+    /// Refusals taken after compaction could not bring the reclaimable part
+    /// under the ceiling — the ones the pause path turns into a resume.
+    pub(super) const CEILING_EXCEEDED_POST_COMPACTION: &str =
+        "agentenv_paused_sandbox_chain_ceiling_exceeded_post_compaction_total";
+    /// Pauses whose pre-flight already fit the ceiling, so the post-compaction
+    /// rejection was skipped because it provably could not fire.
+    pub(super) const PREFLIGHT_GUARANTEED_FIT: &str =
+        "agentenv_paused_sandbox_chain_preflight_guaranteed_fit_total";
 
     pub(super) fn record_chain_bytes(kind: &'static str, bytes: u64, ceiling: u64) {
         metrics::gauge!(CHAIN_BYTES, "kind" => kind).set(bytes as f64);
@@ -223,6 +351,37 @@ mod chain_metrics {
 
     pub(super) fn record_ceiling_exceeded(kind: &'static str) {
         metrics::counter!(CEILING_EXCEEDED, "kind" => kind).increment(1);
+        metrics::counter!(CEILING_EXCEEDED_POST_COMPACTION, "kind" => kind).increment(1);
+    }
+
+    pub(super) fn record_preflight_guaranteed_fit(kind: &'static str) {
+        metrics::counter!(PREFLIGHT_GUARANTEED_FIT, "kind" => kind).increment(1);
+    }
+}
+
+/// The five numbers every ceiling refusal logs, plus the artifact root's disk.
+///
+/// This is the single place that decides what an operator sees when a pause is
+/// refused, so the seven-day measurement of the card has one query to read and
+/// one shape to parse: observed chain bytes, the ceiling, the appended-upper
+/// bytes, the node's free/total bytes at the artifact root, and how many
+/// sandboxes the node is holding paused. The sandbox id is never a field here —
+/// it would make the line unusable as a stable grep — so the caller adds it
+/// where the log line is emitted if at all.
+mod chain_refusal_log {
+    use std::path::Path;
+
+    /// Free and total bytes of the filesystem holding `path`, if it can be read.
+    ///
+    /// Missing and unreadable paths answer `None` rather than failing: a refusal
+    /// must still be reported when the disk probe fails, and the message says the
+    /// numbers are absent instead of inventing them.
+    pub(super) fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
+        let stats = nix::sys::statvfs::statvfs(path).ok()?;
+        let block_size = stats.fragment_size();
+        let total_bytes = stats.blocks().saturating_mul(block_size);
+        let free_bytes = stats.blocks_free().saturating_mul(block_size);
+        Some((free_bytes, total_bytes))
     }
 }
 
@@ -306,10 +465,32 @@ impl LiveOverlaybdSnapshotState {
         }
     }
 
+    /// Classify a failed staging attempt after the restack, if there was one.
+    ///
+    /// A restack mutates the live runtime (it seals the old upper and reopens a
+    /// fresh one), so every error after it is terminal by default: the caller
+    /// must not keep serving a runtime whose device state is unknown. The one
+    /// exception is the chain byte ceiling. It is a capacity decision taken
+    /// after the restack only because the reclaimed size is only known then,
+    /// and the daemon leaves both the device and the resumed VM usable — the
+    /// VM is still paused in memory at that point. Returning it unwrapped makes
+    /// [`crate::sandbox::SandboxCaptureError::from`] classify it as
+    /// recoverable, so the pause path resumes the VM instead of tearing it
+    /// down. Every other post-restack error keeps the terminal classification.
     fn finish_staging(self, staged_snapshot: Result<PathBuf>) -> Result<PathBuf> {
         match self {
             Self::ReadOnly => staged_snapshot,
-            Self::Restacked(_) => staged_snapshot.map_err(into_terminal_snapshot_failure),
+            Self::Restacked(_) => staged_snapshot.map_err(|error| {
+                if is_chain_bytes_ceiling_exceeded(&error) {
+                    debug!(
+                        "keeping a post-restack chain ceiling rejection recoverable so the \
+                         sandbox is resumed instead of stopped"
+                    );
+                    error
+                } else {
+                    into_terminal_snapshot_failure(error)
+                }
+            }),
         }
     }
 }
@@ -566,6 +747,102 @@ async fn copy_file_atomically(src: &Path, dst: &Path, description: &str) -> Resu
     Ok(())
 }
 
+/// Move the sealed layer a live runtime config now references out of a
+/// directory the pause is about to delete, and repoint the config at the new
+/// path.
+///
+/// A rejected pause deletes its own output directory, but after the restack the
+/// live runtime config references the sealed layer inside that directory. Left
+/// there, the deletion frees a layer the still-running device has open — the
+/// same class of dangling reference that leaves a live sandbox pointing at a
+/// deleted file. The move therefore:
+///
+/// 1. copies the layer to the sandbox's snapshot tree, a runtime-owned root that
+///    outlives this generation;
+/// 2. syncs the copy before repointing, so a crash never leaves the config
+///    naming a file whose bytes are still in flight;
+/// 3. rewrites the live config to the new path only AFTER the copy is durable;
+/// 4. only then drops the original from the doomed directory.
+///
+/// A copy-then-unlink (never a rename) is what makes this safe across
+/// filesystems: the snapshot tree and the pause directory are not guaranteed to
+/// share a device, and a rename across devices fails outright.
+pub(super) async fn relocate_sealed_layer_for_rejected_pause(
+    live_runtime_image_config_path: &Path,
+    sealed_layer_path: &Path,
+    retained_dir: &Path,
+) -> Result<PathBuf> {
+    // Unique per call, not just per file name: two devices of one sandbox can
+    // seal layers under the same name (`snapshot.commit`), and a shared name
+    // would make the second copy overwrite the first while a config already
+    // points at it. The uuid prefix keeps them apart; the readable suffix keeps
+    // the operator able to tell what the file is.
+    let retained_path = retained_dir.join(format!(
+        "{}-{}",
+        Uuid::now_v7(),
+        sealed_layer_path
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("snapshot.commit"))
+            .to_string_lossy()
+    ));
+    if retained_path != sealed_layer_path {
+        tokio::fs::create_dir_all(retained_dir)
+            .await
+            .with_context(|| format!("create retained-layer dir {}", retained_dir.display()))?;
+        copy_file_atomically(
+            sealed_layer_path,
+            &retained_path,
+            "sealed layer retained by a rejected pause",
+        )
+        .await?;
+        // Repoint every lower that names the doomed path, keeping its digest and
+        // size: the bytes are identical, so only the location changes.
+        let mut image_config = overlaybd::config::load_image_config(live_runtime_image_config_path)
+            .with_context(|| {
+                format!(
+                    "load live overlaybd runtime config {}",
+                    live_runtime_image_config_path.display()
+                )
+            })?;
+        let doomed =
+            fs::canonicalize(sealed_layer_path).unwrap_or_else(|_| sealed_layer_path.to_path_buf());
+        let mut rewrote = false;
+        for lower in image_config.lowers.iter_mut() {
+            let current =
+                fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
+            if current == doomed {
+                lower.file = retained_path.display().to_string();
+                rewrote = true;
+            }
+        }
+        if !rewrote {
+            anyhow::bail!(
+                "live runtime config {} does not reference the sealed layer {} that a rejected \
+                 pause must retain",
+                live_runtime_image_config_path.display(),
+                sealed_layer_path.display()
+            );
+        }
+        let bytes = serde_json::to_vec_pretty(&image_config)
+            .context("serialize live overlaybd runtime config after retaining the sealed layer")?;
+        write_bytes_atomically(
+            live_runtime_image_config_path,
+            &bytes,
+            "live overlaybd runtime config",
+        )?;
+        // The config is durable and points at the copy, so the original may go.
+        if let Err(error) = tokio::fs::remove_file(sealed_layer_path).await {
+            warn!(
+                path = %sealed_layer_path.display(),
+                error = %error,
+                "failed to remove the sealed layer a rejected pause retained; the copy is \
+                 authoritative and the original is wasted bytes"
+            );
+        }
+    }
+    Ok(retained_path)
+}
+
 async fn rewrite_live_runtime_config_for_restack(
     live_runtime_image_config_path: &Path,
     snapshot_layer_path: &Path,
@@ -598,6 +875,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     snapshot_layer_path: Option<&Path>,
     chain_bytes_ceiling: u64,
     runtime_owned_roots: &[PathBuf],
+    preflight: ChainPreflight,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -641,7 +919,10 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
-        chain_bytes_ceiling,
+        ChainCeilingPolicy {
+            ceiling_bytes: chain_bytes_ceiling,
+            preflight,
+        },
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -655,6 +936,31 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     Ok(output_path)
 }
 
+/// The ceiling knobs a rewrite enforces, grouped so the positional argument
+/// list stays readable.
+///
+/// `ceiling_bytes` and the pre-flight always travel together — one is the bound,
+/// the other the pre-mutation measurement of the same bound — and keeping them in
+/// one value is what stops a caller from pairing a ceiling with a pre-flight
+/// taken under a different one.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct ChainCeilingPolicy {
+    pub(super) ceiling_bytes: u64,
+    pub(super) preflight: ChainPreflight,
+}
+
+impl ChainCeilingPolicy {
+    /// Enforcement disabled (`chain_bytes_ceiling = 0`).
+    ///
+    /// Test-only: production always reaches a rewrite through a live ceiling
+    /// value, so the disabled policy exists to keep the unit fixtures that do not
+    /// exercise the ceiling readable.
+    #[cfg(test)]
+    pub(super) fn disabled() -> Self {
+        Self::default()
+    }
+}
+
 async fn rewrite_lowers_with_runtime_roots(
     existing_lowers: Vec<LayerConfig>,
     output_dir: &Path,
@@ -662,8 +968,12 @@ async fn rewrite_lowers_with_runtime_roots(
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
-    chain_bytes_ceiling: u64,
+    policy: ChainCeilingPolicy,
 ) -> Result<Vec<LayerConfig>> {
+    let ChainCeilingPolicy {
+        ceiling_bytes: chain_bytes_ceiling,
+        preflight,
+    } = policy;
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
 
@@ -782,6 +1092,11 @@ async fn rewrite_lowers_with_runtime_roots(
             // inside it — so a compacted layer still above the ceiling means
             // compaction did not shrink the chain. The stable prefix is carried
             // for the message and not judged, exactly as it was before.
+            //
+            // The pre-flight is skipped here, not trusted: a measurement taken
+            // before the restack that already fits cannot become a breach by
+            // compaction, which only drops blocks, so re-measuring would only
+            // cost a stat pass and could never change the answer.
             let accounting_after = ChainByteAccounting {
                 reclaimable_bytes: match compacted_path.as_deref() {
                     Some(path) => chain_allocated_bytes([path]),
@@ -789,16 +1104,42 @@ async fn rewrite_lowers_with_runtime_roots(
                 },
                 stable_prefix_bytes: breakdown.stable_prefix_bytes,
             };
-            if let Some(observed_bytes) = accounting_after.ceiling_breach(chain_bytes_ceiling) {
+            if preflight.guaranteed_fit() {
+                chain_metrics::record_preflight_guaranteed_fit(compaction_output_name);
+                debug!(
+                    kind = compaction_output_name,
+                    measured_bytes = preflight.measured_bytes,
+                    ceiling_bytes = chain_bytes_ceiling,
+                    "pre-flight chain already fits; skipping the post-compaction ceiling check"
+                );
+            } else if let Some(observed_bytes) =
+                accounting_after.ceiling_breach(chain_bytes_ceiling)
+            {
+                // The refusal carries the five numbers the seven-day
+                // measurement reads from this layer: observed chain bytes, the
+                // ceiling, the appended-upper bytes, and the node's free and
+                // total bytes at the artifact root. The paused-sandbox count is
+                // logged by the orchestrator's recoverable-pause branch, the
+                // only layer with the metadata store; both lines carry the named
+                // code, so one query reads the whole refusal. The disk probe
+                // answers `None` rather than failing the refusal, so the fields
+                // are absent instead of invented when statvfs fails.
+                let space = chain_refusal_log::filesystem_space(output_dir);
                 warn!(
+                    kind = compaction_output_name,
                     ceiling_bytes = chain_bytes_ceiling,
                     observed_bytes = observed_bytes,
+                    appended_bytes = breakdown.appended_bytes,
+                    measured_before_restack_bytes = preflight.measured_bytes,
+                    artifact_root = %output_dir.display(),
+                    node_free_bytes = space.map(|(free, _)| free),
+                    node_total_bytes = space.map(|(_, total)| total),
                     stable_prefix_lowers = breakdown.stable_prefix_lowers,
                     stable_prefix_bytes = breakdown.stable_prefix_bytes,
                     compacted_lowers = breakdown.compacted_lowers,
                     compacted_bytes = breakdown.compacted_bytes,
-                    appended_bytes = breakdown.appended_bytes,
-                    "paused sandbox chain is still above the byte ceiling after compaction"
+                    "paused sandbox chain is still above the byte ceiling after compaction; \
+                     the pause is refused and the sandbox is resumed"
                 );
                 // The pause is rejected, so this generation must not survive:
                 // leave the output directory exactly as the caller will clean
@@ -972,7 +1313,13 @@ pub(super) async fn build_mem_snapshot_image_config(
         "mem_compacted.commit",
         runtime_owned_roots,
         memory_output,
-        chain_bytes_ceiling,
+        ChainCeilingPolicy {
+            ceiling_bytes: chain_bytes_ceiling,
+            // The memory chain is not restacked: the pause appends a fresh layer
+            // it just wrote, so there is no pre-mutation measurement to take and
+            // the post-compaction check stays the only judge.
+            preflight: ChainPreflight::disabled(),
+        },
     )
     .await?;
 
@@ -1024,6 +1371,39 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         .await
         .with_context(|| format!("create overlaybd snapshot dir {}", output_dir.display()))?;
 
+    // Pre-flight BEFORE the restack: the restack is the pause's point of no
+    // return (it seals the writable upper and reopens a fresh one), so the
+    // chain the pause will produce has to be estimable from what is on disk
+    // now. A measurement that already fits cannot be turned into a breach by
+    // compaction, which only drops blocks, so the post-compaction rejection is
+    // provably moot and is skipped there.
+    //
+    // This deliberately does NOT refuse: the measurement includes the writable
+    // upper's allocated bytes, an upper bound rather than a floor, so refusing
+    // on it would reject pauses that would have fit. That is worse than the
+    // refusal it would replace, which the recoverable path already turns into a
+    // resumed VM. The incident shape therefore keeps its full treatment: the
+    // measurement above the ceiling is only logged, and the post-compaction
+    // check refuses by name and the pause path resumes the VM.
+    let preflight = if read_only {
+        ChainPreflight::disabled()
+    } else {
+        preflight_chain_before_restack(
+            live_runtime_image_config_path,
+            runtime_owned_roots,
+            chain_bytes_ceiling,
+        )
+        .unwrap_or_else(|error| {
+            warn!(
+                kind,
+                error = %format_args!("{error:#}"),
+                "failed to measure the chain before the restack; the post-compaction check \
+                 still decides"
+            );
+            ChainPreflight::disabled()
+        })
+    };
+
     let live_snapshot = capture_live_overlaybd_snapshot(
         ublk_device,
         read_only,
@@ -1040,6 +1420,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         live_snapshot.snapshot_layer_path(),
         chain_bytes_ceiling,
         runtime_owned_roots,
+        preflight,
     )
     .await;
 
@@ -1459,7 +1840,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            0,
+            ChainCeilingPolicy::disabled(),
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -1516,6 +1897,270 @@ mod tests {
             super::chain_allocated_bytes([layer.as_path(), missing.as_path(), Path::new("")]),
             single
         );
+    }
+
+    /// The ceiling code must survive `finish_staging`, every other post-restack
+    /// error must stay terminal.
+    ///
+    /// `finish_staging` runs after the restack, which has already sealed the
+    /// live upper and reopened a fresh one. Treating every post-restack error as
+    /// terminal is right for a lost restack reply or a descriptor size mismatch,
+    /// because the runtime there is genuinely unknown. The ceiling is the one
+    /// exception: the daemon leaves the device usable and the VM is still paused
+    /// in memory, so the pause path must resume it instead of stopping it. This
+    /// pins that the classification is decided by the error TYPE through the
+    /// context chain, not by the message, so a wrapping `context` cannot flip it.
+    #[test]
+    fn finish_staging_keeps_the_ceiling_recoverable_and_everything_else_terminal() {
+        let breakdown = ChainCeilingBreakdown {
+            stable_prefix_lowers: 0,
+            stable_prefix_bytes: 0,
+            compacted_lowers: 4,
+            compacted_bytes: 61_167_910_912,
+            appended_bytes: 46_731_390_976,
+        };
+        // Verbatim shape of the incident: the chain needed 61,167,910,912 bytes
+        // against a 51,539,607,552 byte ceiling.
+        let ceiling = chain_ceiling_exceeded(61_167_910_912, 51_539_607_552, breakdown)
+            // The pause path wraps the rejection with context before it reaches
+            // `finish_staging`; the classification has to survive that.
+            .context("snapshot overlaybd runtime state to persistent dir");
+
+        let classified = LiveOverlaybdSnapshotState::Restacked(PathBuf::from("/tmp/unused"))
+            .finish_staging(Err(ceiling))
+            .expect_err("a ceiling rejection is still an error");
+        let capture_error = SandboxCaptureError::from(classified);
+        assert!(
+            !capture_error.is_terminal(),
+            "a chain ceiling breach after the restack must stay recoverable: {capture_error:#}"
+        );
+        // The code lives in the nested error, one context layer in; the wrapper's
+        // own `Display` shows only the outermost context, so the assertion reads
+        // the full chain exactly as an operator's `{:#}` log line would.
+        assert!(
+            format!("{:#}", capture_error.inner()).contains(CHAIN_BYTES_CEILING_EXCEEDED),
+            "the recoverable refusal must keep the named code: {:#}",
+            capture_error.inner()
+        );
+
+        // The control: a descriptor size mismatch through the same path is a
+        // post-restack error the pause cannot recover from and must stay
+        // terminal, or a genuinely broken runtime would keep serving.
+        let mismatch = into_terminal_snapshot_failure(anyhow::anyhow!(
+            "restack snapshot descriptor size mismatch"
+        ));
+        let capture_error = SandboxCaptureError::from(
+            LiveOverlaybdSnapshotState::Restacked(PathBuf::from("/tmp/unused"))
+                .finish_staging(Err(mismatch))
+                .expect_err("a size mismatch is an error"),
+        );
+        assert!(
+            capture_error.is_terminal(),
+            "a descriptor size mismatch must remain terminal: {capture_error:#}"
+        );
+
+        // And the same non-ceiling error without the explicit terminal wrapper
+        // is *not* rescued by `finish_staging`: it becomes terminal there too.
+        let unclassified = LiveOverlaybdSnapshotState::Restacked(PathBuf::from("/tmp/unused"))
+            .finish_staging(Err(anyhow::anyhow!("restack snapshot reply never arrived")))
+            .expect_err("a lost reply is an error");
+        assert!(
+            SandboxCaptureError::from(unclassified).is_terminal(),
+            "a lost restack reply must remain terminal"
+        );
+
+        // The pause adds an outer `.context(...)` on its way up, exactly like
+        // `snapshot_to_dir` does. `From<anyhow::Error>` downcasts through the
+        // context chain, so the terminal classification a nested error carries
+        // must survive that wrapper too — otherwise a size mismatch would turn
+        // recoverable one frame up and the sandbox would keep serving a runtime
+        // whose device state is unknown.
+        let wrapped_mismatch = into_terminal_snapshot_failure(anyhow::anyhow!(
+            "restack snapshot descriptor size mismatch"
+        ))
+        .context("snapshot overlaybd runtime state to persistent dir")
+        .context("pause");
+        assert!(
+            SandboxCaptureError::from(wrapped_mismatch).is_terminal(),
+            "a terminal post-restack error must survive the pause's context wrappers"
+        );
+    }
+
+    /// The classification finds the ceiling code through any depth of context.
+    ///
+    /// The pause wraps its errors at every layer (device restack, staging, the
+    /// pause itself). A message-only match would reclassify an unrelated error
+    /// that happens to mention the code, and would miss the real one once a
+    /// wrapper reworded it; matching the concrete type through the chain is the
+    /// only stable answer. This pins both halves.
+    #[test]
+    fn ceiling_classification_survives_context_layers_and_ignores_lookalikes() {
+        let real = chain_ceiling_exceeded(
+            61_167_910_912,
+            51_539_607_552,
+            ChainCeilingBreakdown::default(),
+        )
+        .context("stage snapshot")
+        .context("restack rootfs")
+        .context("pause");
+        assert!(
+            super::is_chain_bytes_ceiling_exceeded(&real),
+            "the real rejection must be recognized through three context layers"
+        );
+
+        let lookalike =
+            anyhow::anyhow!("CHAIN_BYTES_CEILING_EXCEEDED: a message that only mentions the code");
+        assert!(
+            !super::is_chain_bytes_ceiling_exceeded(&lookalike),
+            "a message that merely mentions the code must not be reclassified"
+        );
+    }
+
+    /// A rejected pause must not free a layer its live runtime config references.
+    ///
+    /// The restack repoints the live config at a layer written inside the
+    /// generation directory the rejected pause then deletes. The relocation moves
+    /// that layer to a directory that outlives the generation and rewrites the
+    /// config to the new path, so the deletion only frees bytes nothing
+    /// references. The control here is the same helper on a config that does not
+    /// reference the sealed layer: it must fail rather than silently leave a
+    /// dangling reference.
+    #[tokio::test]
+    async fn relocating_a_sealed_layer_keeps_the_live_config_resolvable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let doomed_dir = temp.path().join("doomed-generation");
+        std::fs::create_dir_all(&doomed_dir).expect("create doomed dir");
+        let retained_dir = temp.path().join("snapshot-tree").join("retained-layers");
+
+        let sealed = doomed_dir.join("snapshot.commit");
+        std::fs::write(&sealed, vec![0x7Fu8; 8192]).expect("write sealed layer");
+
+        let config_path = temp.path().join("runtime-image.json");
+        let image_config = overlaybd::config::ImageConfig {
+            lowers: vec![local_layer_config(&sealed)],
+            ..Default::default()
+        };
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&image_config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let retained =
+            super::relocate_sealed_layer_for_rejected_pause(&config_path, &sealed, &retained_dir)
+                .await
+                .expect("relocate the sealed layer");
+
+        // The copy is durable, the original is gone, and the bytes match.
+        assert!(retained.exists(), "the retained copy must exist");
+        assert!(
+            !sealed.exists(),
+            "the doomed original must be removed once the copy is durable"
+        );
+        assert_eq!(
+            std::fs::read(&retained).expect("read retained"),
+            vec![0x7Fu8; 8192]
+        );
+
+        // The live config now resolves the layer to the retained copy, so the
+        // generation directory can be deleted without dangling a reference.
+        let rewritten = overlaybd::config::load_image_config(&config_path).expect("reload config");
+        let resolved = fs::canonicalize(&rewritten.lowers[0].file)
+            .unwrap_or_else(|_| PathBuf::from(&rewritten.lowers[0].file));
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&retained).expect("canonical retained path"),
+            "the live config must point at the retained copy"
+        );
+        tokio::fs::remove_dir_all(&doomed_dir)
+            .await
+            .expect("delete the doomed generation");
+        assert!(
+            Path::new(&rewritten.lowers[0].file).exists(),
+            "deleting the generation must not break the live config's reference"
+        );
+    }
+
+    /// The relocation refuses to invent a reference and fails when the config
+    /// does not name the sealed layer, so a caller cannot mistake a no-op for a
+    /// retained layer.
+    #[tokio::test]
+    async fn relocating_a_layer_the_config_never_referenced_fails_loudly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sealed = temp.path().join("snapshot.commit");
+        std::fs::write(&sealed, b"sealed").expect("write sealed layer");
+        let other = temp.path().join("other.commit");
+        std::fs::write(&other, b"other").expect("write other layer");
+
+        let config_path = temp.path().join("runtime-image.json");
+        let image_config = overlaybd::config::ImageConfig {
+            lowers: vec![local_layer_config(&other)],
+            ..Default::default()
+        };
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&image_config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let retained_dir = temp.path().join("retained-layers");
+        let error =
+            super::relocate_sealed_layer_for_rejected_pause(&config_path, &sealed, &retained_dir)
+                .await
+                .expect_err("a config that does not reference the layer must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("does not reference the sealed layer"),
+            "the failure must name the mismatch: {error:#}"
+        );
+    }
+
+    /// The pre-flight refuses nothing and only reports whether the post-restack
+    /// rejection is provably moot.
+    #[test]
+    fn preflight_marks_a_fitting_chain_and_never_refuses() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layer = temp.path().join("generation.commit");
+        std::fs::write(&layer, vec![0xA5u8; 65536]).expect("write runtime layer");
+        let upper_data = temp.path().join("upper.data");
+        std::fs::write(&upper_data, vec![0x5Au8; 32768]).expect("write upper data");
+
+        let roots = [temp.path().to_path_buf()];
+        let chain = [local_layer_config(&layer)];
+
+        // A ceiling that holds the chain and the upper: fitting, so the
+        // post-compaction rejection cannot fire and is skipped.
+        let measured_upper = super::chain_allocated_bytes([upper_data.as_path()]);
+        assert!(measured_upper > 0, "the fixture must allocate upper bytes");
+        let generous = ChainPreflight::measure(
+            chain.clone(),
+            std::slice::from_ref(&upper_data),
+            &roots,
+            u64::MAX,
+        );
+        assert!(generous.guaranteed_fit());
+        assert_eq!(
+            generous.measured_bytes,
+            super::chain_allocated_bytes([layer.as_path()]) + measured_upper
+        );
+
+        // A ceiling below the chain alone: not a guaranteed fit, and crucially
+        // not a refusal either — the pre-flight only reports. The value stays
+        // above zero so it is a real bound and not the disabled value.
+        let tight = ChainPreflight::measure(chain, std::slice::from_ref(&upper_data), &roots, 1);
+        assert!(!tight.guaranteed_fit());
+        assert_eq!(tight.ceiling_bytes, 1);
+
+        // The disabled ceiling measures nothing and fits nothing.
+        let disabled = ChainPreflight::measure(
+            [local_layer_config(&layer)],
+            std::slice::from_ref(&upper_data),
+            &roots,
+            0,
+        );
+        assert_eq!(disabled, super::ChainPreflight::disabled());
+        assert!(!disabled.guaranteed_fit());
     }
 
     /// The ceiling must bound what grows, not what is shared.
@@ -1748,7 +2393,10 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ceiling,
+            ChainCeilingPolicy {
+                ceiling_bytes: ceiling,
+                preflight: ChainPreflight::disabled(),
+            },
         )
         .await
         .expect("a shared prefix above the ceiling must not refuse the pause");
@@ -1796,7 +2444,10 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            1,
+            ChainCeilingPolicy {
+                ceiling_bytes: 1,
+                preflight: ChainPreflight::disabled(),
+            },
         )
         .await
         .expect_err("a chain above the ceiling must fail");
@@ -1863,7 +2514,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            0,
+            ChainCeilingPolicy::disabled(),
         )
         .await
         .expect("rewrite with deep stable prefix");
@@ -1971,7 +2622,10 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ceiling,
+            ChainCeilingPolicy {
+                ceiling_bytes: ceiling,
+                preflight: ChainPreflight::disabled(),
+            },
         )
         .await
         .expect("a fully runtime-owned chain above the ceiling must compact, not fail");
@@ -2031,7 +2685,10 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ceiling,
+            ChainCeilingPolicy {
+                ceiling_bytes: ceiling,
+                preflight: ChainPreflight::disabled(),
+            },
         )
         .await
         .expect("rewrite above the byte ceiling");
@@ -2087,7 +2744,7 @@ mod tests {
                 MANAGED_BASE_LAYER_FILE,
                 &runtime_owned_roots,
                 OverlaybdCompactOutput::Raw,
-                0,
+                ChainCeilingPolicy::disabled(),
             )
             .await
             .expect("rewrite with the ceiling disabled");
@@ -2161,7 +2818,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            0,
+            ChainCeilingPolicy::disabled(),
         )
         .await
         .expect("rewrite with shrinking budget");
@@ -2209,6 +2866,7 @@ mod tests {
             Some(&snapshot_lower),
             0,
             &[],
+            ChainPreflight::disabled(),
         )
         .await
         .expect("stage snapshot");

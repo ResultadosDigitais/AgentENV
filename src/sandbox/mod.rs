@@ -39,7 +39,7 @@ pub use backend::{
 };
 pub use cpu_quota::CpuQuota;
 pub use envd::EnvdApi;
-pub(crate) use firecracker::record_startup_pack;
+pub(crate) use firecracker::{is_chain_bytes_ceiling_exceeded, record_startup_pack};
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,

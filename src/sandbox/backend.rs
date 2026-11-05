@@ -74,6 +74,20 @@ impl SandboxCaptureError {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Terminal(_))
     }
+
+    /// The wrapped error, regardless of classification.
+    ///
+    /// Named `inner` rather than `source` on purpose: `thiserror` already
+    /// generates `Error::source` for the `#[source]` fields, and an inherent
+    /// `source` would shadow it at every call site without a type annotation.
+    /// Callers that need to name a specific failure (a metric, a log line, an
+    /// operator hint) read it through here instead of matching on the Display
+    /// text, so a reclassified error keeps its identity across the wrapper.
+    pub fn inner(&self) -> &anyhow::Error {
+        match self {
+            Self::Recoverable(err) | Self::Terminal(err) => err,
+        }
+    }
 }
 
 impl From<anyhow::Error> for SandboxCaptureError {
