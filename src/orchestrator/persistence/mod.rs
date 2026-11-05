@@ -1,6 +1,7 @@
 mod file_backed;
 #[cfg(test)]
 mod mock;
+pub mod paused_store_cost;
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
