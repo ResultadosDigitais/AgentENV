@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::mmds::MmdsMetadata;
-use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
+use crate::cfg::{AppConfig, BalloonConfig, ConfigManager, EnvdConfig, ToolsConfig};
 use crate::sandbox::ublk::UblkConfig;
 use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
@@ -340,6 +340,8 @@ pub struct FirecrackerSandboxConfig {
     pub boot_args: Option<String>,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
+    /// Balloon device features for this first boot; restores inherit them.
+    pub balloon: BalloonConfig,
 }
 
 impl FirecrackerSandboxConfig {
@@ -367,6 +369,7 @@ impl FirecrackerSandboxConfig {
             boot_args: None,
             vcpu_count: app_config.machine.vcpu_count,
             mem_size_mib: app_config.machine.mem_size_mib,
+            balloon: app_config.machine.balloon,
         }
     }
 
@@ -398,6 +401,7 @@ impl FirecrackerSandboxConfig {
                 .or_else(|| Some(DEFAULT_BOOT_ARGS.to_string())),
             vcpu_count: config.machine.vcpu_count,
             mem_size_mib: config.machine.mem_size_mib,
+            balloon: config.machine.balloon.clone(),
         })
     }
 

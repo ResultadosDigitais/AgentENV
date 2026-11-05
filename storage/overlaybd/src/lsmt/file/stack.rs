@@ -313,6 +313,18 @@ pub async fn open_file_index(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyIndex
     Ok(ReadOnlyIndex::new(mappings))
 }
 
+/// Verify that `file` is a well-formed sealed readonly LSMT layer by checking
+/// its header and trailer, surfacing the underlying verification error for
+/// diagnostics. Unlike [`is_lsmt`], which collapses failures into a boolean,
+/// this lets callers distinguish a corrupt layer from a missing one and act
+/// on it (for example invalidate a cache entry and refetch the layer).
+pub async fn validate_readonly_layer(file: &Arc<dyn VirtualFile>) -> Result<()> {
+    let file_size = file.size().await?;
+    verify_ht(file, false, file_size).await?;
+    verify_ht(file, true, file_size).await?;
+    Ok(())
+}
+
 pub async fn is_lsmt(file: Arc<dyn VirtualFile>) -> i32 {
     let file_size = match file.size().await {
         Ok(s) => s,

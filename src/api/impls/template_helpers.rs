@@ -28,6 +28,7 @@ fn resolve_resources(
         cpu_count,
         memory_mib,
         disk_size_mib: 0,
+        memory_request_mib: None,
     })
 }
 

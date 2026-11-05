@@ -18,6 +18,10 @@ pub struct OrchestratorMetrics {
     pub starting_sandbox_count: u32,
     pub allocated_cpu: u32,
     pub allocated_memory_bytes: u64,
+    /// Sum of the effective memory *request* of non-paused sandboxes. Equal to
+    /// `allocated_memory_bytes` unless a sandbox was created with an explicit
+    /// `memory_request_mb` lower than its nominal limit.
+    pub requested_memory_bytes: u64,
     /// Number of sandboxes currently in the `Paused` state.
     pub paused_sandbox_count: u32,
     pub paused_allocated_cpu: u32,
@@ -78,6 +82,7 @@ pub(crate) struct SandboxContribution {
     starting_sandbox_count: u32,
     allocated_cpu: u32,
     allocated_memory_bytes: u64,
+    requested_memory_bytes: u64,
     paused_sandbox_count: u32,
     paused_allocated_cpu: u32,
     paused_allocated_memory_bytes: u64,
@@ -96,11 +101,13 @@ impl SandboxContribution {
         );
         let counts_as_starting = matches!(state, SandboxState::Creating | SandboxState::Resuming);
         let memory_bytes = u64::from(resources.memory_mib) * 1024 * 1024;
+        let request_bytes = u64::from(resources.effective_memory_request_mib()) * 1024 * 1024;
         Self {
             running_sandbox_count: u32::from(counts_as_running),
             starting_sandbox_count: u32::from(counts_as_starting),
             allocated_cpu: if !is_paused { resources.cpu_count } else { 0 },
             allocated_memory_bytes: if !is_paused { memory_bytes } else { 0 },
+            requested_memory_bytes: if !is_paused { request_bytes } else { 0 },
             paused_sandbox_count: u32::from(is_paused),
             paused_allocated_cpu: if is_paused { resources.cpu_count } else { 0 },
             paused_allocated_memory_bytes: if is_paused { memory_bytes } else { 0 },
@@ -129,6 +136,9 @@ pub(crate) fn aggregate_resource_metrics(
     metrics.allocated_memory_bytes = metrics
         .allocated_memory_bytes
         .saturating_add(contribution.allocated_memory_bytes);
+    metrics.requested_memory_bytes = metrics
+        .requested_memory_bytes
+        .saturating_add(contribution.requested_memory_bytes);
     metrics.paused_sandbox_count = metrics
         .paused_sandbox_count
         .saturating_add(contribution.paused_sandbox_count);
@@ -155,6 +165,7 @@ mod tests {
                 cpu_count: cpu,
                 memory_mib,
                 disk_size_mib: 0,
+                memory_request_mib: None,
             },
             ..Default::default()
         }
@@ -169,6 +180,21 @@ mod tests {
             );
         }
         metrics
+    }
+
+    #[test]
+    fn requested_memory_defaults_to_nominal_and_honors_request() {
+        let mut with_request = meta(SandboxState::Running, 1, 1024);
+        with_request.resources.memory_request_mib = Some(256);
+        let default_req = meta(SandboxState::Running, 1, 512);
+        let mut paused = meta(SandboxState::Paused, 1, 2048);
+        paused.resources.memory_request_mib = Some(128);
+        let metrics = aggregate([&with_request, &default_req, &paused]);
+        assert_eq!(metrics.allocated_memory_bytes, (1024u64 + 512) << 20);
+        assert_eq!(metrics.requested_memory_bytes, (256u64 + 512) << 20);
+
+        let legacy = aggregate([&default_req]);
+        assert_eq!(legacy.requested_memory_bytes, legacy.allocated_memory_bytes);
     }
 
     #[test]

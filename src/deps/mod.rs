@@ -6,16 +6,18 @@ use std::sync::{Arc, LazyLock};
 use anyhow::{bail, Context, Result};
 use object_store_operator::{
     credential_source_from_fields, CredentialFields, CredentialSource, CredentialSourceOptions,
+    GcsAuth,
 };
 use overlaybd::config::DownloadConfig;
 use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::cfg::{
-    AppConfig, OssAddressingStyle, OssBackendConfig, OverlaybdDependencyConfig,
+    AppConfig, GcsBackendConfig, OssAddressingStyle, OssBackendConfig, OverlaybdDependencyConfig,
     ResolvedImageCacheConfig, SnapshotRepositoryBackendKind,
 };
 use crate::digest::FileDigest;
+use crate::repository::backends::oss::NormalizedGcsConfig;
 use crate::virtualization::VirtualizationMode;
 
 pub(crate) mod overlaybd_tools;
@@ -826,6 +828,14 @@ fn write_generated_overlaybd_global_config(
             .context("backend.oss config is required when snapshot.repository_backend = oss")?;
         config["ossConfig"] = overlaybd_runtime_oss_config(oss_config)?;
     }
+    if app_config.snapshot.repository_backend == SnapshotRepositoryBackendKind::Gcs {
+        let gcs_config = app_config
+            .backend
+            .gcs
+            .as_ref()
+            .context("backend.gcs config is required when snapshot.repository_backend = gcs")?;
+        config["ossConfig"] = overlaybd_runtime_gcs_config(gcs_config)?;
+    }
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -857,6 +867,26 @@ fn overlaybd_credential_fields(credential_path: Option<&Path>) -> (String, serde
             serde_json::json!({"mode": "", "path": "", "timeout": 1}),
         ),
     }
+}
+
+/// The overlaybd runtime reads `gs://` layers through its `ossConfig.gcs`,
+/// which needs neither an endpoint nor a region.
+fn overlaybd_runtime_gcs_config(gcs: &GcsBackendConfig) -> Result<serde_json::Value> {
+    let normalized = NormalizedGcsConfig::new(gcs)?;
+    let (credential_path, allow_anonymous, allow_adc) = match normalized.auth() {
+        GcsAuth::ApplicationDefault => ("", false, true),
+        GcsAuth::CredentialFile(path) => (path.as_str(), false, false),
+        GcsAuth::Anonymous => ("", true, false),
+    };
+    Ok(serde_json::json!({
+        "enable": true,
+        "gcs": {
+            "endpoint": normalized.endpoint(),
+            "credentialPath": credential_path,
+            "allowAnonymous": allow_anonymous,
+            "allowApplicationDefaultCredentials": allow_adc,
+        },
+    }))
 }
 
 fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Value> {
@@ -937,13 +967,14 @@ mod tests {
     use super::{
         bundled_manifest, ensure_firecracker, ensure_kernel, ensure_legacy_tools_drive,
         ensure_tools, file_exists_nonempty, overlaybd_credential_fields,
-        overlaybd_runtime_oss_config, validate_explicit_file, version_output_mentions_exact_token,
-        write_generated_overlaybd_global_configs,
+        overlaybd_runtime_gcs_config, overlaybd_runtime_oss_config, validate_explicit_file,
+        version_output_mentions_exact_token, write_generated_overlaybd_global_configs,
     };
     use overlaybd::config::{load_global_config, DownloadConfig};
 
     use crate::cfg::{
-        AppConfig, MemorySnapshotConfig, OssBackendConfig, UblkOverlaybdTomlConfig, UblkTomlConfig,
+        AppConfig, GcsBackendConfig, MemorySnapshotConfig, OssBackendConfig,
+        UblkOverlaybdTomlConfig, UblkTomlConfig,
     };
 
     fn sample_oss_config() -> OssBackendConfig {
@@ -1011,6 +1042,62 @@ mod tests {
             "https://oss-cn-hangzhou.aliyuncs.com"
         );
         assert_eq!(config["defaultAddressingStyle"], "");
+    }
+
+    #[test]
+    fn overlaybd_runtime_gcs_config_forwards_an_explicit_application_default_opt_in() {
+        let config = overlaybd_runtime_gcs_config(&GcsBackendConfig {
+            bucket: "snapshots".to_string(),
+            prefix: None,
+            credential_path: None,
+            endpoint: None,
+            allow_anonymous: false,
+            allow_application_default_credentials: true,
+            cache_max_size_gb: None,
+        })
+        .expect("derive overlaybd gcs config");
+
+        assert_eq!(config["enable"], true);
+        assert_eq!(config["gcs"]["credentialPath"], "");
+        assert_eq!(config["gcs"]["allowAnonymous"], false);
+        assert_eq!(config["gcs"]["allowApplicationDefaultCredentials"], true);
+        assert_eq!(config["gcs"]["endpoint"], "");
+        assert!(config.get("accessKeyId").is_none());
+    }
+
+    #[test]
+    fn overlaybd_runtime_gcs_config_refuses_application_default_credentials_by_default() {
+        let err = overlaybd_runtime_gcs_config(&GcsBackendConfig {
+            bucket: "snapshots".to_string(),
+            prefix: None,
+            credential_path: None,
+            endpoint: None,
+            allow_anonymous: false,
+            allow_application_default_credentials: false,
+            cache_max_size_gb: None,
+        })
+        .expect_err("no credentials must fail");
+        assert!(err
+            .to_string()
+            .contains("allow_application_default_credentials"));
+    }
+
+    #[test]
+    fn overlaybd_runtime_gcs_config_forwards_the_key_file_and_endpoint() {
+        let config = overlaybd_runtime_gcs_config(&GcsBackendConfig {
+            bucket: "snapshots".to_string(),
+            prefix: None,
+            credential_path: Some("/etc/gcp/key.json".to_string()),
+            endpoint: Some("http://127.0.0.1:4443".to_string()),
+            allow_anonymous: false,
+            allow_application_default_credentials: false,
+            cache_max_size_gb: None,
+        })
+        .expect("derive overlaybd gcs config");
+
+        assert_eq!(config["gcs"]["credentialPath"], "/etc/gcp/key.json");
+        assert_eq!(config["gcs"]["allowApplicationDefaultCredentials"], false);
+        assert_eq!(config["gcs"]["endpoint"], "http://127.0.0.1:4443");
     }
 
     #[test]

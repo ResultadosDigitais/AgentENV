@@ -81,6 +81,13 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
+    // Terminate firecracker/uvm-ublk-daemon processes orphaned by a previous
+    // server incarnation before they can wedge startup: they hold ublk devices
+    // and inherited fds that pin the RocksDB LOCK of the persisted-sandbox
+    // store.
+    agentenv::setup::reap_orphaned_runtime_processes(config).await?;
+    // Per-sandbox CPU quota cgroups; after the reap so stale ones are empty.
+    agentenv::sandbox::CpuQuota::init_global(config.resize.enabled && config.resize.cpu_quota);
     let api_key = ApiKey::resolve(config)?;
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
@@ -187,6 +194,13 @@ async fn main() -> anyhow::Result<()> {
     });
     info!(target: "agentenv", addr = %addr, "API server listening");
     let build_cleanup = api_impl.start_image_build_cleanup();
+    // Started here, after `ApiImpl::new` has run `load_all`, so the boot
+    // sweep has already reclaimed the records it could see and the periodic
+    // pass only ever sees what is left.
+    let paused_artifact_reap = api_impl.start_paused_artifact_reap(
+        config.orchestrator.paused_artifact_reap,
+        config.snapshot.managed_layer_collect.gateway_url.as_deref(),
+    );
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
@@ -198,6 +212,12 @@ async fn main() -> anyhow::Result<()> {
                 .await;
             build_cleanup.abort();
             let _ = build_cleanup.await;
+            // Stopped before orchestration shutdown, so a pass never races the
+            // persister's own artifact removal.
+            if let Some(reap) = paused_artifact_reap {
+                reap.abort();
+                let _ = reap.await;
+            }
             if let Some(mut handle) = reporter.take() {
                 info!(target: "agentenv", "stopping observability reporter before process exit");
                 if let Err(err) = handle.shutdown().await {

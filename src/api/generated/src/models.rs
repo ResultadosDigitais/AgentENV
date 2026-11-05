@@ -187,6 +187,18 @@ pub struct SandboxesSandboxIdRefreshesPostPathParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdResourcesGetPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdResourcesPatchPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesSandboxIdResumePostPathParams {
     pub sandbox_id: String,
 }
@@ -2776,6 +2788,18 @@ pub struct ListedSandbox {
     #[validate(range(min = 128u32))]
     pub memory_mb: u32,
 
+    /// vCPUs of the sandbox's VM, fixed when the VM first booted (by its template or cold start). cpuCount can be resized up to this value.
+    #[serde(rename = "maxCpuCount")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cpu_count: Option<u32>,
+
+    /// Guest memory in MiB of the sandbox's VM, fixed when the VM first booted (by its template or cold start). memoryMB can be resized up to this value.
+    #[serde(rename = "maxMemoryMB")]
+    #[validate(range(min = 128u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u32>,
+
     /// Disk size for the sandbox in MiB
     #[serde(rename = "diskSizeMB")]
     #[validate(range(min = 0u32))]
@@ -2824,6 +2848,8 @@ impl ListedSandbox {
             end_at,
             cpu_count,
             memory_mb,
+            max_cpu_count: None,
+            max_memory_mb: None,
             disk_size_mb,
             metadata: None,
             state,
@@ -2855,6 +2881,12 @@ impl std::fmt::Display for ListedSandbox {
             Some(self.cpu_count.to_string()),
             Some("memoryMB".to_string()),
             Some(self.memory_mb.to_string()),
+            self.max_cpu_count.as_ref().map(|max_cpu_count| {
+                ["maxCpuCount".to_string(), max_cpu_count.to_string()].join(",")
+            }),
+            self.max_memory_mb.as_ref().map(|max_memory_mb| {
+                ["maxMemoryMB".to_string(), max_memory_mb.to_string()].join(",")
+            }),
             Some("diskSizeMB".to_string()),
             Some(self.disk_size_mb.to_string()),
             // Skipping metadata in query parameter serialization
@@ -2892,6 +2924,8 @@ impl std::str::FromStr for ListedSandbox {
             pub end_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
+            pub max_cpu_count: Vec<u32>,
+            pub max_memory_mb: Vec<u32>,
             pub disk_size_mb: Vec<u32>,
             pub metadata: Vec<std::collections::HashMap<String, String>>,
             pub state: Vec<models::SandboxState>,
@@ -2950,6 +2984,14 @@ impl std::str::FromStr for ListedSandbox {
                     ),
                     #[allow(clippy::redundant_clone)]
                     "memoryMB" => intermediate_rep.memory_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "maxCpuCount" => intermediate_rep.max_cpu_count.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "maxMemoryMB" => intermediate_rep.max_memory_mb.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -3027,6 +3069,8 @@ impl std::str::FromStr for ListedSandbox {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "memoryMB missing in ListedSandbox".to_string())?,
+            max_cpu_count: intermediate_rep.max_cpu_count.into_iter().next(),
+            max_memory_mb: intermediate_rep.max_memory_mb.into_iter().next(),
             disk_size_mb: intermediate_rep
                 .disk_size_mb
                 .into_iter()
@@ -3427,6 +3471,899 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MachineInfo>
     }
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ManagedLayerCollectFailure {
+    /// Repository-relative key of the object
+    #[serde(rename = "key")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub key: String,
+
+    /// Why the object could not be handled
+    #[serde(rename = "message")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub message: String,
+}
+
+impl ManagedLayerCollectFailure {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(key: String, message: String) -> ManagedLayerCollectFailure {
+        ManagedLayerCollectFailure { key, message }
+    }
+}
+
+/// Converts the ManagedLayerCollectFailure value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ManagedLayerCollectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("key".to_string()),
+            Some(self.key.to_string()),
+            Some("message".to_string()),
+            Some(self.message.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ManagedLayerCollectFailure value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ManagedLayerCollectFailure {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub key: Vec<String>,
+            pub message: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ManagedLayerCollectFailure".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "key" => intermediate_rep.key.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "message" => intermediate_rep.message.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ManagedLayerCollectFailure".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ManagedLayerCollectFailure {
+            key: intermediate_rep
+                .key
+                .into_iter()
+                .next()
+                .ok_or_else(|| "key missing in ManagedLayerCollectFailure".to_string())?,
+            message: intermediate_rep
+                .message
+                .into_iter()
+                .next()
+                .ok_or_else(|| "message missing in ManagedLayerCollectFailure".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ManagedLayerCollectFailure> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ManagedLayerCollectFailure>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ManagedLayerCollectFailure>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ManagedLayerCollectFailure - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ManagedLayerCollectFailure> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ManagedLayerCollectFailure as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ManagedLayerCollectFailure - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// `report` lists and counts without deleting anything; `enforce` deletes the uncited layers older than the grace period. Enforce is refused until a report has run in this server process.
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum ManagedLayerCollectMode {
+    #[serde(rename = "report")]
+    Report,
+    #[serde(rename = "enforce")]
+    Enforce,
+}
+
+impl validator::Validate for ManagedLayerCollectMode {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for ManagedLayerCollectMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ManagedLayerCollectMode::Report => write!(f, "report"),
+            ManagedLayerCollectMode::Enforce => write!(f, "enforce"),
+        }
+    }
+}
+
+impl std::str::FromStr for ManagedLayerCollectMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "report" => std::result::Result::Ok(ManagedLayerCollectMode::Report),
+            "enforce" => std::result::Result::Ok(ManagedLayerCollectMode::Enforce),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ManagedLayerCollectReport {
+    #[serde(rename = "mode")]
+    #[validate(nested)]
+    pub mode: models::ManagedLayerCollectMode,
+
+    /// Managed layers a catalog record or live sandbox cites
+    #[serde(rename = "citedLayers")]
+    pub cited_layers: u64,
+
+    /// Bytes of those cited layers
+    #[serde(rename = "citedBytes")]
+    pub cited_bytes: u64,
+
+    /// Uncited layers older than the grace period
+    #[serde(rename = "orphanLayers")]
+    pub orphan_layers: u64,
+
+    /// Bytes of those orphan layers
+    #[serde(rename = "orphanBytes")]
+    pub orphan_bytes: u64,
+
+    /// Uncited layers still inside the grace period, which stay
+    #[serde(rename = "unexpiredLayers")]
+    pub unexpired_layers: u64,
+
+    /// Objects under managed-layers/ whose name is not a digest. They are never deleted, because the substrate cannot prove what they are.
+    #[serde(rename = "unreadableLayers")]
+    pub unreadable_layers: u64,
+
+    /// Layers the pass could not classify because the citation set was unknowable (a live sandbox whose source left the catalog, or an unreadable record). They are neither cited nor orphaned, and are never deleted.
+    #[serde(rename = "unknownLayers")]
+    pub unknown_layers: u64,
+
+    /// Layers actually removed. Always zero in report mode.
+    #[serde(rename = "deletedLayers")]
+    pub deleted_layers: u64,
+
+    /// Bytes actually removed. Always zero in report mode.
+    #[serde(rename = "reclaimedBytes")]
+    pub reclaimed_bytes: u64,
+
+    /// Present when the pass counted but deleted nothing even in enforce mode, naming why. A live sandbox whose source left the catalog downgrades the pass.
+    #[serde(rename = "downgradedReason")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downgraded_reason: Option<String>,
+
+    /// Objects the pass could not delete or classify
+    #[serde(rename = "failures")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failures: Option<Vec<models::ManagedLayerCollectFailure>>,
+}
+
+impl ManagedLayerCollectReport {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        mode: models::ManagedLayerCollectMode,
+        cited_layers: u64,
+        cited_bytes: u64,
+        orphan_layers: u64,
+        orphan_bytes: u64,
+        unexpired_layers: u64,
+        unreadable_layers: u64,
+        unknown_layers: u64,
+        deleted_layers: u64,
+        reclaimed_bytes: u64,
+    ) -> ManagedLayerCollectReport {
+        ManagedLayerCollectReport {
+            mode,
+            cited_layers,
+            cited_bytes,
+            orphan_layers,
+            orphan_bytes,
+            unexpired_layers,
+            unreadable_layers,
+            unknown_layers,
+            deleted_layers,
+            reclaimed_bytes,
+            downgraded_reason: None,
+            failures: None,
+        }
+    }
+}
+
+/// Converts the ManagedLayerCollectReport value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ManagedLayerCollectReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping mode in query parameter serialization
+            Some("citedLayers".to_string()),
+            Some(self.cited_layers.to_string()),
+            Some("citedBytes".to_string()),
+            Some(self.cited_bytes.to_string()),
+            Some("orphanLayers".to_string()),
+            Some(self.orphan_layers.to_string()),
+            Some("orphanBytes".to_string()),
+            Some(self.orphan_bytes.to_string()),
+            Some("unexpiredLayers".to_string()),
+            Some(self.unexpired_layers.to_string()),
+            Some("unreadableLayers".to_string()),
+            Some(self.unreadable_layers.to_string()),
+            Some("unknownLayers".to_string()),
+            Some(self.unknown_layers.to_string()),
+            Some("deletedLayers".to_string()),
+            Some(self.deleted_layers.to_string()),
+            Some("reclaimedBytes".to_string()),
+            Some(self.reclaimed_bytes.to_string()),
+            self.downgraded_reason.as_ref().map(|downgraded_reason| {
+                [
+                    "downgradedReason".to_string(),
+                    downgraded_reason.to_string(),
+                ]
+                .join(",")
+            }),
+            // Skipping failures in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ManagedLayerCollectReport value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ManagedLayerCollectReport {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub mode: Vec<models::ManagedLayerCollectMode>,
+            pub cited_layers: Vec<u64>,
+            pub cited_bytes: Vec<u64>,
+            pub orphan_layers: Vec<u64>,
+            pub orphan_bytes: Vec<u64>,
+            pub unexpired_layers: Vec<u64>,
+            pub unreadable_layers: Vec<u64>,
+            pub unknown_layers: Vec<u64>,
+            pub deleted_layers: Vec<u64>,
+            pub reclaimed_bytes: Vec<u64>,
+            pub downgraded_reason: Vec<String>,
+            pub failures: Vec<Vec<models::ManagedLayerCollectFailure>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ManagedLayerCollectReport".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "mode" => intermediate_rep.mode.push(<models::ManagedLayerCollectMode as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "citedLayers" => intermediate_rep.cited_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "citedBytes" => intermediate_rep.cited_bytes.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "orphanLayers" => intermediate_rep.orphan_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "orphanBytes" => intermediate_rep.orphan_bytes.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "unexpiredLayers" => intermediate_rep.unexpired_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "unreadableLayers" => intermediate_rep.unreadable_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "unknownLayers" => intermediate_rep.unknown_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "deletedLayers" => intermediate_rep.deleted_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "reclaimedBytes" => intermediate_rep.reclaimed_bytes.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "downgradedReason" => intermediate_rep.downgraded_reason.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "failures" => return std::result::Result::Err("Parsing a container in this style is not supported in ManagedLayerCollectReport".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing ManagedLayerCollectReport".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ManagedLayerCollectReport {
+            mode: intermediate_rep
+                .mode
+                .into_iter()
+                .next()
+                .ok_or_else(|| "mode missing in ManagedLayerCollectReport".to_string())?,
+            cited_layers: intermediate_rep
+                .cited_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "citedLayers missing in ManagedLayerCollectReport".to_string())?,
+            cited_bytes: intermediate_rep
+                .cited_bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "citedBytes missing in ManagedLayerCollectReport".to_string())?,
+            orphan_layers: intermediate_rep
+                .orphan_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "orphanLayers missing in ManagedLayerCollectReport".to_string())?,
+            orphan_bytes: intermediate_rep
+                .orphan_bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "orphanBytes missing in ManagedLayerCollectReport".to_string())?,
+            unexpired_layers: intermediate_rep
+                .unexpired_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "unexpiredLayers missing in ManagedLayerCollectReport".to_string()
+                })?,
+            unreadable_layers: intermediate_rep
+                .unreadable_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "unreadableLayers missing in ManagedLayerCollectReport".to_string()
+                })?,
+            unknown_layers: intermediate_rep
+                .unknown_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "unknownLayers missing in ManagedLayerCollectReport".to_string())?,
+            deleted_layers: intermediate_rep
+                .deleted_layers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "deletedLayers missing in ManagedLayerCollectReport".to_string())?,
+            reclaimed_bytes: intermediate_rep
+                .reclaimed_bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "reclaimedBytes missing in ManagedLayerCollectReport".to_string())?,
+            downgraded_reason: intermediate_rep.downgraded_reason.into_iter().next(),
+            failures: intermediate_rep.failures.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ManagedLayerCollectReport> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ManagedLayerCollectReport>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ManagedLayerCollectReport>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ManagedLayerCollectReport - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ManagedLayerCollectReport> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ManagedLayerCollectReport as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ManagedLayerCollectReport - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ManagedLayerCollectRequest {
+    #[serde(rename = "mode")]
+    #[validate(nested)]
+    pub mode: models::ManagedLayerCollectMode,
+
+    /// Overrides the configured grace period for this pass, in seconds. An uncited layer younger than this is kept: a publish uploads its layers before it writes the record that cites them.
+    #[serde(rename = "graceSeconds")]
+    #[validate(range(min = 0u64))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grace_seconds: Option<u64>,
+}
+
+impl ManagedLayerCollectRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(mode: models::ManagedLayerCollectMode) -> ManagedLayerCollectRequest {
+        ManagedLayerCollectRequest {
+            mode,
+            grace_seconds: None,
+        }
+    }
+}
+
+/// Converts the ManagedLayerCollectRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ManagedLayerCollectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping mode in query parameter serialization
+            self.grace_seconds.as_ref().map(|grace_seconds| {
+                ["graceSeconds".to_string(), grace_seconds.to_string()].join(",")
+            }),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ManagedLayerCollectRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ManagedLayerCollectRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub mode: Vec<models::ManagedLayerCollectMode>,
+            pub grace_seconds: Vec<u64>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ManagedLayerCollectRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "mode" => intermediate_rep.mode.push(
+                        <models::ManagedLayerCollectMode as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "graceSeconds" => intermediate_rep.grace_seconds.push(
+                        <u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ManagedLayerCollectRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ManagedLayerCollectRequest {
+            mode: intermediate_rep
+                .mode
+                .into_iter()
+                .next()
+                .ok_or_else(|| "mode missing in ManagedLayerCollectRequest".to_string())?,
+            grace_seconds: intermediate_rep.grace_seconds.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ManagedLayerCollectRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ManagedLayerCollectRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ManagedLayerCollectRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ManagedLayerCollectRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ManagedLayerCollectRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ManagedLayerCollectRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ManagedLayerCollectRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// vCPUs of the sandbox's VM, fixed when the VM first booted (by its template or cold start). cpuCount can be resized up to this value.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct MaxCpuCount {}
+
+impl MaxCpuCount {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> MaxCpuCount {
+        MaxCpuCount {}
+    }
+}
+
+/// Converts the MaxCpuCount value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for MaxCpuCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a MaxCpuCount value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for MaxCpuCount {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {}
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing MaxCpuCount".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing MaxCpuCount".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(MaxCpuCount {})
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<MaxCpuCount> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<MaxCpuCount>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<MaxCpuCount>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for MaxCpuCount - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MaxCpuCount> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <MaxCpuCount as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into MaxCpuCount - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Guest memory in MiB of the sandbox's VM, fixed when the VM first booted (by its template or cold start). memoryMB can be resized up to this value.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct MaxMemoryMb {}
+
+impl MaxMemoryMb {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> MaxMemoryMb {
+        MaxMemoryMb {}
+    }
+}
+
+/// Converts the MaxMemoryMb value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for MaxMemoryMb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a MaxMemoryMb value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for MaxMemoryMb {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {}
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing MaxMemoryMb".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing MaxMemoryMb".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(MaxMemoryMb {})
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<MaxMemoryMb> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<MaxMemoryMb>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<MaxMemoryMb>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for MaxMemoryMb - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MaxMemoryMb> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <MaxMemoryMb as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into MaxMemoryMb - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
 /// Memory for the sandbox in MiB
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
@@ -3616,6 +4553,12 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u32>,
 
+    /// Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
+    #[serde(rename = "memoryRequestMB")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_request_mb: Option<u32>,
+
     /// Disk size for the sandbox in MiB
     #[serde(rename = "diskSizeMB")]
     #[validate(range(min = 0u32))]
@@ -3652,6 +4595,7 @@ impl NewColdSandbox {
             volume_mounts: None,
             cpu_count: None,
             memory_mb: None,
+            memory_request_mb: None,
             disk_size_mb: None,
             attached_drives: None,
             extra_boot_args: None,
@@ -3702,6 +4646,9 @@ impl std::fmt::Display for NewColdSandbox {
             self.memory_mb
                 .as_ref()
                 .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+            self.memory_request_mb.as_ref().map(|memory_request_mb| {
+                ["memoryRequestMB".to_string(), memory_request_mb.to_string()].join(",")
+            }),
             self.disk_size_mb
                 .as_ref()
                 .map(|disk_size_mb| ["diskSizeMB".to_string(), disk_size_mb.to_string()].join(",")),
@@ -3744,6 +4691,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
+            pub memory_request_mb: Vec<u32>,
             pub disk_size_mb: Vec<u32>,
             pub attached_drives: Vec<Vec<models::AttachedDrive>>,
             pub extra_boot_args: Vec<String>,
@@ -3831,6 +4779,10 @@ impl std::str::FromStr for NewColdSandbox {
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
+                    "memoryRequestMB" => intermediate_rep.memory_request_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
                     "diskSizeMB" => intermediate_rep.disk_size_mb.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
@@ -3875,6 +4827,7 @@ impl std::str::FromStr for NewColdSandbox {
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),
             memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+            memory_request_mb: intermediate_rep.memory_request_mb.into_iter().next(),
             disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
             attached_drives: intermediate_rep.attached_drives.into_iter().next(),
             extra_boot_args: intermediate_rep.extra_boot_args.into_iter().next(),
@@ -3991,6 +4944,24 @@ pub struct NewSandbox {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+
+    /// vCPUs of CPU time for this sandbox, up to the template's cpuCount. Defaults to the template's. A lower value needs [resize].enabled and the CPU quota on the node; vCPUs cannot be added beyond the template's VM.
+    #[serde(rename = "cpuCount")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+
+    /// Guest memory in MiB for this sandbox, up to the template's memoryMB. Defaults to the template's. A lower value needs [resize].enabled on the node.
+    #[serde(rename = "memoryMB")]
+    #[validate(range(min = 128u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u32>,
+
+    /// Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= the sandbox's effective memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
+    #[serde(rename = "memoryRequestMB")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_request_mb: Option<u32>,
 }
 
 impl NewSandbox {
@@ -4009,6 +4980,9 @@ impl NewSandbox {
             custom_extension_params: None,
             mcp: None,
             volume_mounts: None,
+            cpu_count: None,
+            memory_mb: None,
+            memory_request_mb: None,
         }
     }
 }
@@ -4053,6 +5027,15 @@ impl std::fmt::Display for NewSandbox {
             // Skipping mcp in query parameter serialization
 
             // Skipping volumeMounts in query parameter serialization
+            self.cpu_count
+                .as_ref()
+                .map(|cpu_count| ["cpuCount".to_string(), cpu_count.to_string()].join(",")),
+            self.memory_mb
+                .as_ref()
+                .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+            self.memory_request_mb.as_ref().map(|memory_request_mb| {
+                ["memoryRequestMB".to_string(), memory_request_mb.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -4087,6 +5070,9 @@ impl std::str::FromStr for NewSandbox {
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub cpu_count: Vec<u32>,
+            pub memory_mb: Vec<u32>,
+            pub memory_request_mb: Vec<u32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4168,6 +5154,18 @@ impl std::str::FromStr for NewSandbox {
                                 .to_string(),
                         );
                     }
+                    #[allow(clippy::redundant_clone)]
+                    "cpuCount" => intermediate_rep.cpu_count.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryMB" => intermediate_rep.memory_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryRequestMB" => intermediate_rep.memory_request_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandbox".to_string(),
@@ -4200,6 +5198,9 @@ impl std::str::FromStr for NewSandbox {
                 "Nullable types not supported in NewSandbox".to_string(),
             )?,
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            cpu_count: intermediate_rep.cpu_count.into_iter().next(),
+            memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+            memory_request_mb: intermediate_rep.memory_request_mb.into_iter().next(),
         })
     }
 }
@@ -4309,6 +5310,18 @@ pub struct NewSandboxV2 {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+
+    /// vCPUs of CPU time for this sandbox, up to the template's cpuCount. Defaults to the template's. A lower value needs [resize].enabled and the CPU quota on the node; vCPUs cannot be added beyond the template's VM.
+    #[serde(rename = "cpuCount")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+
+    /// Guest memory in MiB for this sandbox, up to the template's memoryMB. Defaults to the template's. A lower value needs [resize].enabled on the node.
+    #[serde(rename = "memoryMB")]
+    #[validate(range(min = 128u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u32>,
 }
 
 impl NewSandboxV2 {
@@ -4326,6 +5339,8 @@ impl NewSandboxV2 {
             custom_extension_params: None,
             mcp: None,
             volume_mounts: None,
+            cpu_count: None,
+            memory_mb: None,
         }
     }
 }
@@ -4367,6 +5382,12 @@ impl std::fmt::Display for NewSandboxV2 {
             // Skipping mcp in query parameter serialization
 
             // Skipping volumeMounts in query parameter serialization
+            self.cpu_count
+                .as_ref()
+                .map(|cpu_count| ["cpuCount".to_string(), cpu_count.to_string()].join(",")),
+            self.memory_mb
+                .as_ref()
+                .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
         ];
 
         write!(
@@ -4400,6 +5421,8 @@ impl std::str::FromStr for NewSandboxV2 {
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub cpu_count: Vec<u32>,
+            pub memory_mb: Vec<u32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4477,6 +5500,14 @@ impl std::str::FromStr for NewSandboxV2 {
                                 .to_string(),
                         );
                     }
+                    #[allow(clippy::redundant_clone)]
+                    "cpuCount" => intermediate_rep.cpu_count.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryMB" => intermediate_rep.memory_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandboxV2".to_string(),
@@ -4508,6 +5539,8 @@ impl std::str::FromStr for NewSandboxV2 {
                 "Nullable types not supported in NewSandboxV2".to_string(),
             )?,
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            cpu_count: intermediate_rep.cpu_count.into_iter().next(),
+            memory_mb: intermediate_rep.memory_mb.into_iter().next(),
         })
     }
 }
@@ -6505,6 +7538,18 @@ pub struct SandboxDetail {
     #[validate(range(min = 128u32))]
     pub memory_mb: u32,
 
+    /// vCPUs of the sandbox's VM, fixed when the VM first booted (by its template or cold start). cpuCount can be resized up to this value.
+    #[serde(rename = "maxCpuCount")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cpu_count: Option<u32>,
+
+    /// Guest memory in MiB of the sandbox's VM, fixed when the VM first booted (by its template or cold start). memoryMB can be resized up to this value.
+    #[serde(rename = "maxMemoryMB")]
+    #[validate(range(min = 128u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u32>,
+
     /// Disk size for the sandbox in MiB
     #[serde(rename = "diskSizeMB")]
     #[validate(range(min = 0u32))]
@@ -6562,6 +7607,8 @@ impl SandboxDetail {
             domain: None,
             cpu_count,
             memory_mb,
+            max_cpu_count: None,
+            max_memory_mb: None,
             disk_size_mb,
             metadata: None,
             state,
@@ -6619,6 +7666,12 @@ impl std::fmt::Display for SandboxDetail {
             Some(self.cpu_count.to_string()),
             Some("memoryMB".to_string()),
             Some(self.memory_mb.to_string()),
+            self.max_cpu_count.as_ref().map(|max_cpu_count| {
+                ["maxCpuCount".to_string(), max_cpu_count.to_string()].join(",")
+            }),
+            self.max_memory_mb.as_ref().map(|max_memory_mb| {
+                ["maxMemoryMB".to_string(), max_memory_mb.to_string()].join(",")
+            }),
             Some("diskSizeMB".to_string()),
             Some(self.disk_size_mb.to_string()),
             // Skipping metadata in query parameter serialization
@@ -6663,6 +7716,8 @@ impl std::str::FromStr for SandboxDetail {
             pub domain: Vec<String>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
+            pub max_cpu_count: Vec<u32>,
+            pub max_memory_mb: Vec<u32>,
             pub disk_size_mb: Vec<u32>,
             pub metadata: Vec<std::collections::HashMap<String, String>>,
             pub state: Vec<models::SandboxState>,
@@ -6738,6 +7793,14 @@ impl std::str::FromStr for SandboxDetail {
                     ),
                     #[allow(clippy::redundant_clone)]
                     "memoryMB" => intermediate_rep.memory_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "maxCpuCount" => intermediate_rep.max_cpu_count.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "maxMemoryMB" => intermediate_rep.max_memory_mb.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -6833,6 +7896,8 @@ impl std::str::FromStr for SandboxDetail {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "memoryMB missing in SandboxDetail".to_string())?,
+            max_cpu_count: intermediate_rep.max_cpu_count.into_iter().next(),
+            max_memory_mb: intermediate_rep.max_memory_mb.into_iter().next(),
             disk_size_mb: intermediate_rep
                 .disk_size_mb
                 .into_iter()
@@ -7676,6 +8741,54 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLogsV
     }
 }
 
+/// Whether the guest has reached memoryMB. converged: the balloon holds its target (or was deflated to zero). converging: the guest is still inflating or deflating the balloon, or cannot give up memory it is using. unobservable: the sandbox is not running, or its VM's balloon was booted without statistics ([machine.balloon].stats_polling_interval_s).
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum SandboxMemoryLimitState {
+    #[serde(rename = "converged")]
+    Converged,
+    #[serde(rename = "converging")]
+    Converging,
+    #[serde(rename = "unobservable")]
+    Unobservable,
+}
+
+impl validator::Validate for SandboxMemoryLimitState {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for SandboxMemoryLimitState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            SandboxMemoryLimitState::Converged => write!(f, "converged"),
+            SandboxMemoryLimitState::Converging => write!(f, "converging"),
+            SandboxMemoryLimitState::Unobservable => write!(f, "unobservable"),
+        }
+    }
+}
+
+impl std::str::FromStr for SandboxMemoryLimitState {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "converged" => std::result::Result::Ok(SandboxMemoryLimitState::Converged),
+            "converging" => std::result::Result::Ok(SandboxMemoryLimitState::Converging),
+            "unobservable" => std::result::Result::Ok(SandboxMemoryLimitState::Unobservable),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
 /// Metric entry with timestamp and line
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
@@ -8497,6 +9610,428 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxRefre
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into SandboxRefreshRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxResourceStatus {
+    /// vCPUs of CPU time the sandbox may use.
+    #[serde(rename = "cpuCount")]
+    #[validate(range(min = 1u32))]
+    pub cpu_count: u32,
+
+    /// Guest memory in MiB the sandbox may use.
+    #[serde(rename = "memoryMB")]
+    #[validate(range(min = 128u32))]
+    pub memory_mb: u32,
+
+    /// vCPUs of the sandbox's VM, fixed when the VM first booted (by its template or cold start). cpuCount can be resized up to this value.
+    #[serde(rename = "maxCpuCount")]
+    #[validate(range(min = 1u32))]
+    pub max_cpu_count: u32,
+
+    /// Guest memory in MiB of the sandbox's VM, fixed when the VM first booted (by its template or cold start). memoryMB can be resized up to this value.
+    #[serde(rename = "maxMemoryMB")]
+    #[validate(range(min = 128u32))]
+    pub max_memory_mb: u32,
+
+    /// vCPUs of CPU time the VMM process is capped at through cgroup v2 cpu.max. Null when the VMM may use every vCPU or the sandbox is not running.
+    #[serde(rename = "cpuQuota")]
+    #[validate(range(min = 0u32))]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_quota: Option<Nullable<u32>>,
+
+    /// Guest memory in MiB the balloon is asked to hold (maxMemoryMB - memoryMB). Null when the sandbox is not running or its VM has no balloon device.
+    #[serde(rename = "balloonTargetMB")]
+    #[validate(range(min = 0u32))]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balloon_target_mb: Option<Nullable<u32>>,
+
+    /// Guest memory in MiB the balloon holds. Null when the sandbox is not running or its VM's balloon reports no statistics.
+    #[serde(rename = "balloonActualMB")]
+    #[validate(range(min = 0u32))]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balloon_actual_mb: Option<Nullable<u32>>,
+
+    #[serde(rename = "memoryState")]
+    #[validate(nested)]
+    pub memory_state: models::SandboxMemoryLimitState,
+}
+
+impl SandboxResourceStatus {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        cpu_count: u32,
+        memory_mb: u32,
+        max_cpu_count: u32,
+        max_memory_mb: u32,
+        memory_state: models::SandboxMemoryLimitState,
+    ) -> SandboxResourceStatus {
+        SandboxResourceStatus {
+            cpu_count,
+            memory_mb,
+            max_cpu_count,
+            max_memory_mb,
+            cpu_quota: None,
+            balloon_target_mb: None,
+            balloon_actual_mb: None,
+            memory_state,
+        }
+    }
+}
+
+/// Converts the SandboxResourceStatus value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxResourceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("cpuCount".to_string()),
+            Some(self.cpu_count.to_string()),
+            Some("memoryMB".to_string()),
+            Some(self.memory_mb.to_string()),
+            Some("maxCpuCount".to_string()),
+            Some(self.max_cpu_count.to_string()),
+            Some("maxMemoryMB".to_string()),
+            Some(self.max_memory_mb.to_string()),
+            self.cpu_quota.as_ref().map(|cpu_quota| {
+                [
+                    "cpuQuota".to_string(),
+                    cpu_quota
+                        .as_ref()
+                        .map_or("null".to_string(), |x| x.to_string()),
+                ]
+                .join(",")
+            }),
+            self.balloon_target_mb.as_ref().map(|balloon_target_mb| {
+                [
+                    "balloonTargetMB".to_string(),
+                    balloon_target_mb
+                        .as_ref()
+                        .map_or("null".to_string(), |x| x.to_string()),
+                ]
+                .join(",")
+            }),
+            self.balloon_actual_mb.as_ref().map(|balloon_actual_mb| {
+                [
+                    "balloonActualMB".to_string(),
+                    balloon_actual_mb
+                        .as_ref()
+                        .map_or("null".to_string(), |x| x.to_string()),
+                ]
+                .join(",")
+            }),
+            // Skipping memoryState in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxResourceStatus value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxResourceStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub cpu_count: Vec<u32>,
+            pub memory_mb: Vec<u32>,
+            pub max_cpu_count: Vec<u32>,
+            pub max_memory_mb: Vec<u32>,
+            pub cpu_quota: Vec<u32>,
+            pub balloon_target_mb: Vec<u32>,
+            pub balloon_actual_mb: Vec<u32>,
+            pub memory_state: Vec<models::SandboxMemoryLimitState>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxResourceStatus".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "cpuCount" => intermediate_rep.cpu_count.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryMB" => intermediate_rep.memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "maxCpuCount" => intermediate_rep.max_cpu_count.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "maxMemoryMB" => intermediate_rep.max_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "cpuQuota" => return std::result::Result::Err("Parsing a nullable type in this style is not supported in SandboxResourceStatus".to_string()),
+                    "balloonTargetMB" => return std::result::Result::Err("Parsing a nullable type in this style is not supported in SandboxResourceStatus".to_string()),
+                    "balloonActualMB" => return std::result::Result::Err("Parsing a nullable type in this style is not supported in SandboxResourceStatus".to_string()),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryState" => intermediate_rep.memory_state.push(<models::SandboxMemoryLimitState as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    _ => return std::result::Result::Err("Unexpected key while parsing SandboxResourceStatus".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxResourceStatus {
+            cpu_count: intermediate_rep
+                .cpu_count
+                .into_iter()
+                .next()
+                .ok_or_else(|| "cpuCount missing in SandboxResourceStatus".to_string())?,
+            memory_mb: intermediate_rep
+                .memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| "memoryMB missing in SandboxResourceStatus".to_string())?,
+            max_cpu_count: intermediate_rep
+                .max_cpu_count
+                .into_iter()
+                .next()
+                .ok_or_else(|| "maxCpuCount missing in SandboxResourceStatus".to_string())?,
+            max_memory_mb: intermediate_rep
+                .max_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| "maxMemoryMB missing in SandboxResourceStatus".to_string())?,
+            cpu_quota: std::result::Result::Err(
+                "Nullable types not supported in SandboxResourceStatus".to_string(),
+            )?,
+            balloon_target_mb: std::result::Result::Err(
+                "Nullable types not supported in SandboxResourceStatus".to_string(),
+            )?,
+            balloon_actual_mb: std::result::Result::Err(
+                "Nullable types not supported in SandboxResourceStatus".to_string(),
+            )?,
+            memory_state: intermediate_rep
+                .memory_state
+                .into_iter()
+                .next()
+                .ok_or_else(|| "memoryState missing in SandboxResourceStatus".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxResourceStatus> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxResourceStatus>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxResourceStatus>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxResourceStatus - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxResourceStatus> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxResourceStatus as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxResourceStatus - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// New effective CPU and memory for a running sandbox, inside its VM shape (maxCpuCount / maxMemoryMB). An omitted field keeps its current value; at least one field is required.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxResourcesUpdate {
+    /// vCPUs of CPU time the sandbox may use, from 1 to maxCpuCount.
+    #[serde(rename = "cpuCount")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+
+    /// Guest memory in MiB, from the node's minimum ([resize].min_memory_mib) to maxMemoryMB.
+    #[serde(rename = "memoryMB")]
+    #[validate(range(min = 128u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u32>,
+}
+
+impl SandboxResourcesUpdate {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> SandboxResourcesUpdate {
+        SandboxResourcesUpdate {
+            cpu_count: None,
+            memory_mb: None,
+        }
+    }
+}
+
+/// Converts the SandboxResourcesUpdate value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxResourcesUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            self.cpu_count
+                .as_ref()
+                .map(|cpu_count| ["cpuCount".to_string(), cpu_count.to_string()].join(",")),
+            self.memory_mb
+                .as_ref()
+                .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxResourcesUpdate value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxResourcesUpdate {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub cpu_count: Vec<u32>,
+            pub memory_mb: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxResourcesUpdate".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "cpuCount" => intermediate_rep.cpu_count.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryMB" => intermediate_rep.memory_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxResourcesUpdate".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxResourcesUpdate {
+            cpu_count: intermediate_rep.cpu_count.into_iter().next(),
+            memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxResourcesUpdate> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxResourcesUpdate>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxResourcesUpdate>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxResourcesUpdate - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxResourcesUpdate> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxResourcesUpdate as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxResourcesUpdate - {err}"#
                     )),
                 }
             }

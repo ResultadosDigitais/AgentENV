@@ -32,12 +32,17 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_VIRTUALIZATION_MODE` | `kvm` | Select the node virtualization mode. Leave unset for normal installations; set to `pvm` only when following the [PVM Deployment](../deployment/pvm.md) guide. |
 | `AENV_SNAPSHOT_LOCAL_CACHE_PATH` | `$AENV_HOME/snapshot-local-cache` | Override the snapshot manager's node-local artifact/cache root |
 | `AENV_SNAPSHOT_STORE` | `$AENV_HOME/snapshot-store` | Override the posix_fs snapshot repository root directory |
+| `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED` | `false` | Enable `POST /admin/managed-layers/collect`, which sweeps managed layers no catalog record cites. Disabled, the endpoint answers 409 and sweeps nothing. Deleting a layer is irreversible, so a report pass must run before any `enforce` in the same server process. See [Managed Layer Collection](../internals/persistence-artifact-inventory.md#managed-layer-collection). |
+| `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS` | `7200` | How old an uncited managed layer must be before `enforce` may delete it. A publish uploads its layers before it writes the record that cites them, so a layer younger than this may belong to a publish in flight. |
+| `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL` | unset | Base URL of the cluster gateway (`http://agentenv-gateway:8080` in the provided deployment), called as `GET /v2/sandboxes` with this node's API key. The gateway fans the list out to every node, so a sandbox paused on another node keeps its source layers cited, and the paused-artifact sweep sees it too. Unset, or when any node of the fan-out fails, `enforce` answers 409 and only `report` runs. |
+| `AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP` | `off` | Periodic sweep of `persisted_sandboxes/artifacts/` that reclaims a sandbox directory no record and no cluster list names any more: `off`, `report` (list and count only) or `enforce` (move to `artifacts/.trash/{epoch}/`, then delete after a second grace). Any failed or unconfigured cluster list degrades a pass to a report; see [Paused Artifact Reaping](../internals/persistence-artifact-inventory.md#orchestrator-persistence). |
 | `AENV_UBLK_DAEMON_BINARY_PATH` | `$AENV_HOME/ublk/uvm-ublk-daemon` | Override path to the `uvm-ublk-daemon` binary |
 | `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR` | `0.0.0.0:9103` | Override ublk daemon Prometheus metrics listen address; empty string disables it |
 | `AENV_FORCE_SYSCTL_TUNING` | unset | Set to `1` to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers. |
 | `AENV_FIRECRACKER_WORK_DIR` | `$AENV_HOME/firecracker-work` | Override the parent directory for per-sandbox Firecracker work directories. |
 | `AENV_FIRECRACKER_SERIAL_DIR` | `$AENV_HOME/logs/serial` | Override the directory for persistent Firecracker serial output. Files are grouped under `{serial_dir}/{sandbox_id}/`. |
 | `AENV_PERSISTED_SANDBOX_STORE_PATH` | `$AENV_HOME/persisted-sandboxes` | Override the directory where paused sandbox state is persisted across server restarts. |
+| `AENV_CHAIN_BYTES_CEILING` | `51539607552` (48 GiB) | Override the byte ceiling for the reclaimable part of one sandbox's paused artifact chain (its runtime-owned generations plus each pause's appended layer; the shared image prefix is reported but not charged). A breach is a recoverable refusal: the sandbox is resumed in place and keeps running and serving, so no ceiling path stops the VM. `0` disables the ceiling, the pre-flight and the stale-generation sweep, restoring the unbounded behavior without a redeploy. |
 
 ## E2B SDK / CLI
 
@@ -51,18 +56,10 @@ These variables configure the E2B SDK and CLI to point at an AgentENV server. Va
 
 ### Values by Deployment Mode
 
-**Manual compile (single node)**:
+**Manual compile (single node)** uses port `8000`; **Docker Compose / Kubernetes (multi-node)** uses `8080`:
 
 ```bash
-export E2B_API_URL=http://127.0.0.1:8000
-export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=${AENV_API_KEY}
-```
-
-**Docker Compose / Kubernetes (multi-node)**:
-
-```bash
-export E2B_API_URL=http://127.0.0.1:8080
+export E2B_API_URL=http://127.0.0.1:8080   # 8000 on a single node
 export E2B_SANDBOX_URL=${E2B_API_URL}
 export E2B_API_KEY=${AENV_API_KEY}
 ```
@@ -101,7 +98,7 @@ These variables apply to both the gateway and scheduler processes.
 |----------|---------|-------------|
 | `SCHEDULER_GRPC_LISTEN_ADDR` | `:9090` | gRPC listen address |
 | `SCHEDULER_METRICS_LISTEN_ADDR` | `:9101` | Prometheus metrics listen address |
-| `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin` or `random` |
+| `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin`, `random` or `least_loaded` (the less loaded of two sampled nodes, by heartbeat CPU and memory) |
 | `SCHEDULER_REDIS_ADDR` | unset | Redis address for persistent sandbox-to-node bindings (for example, `redis:6379`). Unset = in-memory bindings, lost on scheduler restart. |
 | `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). |
 | `SCHEDULER_ARTIFACT_STORE_CAPACITY` | `1000000` | Maximum number of P2P artifact entries held in the scheduler's in-memory index |

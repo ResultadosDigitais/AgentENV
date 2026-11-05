@@ -36,6 +36,12 @@ spec:
                   optional: true
             - name: AENV_VIRTUALIZATION_MODE
               value: "kvm"
+            # Ceiling for one sandbox's paused artifact chain. 0 disables both
+            # the ceiling and the stale-generation sweep on this node, which is
+            # the rollback for a node whose chain growth has to be stopped
+            # without a code redeploy.
+            - name: AENV_CHAIN_BYTES_CEILING
+              value: "51539607552"
             - name: API_ADDR
               value: "0.0.0.0:8000"
             - name: AENV_UBLK_DAEMON_BINARY_PATH
@@ -80,20 +86,35 @@ spec:
                   - "-c"
                   - |
                     echo "preStop: waiting for sandboxes to drain..."
-                    while true; do
-                      count=$(curl -sf -H "X-API-Key: ${AENV_API_KEY}" http://localhost:8000/sandboxes | jq 'length') || count=""
+                    # Global deadline: give up well before
+                    # terminationGracePeriodSeconds so the kubelet still has
+                    # time to SIGTERM the agent and let it persist sandboxes.
+                    drain_timeout=240
+                    deadline=$(( $(date +%s) + drain_timeout ))
+                    failures=0
+                    max_failures=5
+                    while [ "$(date +%s)" -lt "$deadline" ]; do
+                      count=$(curl -sf --max-time 5 -H "X-API-Key: ${AENV_API_KEY}" http://localhost:8000/sandboxes | jq 'length') || count=""
                       if [ -z "$count" ]; then
-                        echo "preStop: failed to query sandbox count, retrying..."
-                        sleep 3
+                        failures=$((failures + 1))
+                        echo "preStop: failed to query sandbox count (attempt $failures/$max_failures)"
+                        if [ "$failures" -ge "$max_failures" ]; then
+                          echo "preStop: drain query unreachable; proceeding with termination"
+                          exit 0
+                        fi
+                        sleep $(( failures * 3 ))
                         continue
                       fi
+                      failures=0
                       echo "preStop: $count sandbox(es) remaining"
                       if [ "$count" = "0" ]; then
                         echo "preStop: all sandboxes drained, exiting"
-                        break
+                        exit 0
                       fi
                       sleep 3
                     done
+                    echo "preStop: drain deadline (${drain_timeout}s) reached; proceeding with termination"
+                    exit 0
             postStart:
               exec:
                 command:

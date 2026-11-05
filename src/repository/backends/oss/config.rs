@@ -1,10 +1,88 @@
 use anyhow::{Context, Result};
 use object_store_operator::{
     credential_source_from_fields, normalized_credential, AddressingStyle, CredentialFields,
-    CredentialSource, CredentialSourceOptions,
+    CredentialSource, CredentialSourceOptions, GcsAuth,
 };
 
-use crate::cfg::{OssAddressingStyle, OssBackendConfig, SnapshotImageStoragePolicy};
+use super::client::OssClient;
+use crate::cfg::{
+    GcsBackendConfig, OssAddressingStyle, OssBackendConfig, SnapshotImageStoragePolicy,
+};
+
+/// `[backend.gcs]` with blanks trimmed and the conflicting settings rejected.
+#[derive(Debug, Clone)]
+pub(crate) struct NormalizedGcsConfig {
+    bucket: String,
+    prefix: String,
+    endpoint: String,
+    auth: GcsAuth,
+}
+
+impl NormalizedGcsConfig {
+    pub(crate) fn new(config: &GcsBackendConfig) -> Result<Self> {
+        let bucket = normalized_credential(Some(config.bucket.as_str()))
+            .context("backend.gcs.bucket cannot be empty")?
+            .to_string();
+        let prefix = config
+            .prefix
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .trim_matches('/')
+            .to_string();
+        let endpoint = normalized_credential(config.endpoint.as_deref())
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        let credential_path = normalized_credential(config.credential_path.as_deref());
+        let adc = config.allow_application_default_credentials;
+        let auth = match (credential_path, config.allow_anonymous, adc) {
+            (Some(_), true, _) => anyhow::bail!(
+                "backend.gcs.credential_path cannot be combined with backend.gcs.allow_anonymous"
+            ),
+            (Some(_), _, true) => anyhow::bail!(
+                "backend.gcs.credential_path cannot be combined with \
+                 backend.gcs.allow_application_default_credentials"
+            ),
+            (None, true, true) => anyhow::bail!(
+                "backend.gcs.allow_anonymous cannot be combined with \
+                 backend.gcs.allow_application_default_credentials"
+            ),
+            (Some(path), false, false) => GcsAuth::CredentialFile(path.to_string()),
+            (None, true, false) => GcsAuth::Anonymous,
+            (None, false, true) => GcsAuth::ApplicationDefault,
+            (None, false, false) => anyhow::bail!(
+                "backend.gcs needs credentials: set backend.gcs.credential_path (recommended), \
+                 or explicitly backend.gcs.allow_application_default_credentials = true, \
+                 or backend.gcs.allow_anonymous = true for emulators"
+            ),
+        };
+        Ok(Self {
+            bucket,
+            prefix,
+            endpoint,
+            auth,
+        })
+    }
+
+    /// The emulator endpoint; empty for Google's own.
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub(crate) fn auth(&self) -> &GcsAuth {
+        &self.auth
+    }
+
+    pub(crate) fn client(&self) -> OssClient {
+        OssClient::new_gcs(
+            self.bucket.clone(),
+            self.endpoint.clone(),
+            self.prefix.clone(),
+            self.auth.clone(),
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct NormalizedOssConfig {
@@ -103,8 +181,111 @@ impl NormalizedOssConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::NormalizedOssConfig;
-    use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
+    use object_store_operator::GcsAuth;
+
+    use super::{NormalizedGcsConfig, NormalizedOssConfig};
+    use crate::cfg::{GcsBackendConfig, OssBackendConfig, SnapshotImageStoragePolicy};
+
+    fn gcs_config() -> GcsBackendConfig {
+        GcsBackendConfig {
+            bucket: " snapshots ".to_string(),
+            prefix: Some(" /agentenv/prod/ ".to_string()),
+            credential_path: Some("/etc/gcp/credential.json".to_string()),
+            endpoint: None,
+            allow_anonymous: false,
+            allow_application_default_credentials: false,
+            cache_max_size_gb: None,
+        }
+    }
+
+    #[test]
+    fn gcs_config_trims_and_selects_the_credential_file() {
+        let mut config = gcs_config();
+        config.credential_path = Some(" /etc/gcp/key.json ".to_string());
+        config.endpoint = Some(" http://127.0.0.1:4443/ ".to_string());
+
+        let normalized = NormalizedGcsConfig::new(&config).expect("normalize");
+        assert_eq!(normalized.bucket, "snapshots");
+        assert_eq!(normalized.prefix, "agentenv/prod");
+        assert_eq!(normalized.endpoint(), "http://127.0.0.1:4443");
+        assert_eq!(
+            normalized.auth(),
+            &GcsAuth::CredentialFile("/etc/gcp/key.json".to_string())
+        );
+    }
+
+    #[test]
+    fn gcs_config_refuses_application_default_credentials_by_default() {
+        let mut config = gcs_config();
+        config.credential_path = None;
+
+        let err = NormalizedGcsConfig::new(&config).expect_err("no credentials must fail");
+        let message = err.to_string();
+        assert!(message.contains("credential_path"), "{message}");
+        assert!(
+            message.contains("allow_application_default_credentials"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn gcs_config_allows_application_default_credentials_only_when_asked() {
+        let mut config = gcs_config();
+        config.credential_path = None;
+        config.allow_application_default_credentials = true;
+
+        let normalized = NormalizedGcsConfig::new(&config).expect("explicit opt-in");
+        assert_eq!(normalized.auth(), &GcsAuth::ApplicationDefault);
+    }
+
+    #[test]
+    fn gcs_config_rejects_conflicting_credential_choices() {
+        let mut config = gcs_config();
+        config.allow_application_default_credentials = true;
+        let err = NormalizedGcsConfig::new(&config).expect_err("file and ADC");
+        assert!(err.to_string().contains("cannot be combined"));
+
+        let mut config = gcs_config();
+        config.credential_path = None;
+        config.allow_anonymous = true;
+        config.allow_application_default_credentials = true;
+        let err = NormalizedGcsConfig::new(&config).expect_err("anonymous and ADC");
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn gcs_config_allows_anonymous_requests_only_without_a_credential_file() {
+        let mut config = gcs_config();
+        config.credential_path = None;
+        config.allow_anonymous = true;
+        assert_eq!(
+            NormalizedGcsConfig::new(&config).expect("anonymous").auth(),
+            &GcsAuth::Anonymous
+        );
+
+        config.credential_path = Some("/etc/gcp/key.json".to_string());
+        let err = NormalizedGcsConfig::new(&config).expect_err("mixed auth must fail");
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn gcs_config_requires_a_bucket() {
+        let mut config = gcs_config();
+        config.bucket = "  ".to_string();
+        let err = NormalizedGcsConfig::new(&config).expect_err("blank bucket must fail");
+        assert!(err.to_string().contains("backend.gcs.bucket"));
+    }
+
+    #[test]
+    fn gcs_client_names_objects_with_gs_urls_under_the_prefix() {
+        let client = NormalizedGcsConfig::new(&gcs_config())
+            .expect("normalize")
+            .client();
+        assert_eq!(
+            client.object_url("managed-layers"),
+            "gs://snapshots/agentenv/prod/managed-layers"
+        );
+    }
 
     fn sample_config() -> OssBackendConfig {
         OssBackendConfig {

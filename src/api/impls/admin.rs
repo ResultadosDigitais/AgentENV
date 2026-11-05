@@ -1,12 +1,28 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use axum_extra::extract::CookieJar;
 use headers::Host;
 use http::Method;
 
+use crate::maintenance::{
+    collect_managed_layers, ClusterLiveSandboxes, GatewaySandboxList, LiveSandboxes,
+    ManagedLayerCollectMode, ManagedLayerCollectReport, ManagedLayerCollectRequest,
+    ManagedLayerCollectorError, OrchestratorLiveSandboxes,
+};
 use crate::observability::{DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
 use agentenv_http_server::{apis::admin::*, models};
 
 use super::ApiImpl;
+
+/// Whether a report pass has run in this process, which enforce requires.
+///
+/// Enforce is irreversible: the bucket has no trash, and a layer cannot be
+/// rebuilt without its origin. Requiring one report first makes an operator see
+/// what a pass would remove before it removes anything.
+static REPORT_RAN: AtomicBool = AtomicBool::new(false);
 
 impl From<MachineInfo> for models::MachineInfo {
     fn from(machine_info: MachineInfo) -> Self {
@@ -74,6 +90,36 @@ impl From<NodeSnapshot> for models::Node {
 #[async_trait]
 impl Admin<()> for ApiImpl {
     type Claims = super::Claims;
+
+    async fn admin_managed_layers_collect_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        body: &models::ManagedLayerCollectRequest,
+    ) -> Result<AdminManagedLayersCollectPostResponse, ()> {
+        match self.run_managed_layer_collect(body).await {
+            Ok(report) => Ok(
+                AdminManagedLayersCollectPostResponse::Status200_SuccessfullyRanOneCollectionPass(
+                    report.into(),
+                ),
+            ),
+            // The refusals this endpoint decides itself (disabled on this node,
+            // another pass running, enforce before a report) are conflicts; a
+            // backend failure keeps its own status.
+            Err(error) => Ok(match error.code {
+                400 => AdminManagedLayersCollectPostResponse::Status400_BadRequest(error),
+                403 => AdminManagedLayersCollectPostResponse::Status403_Forbidden(error),
+                409 => {
+                    AdminManagedLayersCollectPostResponse::Status409_ThePassIsDisabledOnThisNode(
+                        error,
+                    )
+                }
+                _ => AdminManagedLayersCollectPostResponse::Status500_ServerError(error),
+            }),
+        }
+    }
 
     async fn nodes_get(
         &self,
@@ -165,5 +211,131 @@ impl Admin<()> for ApiImpl {
             node.paused_sandbox_count,
         );
         Ok(NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(detail))
+    }
+}
+
+impl ApiImpl {
+    /// Runs one collection pass, or returns the client-facing error explaining
+    /// why it did not run.
+    async fn run_managed_layer_collect(
+        &self,
+        body: &models::ManagedLayerCollectRequest,
+    ) -> Result<ManagedLayerCollectReport, models::Error> {
+        let config = crate::cfg::ConfigManager::global_config();
+        let collect = &config.snapshot.managed_layer_collect;
+        if !collect.enabled {
+            return Err(Self::error(
+                409,
+                "managed layer collection is disabled; set \
+                 AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED=true to enable it",
+            ));
+        }
+        let mode = match body.mode {
+            models::ManagedLayerCollectMode::Report => ManagedLayerCollectMode::Report,
+            models::ManagedLayerCollectMode::Enforce => ManagedLayerCollectMode::Enforce,
+        };
+        // Enforce is irreversible, so an operator must have seen a report from
+        // this process first.
+        if mode == ManagedLayerCollectMode::Enforce && !REPORT_RAN.load(Ordering::SeqCst) {
+            return Err(Self::error(
+                409,
+                "enforce requires a report pass in this server process first",
+            ));
+        }
+        let grace = body.grace_seconds.map_or_else(
+            || Duration::from_secs(collect.grace_secs),
+            Duration::from_secs,
+        );
+        // Without the gateway this node sees only its own sandboxes, so a
+        // sandbox paused on another node reads layers the pass would call
+        // uncited. Report still runs, and says so; enforce is refused outright.
+        if mode == ManagedLayerCollectMode::Enforce && collect.gateway_url.is_none() {
+            return Err(Self::error(
+                409,
+                "enforce requires the cluster gateway URL, so that sandboxes on other nodes \
+                 keep their layers cited; set \
+                 AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL and restart",
+            ));
+        }
+        let live = self.live_sandboxes(collect.gateway_url.as_deref())?;
+        let repository = self.repository();
+        let report = collect_managed_layers(
+            repository.as_ref(),
+            &live,
+            &ManagedLayerCollectRequest { mode, grace },
+        )
+        .await
+        .map_err(|error| match error {
+            ManagedLayerCollectorError::Locked => {
+                Self::error(409, "another managed-layer collection pass is running")
+            }
+            ManagedLayerCollectorError::ReportRequired => {
+                Self::error(409, "enforce requires a report pass first")
+            }
+            ManagedLayerCollectorError::Repository(error) => Self::repository_error(&error),
+        })?;
+        if mode == ManagedLayerCollectMode::Report {
+            REPORT_RAN.store(true, Ordering::SeqCst);
+        }
+        Ok(report)
+    }
+
+    /// The collector's live-sandbox reader: this node plus, when configured, the
+    /// gateway's list of every node.
+    ///
+    /// A pass that cannot see the sandboxes of other nodes cannot prove any
+    /// layer uncited — a sandbox paused elsewhere reads its source snapshot's
+    /// layers on resume — so without a gateway the pass may only report.
+    fn live_sandboxes(
+        &self,
+        gateway_url: Option<&str>,
+    ) -> Result<ClusterLiveSandboxes, models::Error> {
+        let local: Arc<dyn LiveSandboxes> =
+            Arc::new(OrchestratorLiveSandboxes::new(self.orchestrator()));
+        let Some(gateway_url) = gateway_url else {
+            return Ok(ClusterLiveSandboxes::new(local, None));
+        };
+        let gateway = GatewaySandboxList::new(gateway_url, self.api_key().clone())
+            .map_err(|error| Self::error(500, format!("invalid cluster gateway URL: {error:#}")))?;
+        Ok(ClusterLiveSandboxes::new(local, Some(Arc::new(gateway))))
+    }
+}
+
+impl From<ManagedLayerCollectMode> for models::ManagedLayerCollectMode {
+    fn from(mode: ManagedLayerCollectMode) -> Self {
+        match mode {
+            ManagedLayerCollectMode::Report => Self::Report,
+            ManagedLayerCollectMode::Enforce => Self::Enforce,
+        }
+    }
+}
+
+impl From<ManagedLayerCollectReport> for models::ManagedLayerCollectReport {
+    fn from(report: ManagedLayerCollectReport) -> Self {
+        models::ManagedLayerCollectReport {
+            mode: report
+                .mode
+                .unwrap_or(ManagedLayerCollectMode::Report)
+                .into(),
+            cited_layers: report.cited_layers,
+            cited_bytes: report.cited_bytes,
+            orphan_layers: report.orphan_layers,
+            orphan_bytes: report.orphan_bytes,
+            unexpired_layers: report.unexpired_layers,
+            unknown_layers: report.unknown_layers,
+            unreadable_layers: report.unreadable_layers,
+            deleted_layers: report.deleted_layers,
+            reclaimed_bytes: report.reclaimed_bytes,
+            downgraded_reason: report.downgraded_reason,
+            failures: (!report.failures.is_empty()).then(|| {
+                report
+                    .failures
+                    .into_iter()
+                    .map(|failure| {
+                        models::ManagedLayerCollectFailure::new(failure.key, failure.message)
+                    })
+                    .collect()
+            }),
+        }
     }
 }

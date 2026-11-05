@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 pub(crate) mod image;
 pub(crate) mod network;
+mod paused_artifact_reap;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::Config;
 pub use image::{
@@ -11,6 +13,7 @@ pub use image::{
 };
 pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
+pub use paused_artifact_reap::PausedArtifactReapMode;
 use serde::Deserialize;
 
 use crate::virtualization::VirtualizationMode;
@@ -106,6 +109,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub machine: MachineConfig,
     #[config(nested)]
+    pub resize: ResizeConfig,
+    #[config(nested)]
     pub backend: BackendConfig,
     #[config(nested)]
     pub envd: EnvdConfig,
@@ -147,6 +152,7 @@ pub struct AppConfig {
 pub struct BackendConfig {
     pub posix_fs: Option<PosixFsBackendConfig>,
     pub oss: Option<OssBackendConfig>,
+    pub gcs: Option<GcsBackendConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -219,6 +225,12 @@ pub struct FirecrackerProcessPoolConfig {
     pub startup_prewarm: bool,
     #[config(default = 4usize)]
     pub fill_concurrency: usize,
+    /// Seconds without pool acquisitions before the geometric fill target
+    /// decays back to the low watermark and excess warm processes are drained.
+    /// 0 disables decay and keeps the fill target ratcheted for the process
+    /// lifetime.
+    #[config(default = 600u64)]
+    pub idle_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +327,49 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     #[config(nested)]
     pub disk_rate_limit: DiskRateLimitConfig,
+    #[config(nested)]
+    pub balloon: BalloonConfig,
+}
+
+/// The virtio-balloon device a VM gets when it first boots (cold starts and
+/// template builds). A VM restored from a snapshot keeps the device the
+/// snapshot was taken with, so changes here reach existing templates only
+/// after they are rebuilt.
+#[derive(Debug, Config, Clone)]
+pub struct BalloonConfig {
+    /// Let the guest take balloon memory back under memory pressure. `true`
+    /// makes a memory limit below the VM shape advisory; `false` enforces it,
+    /// so a guest that outgrows the limit OOM-kills inside it.
+    #[config(default = true)]
+    pub deflate_on_oom: bool,
+    /// Balloon statistics polling interval in seconds; `0` disables them.
+    /// Without statistics the resources API cannot report how much memory
+    /// the balloon actually holds.
+    #[config(default = 0u32)]
+    pub stats_polling_interval_s: u32,
+}
+
+/// Per-sandbox resources inside the VM shape: `cpuCount`/`memoryMB` on
+/// snapshot-based creates and live resize through
+/// `PATCH /sandboxes/{sandboxID}/resources`.
+#[derive(Debug, Config, Clone)]
+pub struct ResizeConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Enforce CPU limits below the VM shape with a cgroup v2 `cpu.max` quota
+    /// on each VMM process. Needs a writable, delegated cgroup v2 hierarchy
+    /// with the `cpu` controller; without one, only memory can be resized.
+    #[config(default = true)]
+    pub cpu_quota: bool,
+    /// Smallest effective guest memory in MiB a sandbox may be given.
+    #[config(default = 512u32)]
+    pub min_memory_mib: u32,
+    /// Reject a resize that grows a sandbox when the CPUs allocated to the
+    /// node's running sandboxes would exceed this percentage of its CPUs.
+    pub max_cpu_allocated_percent: Option<u32>,
+    /// Reject a resize that grows a sandbox when the memory allocated to the
+    /// node's running sandboxes would exceed this percentage of its memory.
+    pub max_memory_allocated_percent: Option<u32>,
 }
 
 #[derive(Debug, Config, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -361,6 +416,44 @@ pub struct SnapshotConfig {
     pub publish_compression: SnapshotPublishCompressionConfig,
     #[config(nested)]
     pub memory_startup_pack: SnapshotStartupPackConfig,
+    #[config(nested)]
+    pub managed_layer_collect: SnapshotManagedLayerCollectConfig,
+}
+
+/// Collecting managed layers that no record cites.
+///
+/// The pass deletes content-addressed layers, and a layer cannot be recreated
+/// without its origin, so it is off unless an operator turns it on and runs a
+/// report first.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotManagedLayerCollectConfig {
+    /// Whether the admin collection endpoint runs at all. Disabled, it answers
+    /// 409 and sweeps nothing.
+    #[config(default = false, env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED")]
+    pub enabled: bool,
+    /// How old an uncited layer must be before enforce may delete it. This
+    /// covers one publication, which uploads its layers before it writes the
+    /// record that cites them: a layer uploaded moments ago and not cited yet
+    /// belongs to a publication in flight. Measured on staging from a golden's
+    /// first layer upload to its record commit; see
+    /// `docs/src/internals/persistence-artifact-inventory.md`.
+    #[config(
+        default = 7200u64,
+        env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS"
+    )]
+    pub grace_secs: u64,
+    /// Base URL of the cluster gateway, used to list the sandboxes of every
+    /// node. The collector must keep a layer cited when a sandbox paused on
+    /// *another* node still reads it, and a node can only see its own
+    /// sandboxes, so the pass reads the gateway's aggregated list.
+    ///
+    /// Unset, the pass cannot prove which layers the other nodes use: enforce is
+    /// refused and only a report runs.
+    #[config(
+        env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL",
+        parse_env = parse_trimmed_string
+    )]
+    pub gateway_url: Option<String>,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -452,6 +545,37 @@ pub struct OssBackendConfig {
     pub cache_max_size_gb: Option<u64>,
 }
 
+/// Google Cloud Storage snapshot repository. Exactly one way to authenticate
+/// must be chosen: `credential_path`, `allow_anonymous`, or the explicit
+/// opt-in `allow_application_default_credentials`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GcsBackendConfig {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    /// Credential JSON file: a service-account key, or an `external_account`
+    /// (Workload Identity Federation) configuration. A file that is missing or
+    /// unparsable fails requests; it never falls back to another source.
+    #[serde(alias = "credentialPath", alias = "credential-path")]
+    pub credential_path: Option<String>,
+    /// API endpoint override for emulators such as fake-gcs-server. Unset
+    /// selects `https://storage.googleapis.com`.
+    pub endpoint: Option<String>,
+    /// Send unauthenticated requests: emulators and public buckets only.
+    #[serde(default, alias = "allowAnonymous", alias = "allow-anonymous")]
+    pub allow_anonymous: bool,
+    /// Resolve Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`,
+    /// the gcloud well-known file, then the metadata server. Off by default
+    /// because the metadata server hands its identity to everything that
+    /// shares the host's or pod's network.
+    #[serde(
+        default,
+        alias = "allowApplicationDefaultCredentials",
+        alias = "allow-application-default-credentials"
+    )]
+    pub allow_application_default_credentials: bool,
+    pub cache_max_size_gb: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotImageStoragePolicy {
@@ -465,6 +589,7 @@ pub enum SnapshotImageStoragePolicy {
 pub enum SnapshotRepositoryBackendKind {
     PosixFs,
     Oss,
+    Gcs,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -654,6 +779,23 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
+
+    /// Ceiling, in bytes, for the reclaimable part of the paused artifact chain
+    /// of a single sandbox: its runtime-owned overlaybd generations plus the
+    /// layer each pause appends. The image-derived stable prefix is reported by
+    /// the rejection but never charged, because every sandbox of an image points
+    /// at the same node-local files. A pause whose reclaimable part would push
+    /// past this value compacts the runtime-owned suffix into one complete
+    /// generation (and reclaims unreferenced files from stale generations). `0`
+    /// disables both the ceiling and the reclaim sweep. PROVISIONAL default:
+    /// 48 GiB comes from the OPSAI-5494 staging measurement of 29/10/2026; the
+    /// node-by-node rollout re-measures compaction wall clock and may adjust it.
+    #[config(default = 51539607552u64, env = "AENV_CHAIN_BYTES_CEILING")]
+    pub chain_bytes_ceiling: u64,
+
+    /// Paused-artifact sweep kill switch; see [`PausedArtifactReapMode`].
+    #[config(default = "off", env = "AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP")]
+    pub paused_artifact_reap: PausedArtifactReapMode,
 }
 
 /// Custom extension service integration.
@@ -727,6 +869,8 @@ impl_config_default!(
     SandboxConfig,
     VolumeConfig,
     MachineConfig,
+    BalloonConfig,
+    ResizeConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
     SnapshotPublishCompressionConfig,
@@ -883,6 +1027,9 @@ impl AppConfig {
             high_watermark: self.pool.high_watermark,
             maintenance_enabled: pool.enabled && pool.maintenance_enabled,
             startup_prewarm: pool.startup_prewarm,
+            // The network slot pool holds no processes; keep its historical
+            // ratchet behavior without idle decay.
+            idle_ttl: None,
         }
     }
 
@@ -900,6 +1047,7 @@ impl AppConfig {
             // reusable device shape is image/size dependent.
             maintenance_enabled: false,
             startup_prewarm: pool.startup_prewarm,
+            idle_ttl: None,
         })
     }
 
@@ -916,6 +1064,7 @@ impl AppConfig {
                 high_watermark: self.pool.high_watermark,
                 maintenance_enabled: pool.maintenance_enabled,
                 startup_prewarm: pool.startup_prewarm,
+                idle_ttl: (pool.idle_ttl_secs > 0).then(|| Duration::from_secs(pool.idle_ttl_secs)),
             },
             fill_concurrency: pool.fill_concurrency,
         })
@@ -1911,6 +2060,74 @@ mod tests {
             config.resolved_overlaybd_oci_converter_id(),
             "overlaybd-oci:test-version:agentenv-cache-v1"
         );
+    }
+
+    /// `chain_bytes_ceiling` is bound to its own env var, ships the provisional
+    /// 48 GiB default, and accepts `0` as the documented disabled value.
+    #[test]
+    fn chain_bytes_ceiling_default_env_binding_and_disabled_value() -> Result<()> {
+        fn find_leaf(
+            meta: &confique::meta::Meta,
+            prefix: &str,
+            wanted: &str,
+        ) -> Option<(Option<&'static str>, Option<confique::meta::Expr>)> {
+            for field in meta.fields {
+                let path = if prefix.is_empty() {
+                    field.name.to_string()
+                } else {
+                    format!("{prefix}.{}", field.name)
+                };
+                match field.kind {
+                    confique::meta::FieldKind::Leaf { env, kind } => {
+                        if path == wanted {
+                            let default = match kind {
+                                confique::meta::LeafKind::Required { default } => default,
+                                confique::meta::LeafKind::Optional => None,
+                            };
+                            return Some((env, default));
+                        }
+                    }
+                    confique::meta::FieldKind::Nested { meta } => {
+                        if let Some(found) = find_leaf(meta, &path, wanted) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let (env, default) = find_leaf(&AppConfig::META, "", "orchestrator.chain_bytes_ceiling")
+            .expect("orchestrator.chain_bytes_ceiling must exist in the schema");
+        assert_eq!(
+            env,
+            Some("AENV_CHAIN_BYTES_CEILING"),
+            "the knob must be overridable by its own documented env var"
+        );
+        assert_eq!(
+            default,
+            Some(confique::meta::Expr::Integer(confique::meta::Integer::U64(
+                48 * 1024 * 1024 * 1024
+            ))),
+            "the default must be the provisional 48 GiB ceiling in bytes"
+        );
+
+        // The shipped config file carries the same value, so a node reading
+        // `config/default.toml` and a node relying on the schema default agree.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert_eq!(
+            config.config().orchestrator.chain_bytes_ceiling,
+            48 * 1024 * 1024 * 1024
+        );
+
+        // `0` is a legal value: it is the kill switch, not a validation error.
+        let temp = tempdir()?;
+        let disabled_path = temp.path().join("disabled.toml");
+        std::fs::write(&disabled_path, "[orchestrator]\nchain_bytes_ceiling = 0\n")?;
+        let disabled = ConfigManager::new_from_path(&disabled_path)?;
+        assert_eq!(disabled.config().orchestrator.chain_bytes_ceiling, 0);
+        Ok(())
     }
 
     #[test]

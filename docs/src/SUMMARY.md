@@ -39,6 +39,7 @@
 - [Sandboxes](./concepts/sandboxes/index.md)
   - [Starting a Sandbox](./concepts/sandboxes/starting.md)
   - [Working with Sandboxes](./concepts/sandboxes/working.md)
+  - [Resources and Live Resize](./concepts/sandboxes/resources.md)
   - [Auto-Eviction](./concepts/sandboxes/auto-eviction.md)
   - [Networking](./concepts/sandboxes/networking.md)
   - [Proxy](./concepts/sandboxes/proxy.md)

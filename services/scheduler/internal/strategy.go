@@ -52,6 +52,8 @@ func NewStrategy(name string) Strategy {
 	switch name {
 	case "random":
 		return NewRandomStrategy()
+	case "least_loaded":
+		return NewLeastLoadedStrategy()
 	case "round_robin":
 		fallthrough
 	default:

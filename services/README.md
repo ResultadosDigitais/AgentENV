@@ -10,7 +10,7 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Gateway resolves `GET /nodes/{id}` via scheduler and proxies to the target node.
 - Gateway routes sandbox requests by existing sandbox-to-node binding.
 - Scheduler exposes gRPC API and supports pluggable strategy providers.
-- Built-in strategies in v1: round_robin and random.
+- Built-in strategies: round_robin, random and least_loaded.
 - Scheduler supports both static node configuration and Kubernetes EndpointSlice discovery.
 - Scheduler sandbox binding store can be in-memory or Redis-backed.
 - Scheduler can run as a primary read/write service or as query-only replicas that serve only `LookupNode` from Redis.
@@ -116,8 +116,9 @@ General config notes:
 |---|---|
 | `round_robin` (default) | Cycles through eligible nodes in stable order |
 | `random` | Picks a uniformly random eligible node |
+| `least_loaded` | Samples two distinct eligible nodes and keeps the one with the lower heartbeat load: the higher of CPU and memory pressure, plus 15 points per sandbox still starting; a node without a heartbeat loses to one with it |
 
-The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
+The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). `round_robin` and `random` ignore the snapshot; `least_loaded` reads it.
 
 ### Node resource limit
 
@@ -135,6 +136,10 @@ All fields are optional. Omitting a field (or setting the whole block to `null`)
 | `max_cpu_allocated_percent` | uint32 | Maximum allocated-CPU-to-physical-CPU ratio; can exceed 100 when overcommit is allowed |
 | `max_memory_used_percent` | uint32 | Maximum observed memory usage (0–100) |
 | `max_memory_allocated_percent` | uint32 | Maximum allocated-memory-to-physical-memory ratio; can exceed 100 when overcommit is allowed |
+| `admission_mode` | string | `nominal` (default), `request` or `shadow`; see "Memory admission modes" below |
+| `max_memory_limit_overcommit_ratio` | float | In `request`/`shadow` mode: cap on (sum of nominal VM sizes) / node memory. Default `1.5`; ignored in `nominal` |
+| `max_disk_used_percent` | uint32 | Maximum used percentage of the filesystem at `disk_mount_point` (0–100). Always effective: unlike the memory limits it does not take part in `admission_mode` |
+| `disk_mount_point` | string | Mount point of the heartbeat disk metric the disk limit reads, matched exactly. Default `/workspace`; only used when `max_disk_used_percent` is set |
 
 Example:
 
@@ -145,9 +150,25 @@ Example:
   "max_cpu_used_percent": 90,
   "max_cpu_allocated_percent": 150,
   "max_memory_used_percent": 85,
-  "max_memory_allocated_percent": 150
+  "max_memory_allocated_percent": 150,
+  "max_disk_used_percent": 75,
+  "disk_mount_point": "/workspace"
 }
 ```
+
+The disk limit reads the real used/total ratio of one mount point and rejects the node when it is strictly above the limit. A heartbeat that does not carry that mount (an older agent) is admitted — fail-open — and counted in `agentenv_scheduler_disk_admission_total{outcome="mount_missing"}`, so an inert limit is visible instead of silent. Pausing a sandbox writes a chain of roughly one VM's worth of state to this filesystem, so the limit protects the next pause, not only the current usage.
+
+### Memory admission modes
+
+A sandbox is booted with a fixed VM size (`memoryMB`, the *limit*; no memory hotplug). Sandbox creation also accepts an optional `memoryRequestMB` (> 0, <= `memoryMB`, default = `memoryMB`) which only affects scheduling; it never changes the VM size. Nodes report the sum of active requests as `requested_memory_bytes` next to `allocated_memory_bytes` (sum of limits).
+
+- `nominal` (default): `max_memory_allocated_percent` compares the sum of limits. Identical to previous releases; `memoryRequestMB`, `requested_memory_bytes` and `max_memory_limit_overcommit_ratio` are ignored.
+- `request`: `max_memory_allocated_percent` compares the sum of requests, and the sum of limits must stay <= `max_memory_limit_overcommit_ratio` x node memory. `max_memory_used_percent` still applies and is the only protection against real host exhaustion.
+- `shadow`: decides exactly like `nominal`, evaluates `request` in parallel, logs `admission shadow divergence` and increments `agentenv_scheduler_admission_shadow_total{outcome=agree|request_would_reject|request_would_admit}`. Use it to size the rollout before enabling `request`.
+
+Nodes running an older agent report no `requested_memory_bytes`; they are evaluated with their nominal figure in `request` mode. Unknown `admission_mode` values or a ratio <= 0 are rejected at startup.
+
+Risk: in `request` mode, sandboxes can grow to their limit at the same time and exhaust host memory (OOM kills of Firecracker processes). Do not enable `request` before a pressure-based pause/eviction mechanism exists on the node; paused sandboxes are not counted in the active sums.
 
 When all nodes are filtered out, the scheduler returns `Unavailable` to the caller.
 

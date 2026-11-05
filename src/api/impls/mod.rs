@@ -3,6 +3,7 @@ mod attached_drives;
 pub(crate) mod auth;
 pub(crate) mod image_build;
 mod pagination;
+mod paused_artifacts;
 mod sandbox;
 mod snapshots;
 mod template;
@@ -96,6 +97,13 @@ impl ApiImpl {
         Arc::clone(&self.orchestrator)
     }
 
+    /// The API key this node authenticates inbound requests with. Its only
+    /// outbound use is calling the cluster gateway with the credential the node
+    /// already holds; it must never be logged or returned.
+    pub(crate) fn api_key(&self) -> &ApiKey {
+        &self.api_key
+    }
+
     pub(crate) fn proxy_client(&self) -> &ProxyClient {
         &self.proxy_client
     }
@@ -106,6 +114,11 @@ impl ApiImpl {
 
     pub(crate) fn image_resolver(&self) -> Arc<ImageResolver> {
         Arc::clone(&self.image_resolver)
+    }
+
+    /// The durable repository the snapshot manager reads and writes.
+    pub(crate) fn repository(&self) -> Arc<dyn crate::repository::Repository> {
+        self.snapshot_manager.repository()
     }
 
     /// Returns the optional observability service backing node/admin

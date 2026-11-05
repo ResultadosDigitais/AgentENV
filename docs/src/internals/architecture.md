@@ -132,6 +132,7 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 | Observability | `src/observability/` | Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting |
 | Sandbox | `src/sandbox/` | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
 | Snapshot + Template Builder | `src/snapshot/`, `src/template/` | `src/snapshot/` owns committed snapshot storage/runtime resolution; `src/template/` provides the user-facing builder that publishes snapshots |
+| Repository maintenance | `src/maintenance/` | Operations no single catalog owns. Today: collecting managed layers no catalog record cites, in report or enforce mode, under a repository lock. It sits above the catalogs because `repository` may not import them and `snapshot` may not import `volume` |
 | P2P artifact transport | `src/p2p/` | Optional project-wide artifact lookup, publish, and fetch layer with disabled and iroh-backed transports |
 | Config | `src/cfg.rs` | TOML config for firecracker paths, machine specs, timeouts, shared pool tuning, observability metadata, P2P, and scheduler-report settings |
 

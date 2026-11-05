@@ -422,6 +422,7 @@ impl ObservabilityReporter {
                 paused_sandbox_count: snapshot.paused_sandbox_count,
                 paused_allocated_cpu: snapshot.metrics.paused_allocated_cpu,
                 paused_allocated_memory_bytes: snapshot.metrics.paused_allocated_memory_bytes,
+                requested_memory_bytes: snapshot.metrics.requested_memory_bytes,
             }),
             sandbox_ids: snapshot
                 .sandbox_ids

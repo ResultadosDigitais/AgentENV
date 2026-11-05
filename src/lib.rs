@@ -7,6 +7,7 @@ pub mod identity;
 pub mod image;
 mod local_store;
 pub mod logging;
+pub mod maintenance;
 mod managed_secret;
 #[cfg(test)]
 mod module_cycles;

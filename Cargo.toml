@@ -48,7 +48,7 @@ custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/
 tokio = { version = "1", features = ["full"] }
 reqsign = { version = "0.16.5", default-features = false, features = ["services-aws"] }
 reqwest = { version = "0.13", features = ["json", "stream"] }
-opendal = { version = "0.55.0", features = ["services-oss", "services-s3"] }
+opendal = { version = "0.55.0", features = ["services-gcs", "services-oss", "services-s3"] }
 object-store-operator = { path = "crates/object-store-operator" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
@@ -104,7 +104,8 @@ uvm-ublk-daemon = { path = "storage/ublk-daemon" }
 shell-util = { path = "crates/shell-util" }
 linux-cap = { path = "crates/linux-cap" }
 warm-pool = { path = "crates/warm-pool" }
-ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
+# Registry, not the git rev: the sandbox git proxy reaches only the card's repo; 0.1.0 == rev c6a3e06.
+ublk-sys = { package = "libublk-rs-sys", version = "=0.1.0" }
 overlaybd = { path = "storage/overlaybd" }
 storage-util = { path = "storage/util" }
 dashmap = "6.1.0"

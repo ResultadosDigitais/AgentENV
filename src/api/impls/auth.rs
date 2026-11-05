@@ -10,7 +10,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-pub(crate) const API_KEY_HEADER: &str = "x-api-key";
+/// Re-exported so the many inbound call sites keep reading one name; the value
+/// itself lives in `api_key`, because the outbound cluster reader presents it
+/// too and the wire literal must not be written twice.
+pub(crate) use crate::api_key::API_KEY_HEADER;
 pub(crate) const TRAFFIC_ACCESS_TOKEN_HEADER: &str = "e2b-traffic-access-token";
 pub(crate) const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
 

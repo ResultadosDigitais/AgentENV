@@ -3,16 +3,18 @@
 //! Each document is one object at [`DocumentKey::path`], which nodes on older
 //! versions read and write too. Writers of one document exclude each other so
 //! that no update is lost: on S3 stores, MinIO among them, an update replaces
-//! a document only if its ETag is unchanged. Alibaba OSS cannot write
-//! conditionally, so there every write holds the document's [`lease`].
+//! a document only if its ETag is unchanged. Alibaba OSS and Google Cloud
+//! Storage cannot replace an object conditionally, so there every write holds
+//! the document's [`lease`] or [`epoch_lease`] respectively; see
+//! [`DocumentLocking`].
 
 use std::time::Duration;
 
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::RngExt;
 
-use super::client::{OssClient, OssUploadArtifact};
-use super::lease;
+use super::client::{DocumentLocking, OssClient, OssUploadArtifact};
+use super::{epoch_lease, lease};
 use crate::repository::{
     DocumentChange, DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError,
     RepositoryResult,
@@ -41,6 +43,39 @@ impl Backoff {
     }
 }
 
+/// A document's lock, held through whichever protocol the store supports.
+enum Held {
+    Append(lease::Lease),
+    CreateOnly(epoch_lease::Lease),
+}
+
+impl Held {
+    /// Writes made under the lock must start before this.
+    fn deadline(&self) -> tokio::time::Instant {
+        match self {
+            Self::Append(lease) => lease.deadline(),
+            Self::CreateOnly(lease) => lease.deadline(),
+        }
+    }
+}
+
+async fn lock(client: &OssClient, path: &str) -> RepositoryResult<Held> {
+    match client.document_locking() {
+        DocumentLocking::AppendLease => lease::acquire(client, path).await.map(Held::Append),
+        DocumentLocking::CreateOnlyLease => epoch_lease::acquire(client, path)
+            .await
+            .map(Held::CreateOnly),
+        DocumentLocking::IfMatch => unreachable!("conditional writes need no lock"),
+    }
+}
+
+async fn unlock(client: &OssClient, held: Held) {
+    match held {
+        Held::Append(lease) => lease::release(client, lease).await,
+        Held::CreateOnly(lease) => epoch_lease::release(client, lease).await,
+    }
+}
+
 pub(super) async fn get(
     client: &OssClient,
     key: &DocumentKey,
@@ -55,19 +90,19 @@ pub(super) async fn put(
 ) -> RepositoryResult<()> {
     let path = key.path();
     let artifact = upload_artifact(key);
-    if !client.can_append() {
+    if !client.document_locking().needs_lease() {
         return client
             .put_bytes(&path, bytes, artifact)
             .await
             .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error));
     }
-    let lease = lease::acquire(client, &path).await?;
+    let lease = lock(client, &path).await?;
     // Any failed write may still land, so its lease runs out instead.
     client
         .put_bytes_before(&path, bytes, artifact, lease.deadline())
         .await
         .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error))?;
-    lease::release(client, lease).await;
+    unlock(client, lease).await;
     Ok(())
 }
 
@@ -77,10 +112,10 @@ pub(super) async fn update(
     update: DocumentUpdate,
 ) -> RepositoryResult<Option<Vec<u8>>> {
     let path = key.path();
-    if !client.can_append() {
+    if !client.document_locking().needs_lease() {
         return update_if_unchanged(client, &path, update).await;
     }
-    let lease = lease::acquire(client, &path).await?;
+    let lease = lock(client, &path).await?;
     let decided = async {
         let current = read(client, &path).await?;
         let change = update(current.as_deref())?;
@@ -91,7 +126,7 @@ pub(super) async fn update(
         Ok((current, DocumentChange::Put(bytes))) => (current, Some(bytes)),
         Ok((current, DocumentChange::Delete)) if current.is_some() => (current, None),
         decided => {
-            lease::release(client, lease).await;
+            unlock(client, lease).await;
             return decided.map(|(current, _)| current);
         }
     };
@@ -104,24 +139,24 @@ pub(super) async fn update(
         None => client.delete_before(&path, lease.deadline()).await,
     };
     written.map_err(|error| RepositoryError::backend(format!("update '{path}'"), error))?;
-    lease::release(client, lease).await;
+    unlock(client, lease).await;
     Ok(current)
 }
 
 pub(super) async fn delete(client: &OssClient, key: &DocumentKey) -> RepositoryResult<()> {
     let path = key.path();
-    if !client.can_append() {
+    if !client.document_locking().needs_lease() {
         return client
             .delete(&path)
             .await
             .map_err(|error| RepositoryError::backend(format!("delete '{path}'"), error));
     }
-    let lease = lease::acquire(client, &path).await?;
+    let lease = lock(client, &path).await?;
     client
         .delete_before(&path, lease.deadline())
         .await
         .map_err(|error| RepositoryError::backend(format!("delete '{path}'"), error))?;
-    lease::release(client, lease).await;
+    unlock(client, lease).await;
     Ok(())
 }
 

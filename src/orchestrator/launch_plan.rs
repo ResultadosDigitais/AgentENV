@@ -3,10 +3,11 @@ use std::sync::Arc;
 use super::store::{NewTimeout, SandboxMetadata};
 use super::types::SandboxState;
 use crate::sandbox::{
-    EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxLaunchConfig,
+    EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, ResourceLimitPlan,
+    SandboxLaunchConfig,
 };
 use crate::snapshot::RunnableSnapshot;
-use crate::types::{SandboxId, SandboxResources};
+use crate::types::{ResourceLimits, SandboxId, SandboxResources};
 
 pub(super) struct CreateLaunchPlan {
     pub sandbox_id: SandboxId,
@@ -30,6 +31,7 @@ pub(super) struct ResumeLaunchPlan {
     pub paused_state: Arc<dyn PausedSandboxState>,
     pub timeout: NewTimeout,
     pub resources: SandboxResources,
+    pub resource_limits: Option<ResourceLimits>,
     pub envd_access_token: Option<EnvdAccessToken>,
 }
 
@@ -78,6 +80,7 @@ impl LaunchPlan {
         paused_state: Arc<dyn PausedSandboxState>,
         timeout: NewTimeout,
         resources: SandboxResources,
+        resource_limits: Option<ResourceLimits>,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Self {
         Self::Resume(Box::new(ResumeLaunchPlan {
@@ -85,6 +88,7 @@ impl LaunchPlan {
             paused_state,
             timeout,
             resources,
+            resource_limits,
             envd_access_token,
         }))
     }
@@ -122,5 +126,19 @@ impl LaunchPlan {
             Self::Create(plan) => plan.metadata.resources,
             Self::Resume(plan) => plan.resources,
         }
+    }
+
+    /// The limits to enforce once the sandbox is ready. Template builders
+    /// always use their whole VM.
+    pub(super) fn resource_limit_plan(&self) -> Option<ResourceLimitPlan> {
+        let (shape, limits) = match self {
+            Self::Create(plan) if plan.metadata.template_builder => return None,
+            Self::Create(plan) => (plan.metadata.resources, plan.metadata.resource_limits),
+            Self::Resume(plan) => (plan.resources, plan.resource_limits),
+        };
+        Some(ResourceLimitPlan::new(
+            shape,
+            limits.unwrap_or_else(|| ResourceLimits::whole(shape)),
+        ))
     }
 }

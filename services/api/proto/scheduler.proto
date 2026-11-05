@@ -139,6 +139,13 @@ message NodeSnapshot {
   uint32 paused_sandbox_count = 14;
   uint32 paused_allocated_cpu = 15;
   uint64 paused_allocated_memory_bytes = 16;
+  // Sum of effective memory *requests* of the active running set. Equals
+  // allocated_memory_bytes unless sandboxes were created with an explicit
+  // memory_request_mb below their nominal limit. Older nodes do not report it
+  // (0). A node with allocated_memory_bytes > 0 always has requested > 0, so
+  // "requested == 0 && allocated > 0" identifies a non-reporting node and the
+  // scheduler falls back to allocated_memory_bytes (see filter.go).
+  uint64 requested_memory_bytes = 17;
 }
 
 message P2pEndpoint {

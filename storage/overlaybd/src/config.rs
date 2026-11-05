@@ -218,6 +218,26 @@ pub struct OssConfig {
     pub timeout_secs: u64,
     /// Number of retries on transient failures. Default 3.
     pub retry_count: u32,
+    /// Reads `gs://` objects from Google Cloud Storage. When set, the S3
+    /// fields above are not required.
+    pub gcs: Option<GcsConfig>,
+}
+
+/// Google Cloud Storage access for `gs://` URLs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GcsConfig {
+    /// API endpoint override for emulators; empty selects Google's.
+    pub endpoint: String,
+    /// Service-account or authorized-user JSON file; empty selects
+    /// Application Default Credentials (GKE Workload Identity included).
+    pub credential_path: String,
+    /// Send unauthenticated requests: emulators and public buckets only.
+    pub allow_anonymous: bool,
+    /// Resolve Application Default Credentials, the metadata server included.
+    /// Must be set deliberately: with neither this nor `credentialPath` nor
+    /// `allowAnonymous`, the config is rejected.
+    pub allow_application_default_credentials: bool,
 }
 
 impl Default for OssConfig {
@@ -233,6 +253,7 @@ impl Default for OssConfig {
             default_addressing_style: String::new(),
             timeout_secs: 30,
             retry_count: 3,
+            gcs: None,
         }
     }
 }
@@ -636,7 +657,26 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
         cfg.registry_fs_version
     );
 
-    if cfg.oss_config.enable {
+    if let Some(gcs) = cfg
+        .oss_config
+        .gcs
+        .as_ref()
+        .filter(|_| cfg.oss_config.enable)
+    {
+        let has_file = !gcs.credential_path.trim().is_empty();
+        let chosen = usize::from(has_file)
+            + usize::from(gcs.allow_anonymous)
+            + usize::from(gcs.allow_application_default_credentials);
+        ensure!(
+            chosen != 0,
+            "ossConfig.gcs needs credentialPath, allowAnonymous or allowApplicationDefaultCredentials"
+        );
+        ensure!(
+            chosen == 1,
+            "ossConfig.gcs.credentialPath, allowAnonymous and allowApplicationDefaultCredentials \
+             cannot be combined"
+        );
+    } else if cfg.oss_config.enable {
         ensure!(
             !cfg.oss_config.default_endpoint.is_empty(),
             "ossConfig.defaultEndpoint cannot be empty when oss is enabled"
@@ -903,6 +943,65 @@ mod tests {
         cfg.normalize_compat_fields();
         assert_eq!(cfg.log_config.log_level, 2);
         assert_eq!(cfg.log_config.log_path, "/tmp/overlaybd.log");
+    }
+
+    #[test]
+    fn test_gcs_config_replaces_the_s3_requirements() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "gcs": { "credentialPath": "/etc/gcp/key.json" }
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        validate_global_config(&cfg).expect("gcs needs no endpoint or region");
+        let gcs = cfg.oss_config.gcs.expect("gcs config");
+        assert_eq!(gcs.credential_path, "/etc/gcp/key.json");
+        assert!(!gcs.allow_anonymous);
+    }
+
+    #[test]
+    fn test_gcs_config_rejects_a_key_file_with_anonymous_access() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "gcs": { "credentialPath": "/etc/gcp/key.json", "allowAnonymous": true }
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        let err = validate_global_config(&cfg).expect_err("should fail");
+        assert!(err.to_string().contains("allowAnonymous"));
+    }
+
+    #[test]
+    fn test_gcs_config_refuses_application_default_credentials_unless_asked() {
+        let raw = |gcs: &str| {
+            format!(
+                r#"{{"registryFsVersion": "v2", "ioEngine": 0,
+                   "ossConfig": {{"enable": true, "gcs": {gcs}}}}}"#
+            )
+        };
+        let parse = |gcs: &str| {
+            let mut cfg: GlobalConfig = serde_json::from_str(&raw(gcs)).expect("parse");
+            cfg.normalize_compat_fields();
+            validate_global_config(&cfg)
+        };
+
+        let err = parse("{}").expect_err("no credential choice must fail");
+        assert!(err
+            .to_string()
+            .contains("allowApplicationDefaultCredentials"));
+        parse(r#"{"allowApplicationDefaultCredentials": true}"#).expect("explicit opt-in");
+        parse(r#"{"credentialPath": "/k.json", "allowApplicationDefaultCredentials": true}"#)
+            .expect_err("file and ADC conflict");
     }
 
     #[test]

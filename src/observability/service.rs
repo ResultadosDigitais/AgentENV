@@ -83,6 +83,7 @@ impl ObservabilityService {
             metrics: NodeMetricsSnapshot {
                 allocated_cpu: runtime.allocated_cpu,
                 allocated_memory_bytes: runtime.allocated_memory_bytes,
+                requested_memory_bytes: runtime.requested_memory_bytes,
                 cpu_percent: host.cpu_percent,
                 cpu_count: host.cpu_count,
                 memory_used_bytes: host.memory_used_bytes,

@@ -37,6 +37,20 @@ var (
 		},
 		[]string{"strategy"},
 	)
+	schedulerAdmissionShadow = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_admission_shadow_total",
+			Help: "Per-node memory admission comparisons in shadow mode by outcome (agree, request_would_reject, request_would_admit).",
+		},
+		[]string{"outcome"},
+	)
+	schedulerDiskAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_disk_admission_total",
+			Help: "Per-node disk admission outcomes by outcome (within_limit, over_limit, mount_missing). Counted once per node with a heartbeat.",
+		},
+		[]string{"outcome"},
+	)
 	schedulerObservedNodes = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "agentenv_scheduler_observed_nodes",
@@ -120,6 +134,8 @@ func schedulerStrategyLabel(strategy string) string {
 		return "round_robin"
 	case "random":
 		return "random"
+	case "least_loaded":
+		return "least_loaded"
 	default:
 		return "unknown"
 	}

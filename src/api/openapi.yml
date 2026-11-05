@@ -176,6 +176,102 @@ components:
       minimum: 0
       description: Disk size for the sandbox in MiB
 
+    MaxCPUCount:
+      type: integer
+      format: int32
+      minimum: 1
+      description: >-
+        vCPUs of the sandbox's VM, fixed when the VM first booted (by its
+        template or cold start). cpuCount can be resized up to this value.
+
+    MaxMemoryMB:
+      type: integer
+      format: int32
+      minimum: 128
+      description: >-
+        Guest memory in MiB of the sandbox's VM, fixed when the VM first
+        booted (by its template or cold start). memoryMB can be resized up to
+        this value.
+
+    SandboxResourcesUpdate:
+      type: object
+      description: >-
+        New effective CPU and memory for a running sandbox, inside its VM
+        shape (maxCpuCount / maxMemoryMB). An omitted field keeps its current
+        value; at least one field is required.
+      properties:
+        cpuCount:
+          allOf:
+            - $ref: "#/components/schemas/CPUCount"
+          description: vCPUs of CPU time the sandbox may use, from 1 to maxCpuCount.
+        memoryMB:
+          allOf:
+            - $ref: "#/components/schemas/MemoryMB"
+          description: Guest memory in MiB, from the node's minimum ([resize].min_memory_mib) to maxMemoryMB.
+
+    SandboxMemoryLimitState:
+      type: string
+      description: >-
+        Whether the guest has reached memoryMB. converged: the balloon holds
+        its target (or was deflated to zero). converging: the guest is still
+        inflating or deflating the balloon, or cannot give up memory it is
+        using. unobservable: the sandbox is not running, or its VM's balloon
+        was booted without statistics ([machine.balloon].stats_polling_interval_s).
+      enum:
+        - converged
+        - converging
+        - unobservable
+
+    SandboxResourceStatus:
+      type: object
+      required:
+        - cpuCount
+        - memoryMB
+        - maxCpuCount
+        - maxMemoryMB
+        - memoryState
+      properties:
+        cpuCount:
+          allOf:
+            - $ref: "#/components/schemas/CPUCount"
+          description: vCPUs of CPU time the sandbox may use.
+        memoryMB:
+          allOf:
+            - $ref: "#/components/schemas/MemoryMB"
+          description: Guest memory in MiB the sandbox may use.
+        maxCpuCount:
+          $ref: "#/components/schemas/MaxCPUCount"
+        maxMemoryMB:
+          $ref: "#/components/schemas/MaxMemoryMB"
+        cpuQuota:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          description: >-
+            vCPUs of CPU time the VMM process is capped at through cgroup v2
+            cpu.max. Null when the VMM may use every vCPU or the sandbox is
+            not running.
+        balloonTargetMB:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          description: >-
+            Guest memory in MiB the balloon is asked to hold (maxMemoryMB -
+            memoryMB). Null when the sandbox is not running or its VM has no
+            balloon device.
+        balloonActualMB:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          description: >-
+            Guest memory in MiB the balloon holds. Null when the sandbox is
+            not running or its VM's balloon reports no statistics.
+        memoryState:
+          $ref: "#/components/schemas/SandboxMemoryLimitState"
+
     EnvdVersion:
       type: string
       description: Version of the envd running in the sandbox
@@ -570,6 +666,10 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+        maxCpuCount:
+          $ref: "#/components/schemas/MaxCPUCount"
+        maxMemoryMB:
+          $ref: "#/components/schemas/MaxMemoryMB"
         diskSizeMB:
           $ref: "#/components/schemas/DiskSizeMB"
         metadata:
@@ -623,6 +723,10 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+        maxCpuCount:
+          $ref: "#/components/schemas/MaxCPUCount"
+        maxMemoryMB:
+          $ref: "#/components/schemas/MaxMemoryMB"
         diskSizeMB:
           $ref: "#/components/schemas/DiskSizeMB"
         metadata:
@@ -692,6 +796,26 @@ components:
             Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        cpuCount:
+          allOf:
+            - $ref: "#/components/schemas/CPUCount"
+          description: >-
+            vCPUs of CPU time for this sandbox, up to the template's
+            cpuCount. Defaults to the template's. A lower value needs
+            [resize].enabled and the CPU quota on the node; vCPUs cannot be
+            added beyond the template's VM.
+        memoryMB:
+          allOf:
+            - $ref: "#/components/schemas/MemoryMB"
+          description: >-
+            Guest memory in MiB for this sandbox, up to the template's
+            memoryMB. Defaults to the template's. A lower value needs
+            [resize].enabled on the node.
+        memoryRequestMB:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= the sandbox's effective memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
 
     NewSandboxV2:
       description: >-
@@ -738,6 +862,21 @@ components:
             Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        cpuCount:
+          allOf:
+            - $ref: "#/components/schemas/CPUCount"
+          description: >-
+            vCPUs of CPU time for this sandbox, up to the template's
+            cpuCount. Defaults to the template's. A lower value needs
+            [resize].enabled and the CPU quota on the node; vCPUs cannot be
+            added beyond the template's VM.
+        memoryMB:
+          allOf:
+            - $ref: "#/components/schemas/MemoryMB"
+          description: >-
+            Guest memory in MiB for this sandbox, up to the template's
+            memoryMB. Defaults to the template's. A lower value needs
+            [resize].enabled on the node.
 
     ResumedSandbox:
       properties:
@@ -801,6 +940,11 @@ components:
           allOf:
             - $ref: "#/components/schemas/MemoryMB"
           description: Memory for the cold-start sandbox in MiB.
+        memoryRequestMB:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
         diskSizeMB:
           $ref: "#/components/schemas/DiskSizeMB"
         attachedDrives:
@@ -1597,6 +1741,110 @@ components:
           type: integer
           format: uint32
           description: Number of sandboxes currently in the Paused state
+
+    ManagedLayerCollectMode:
+      type: string
+      enum: [report, enforce]
+      description: >-
+        `report` lists and counts without deleting anything; `enforce` deletes
+        the uncited layers older than the grace period. Enforce is refused
+        until a report has run in this server process.
+
+    ManagedLayerCollectRequest:
+      required:
+        - mode
+      properties:
+        mode:
+          $ref: "#/components/schemas/ManagedLayerCollectMode"
+        graceSeconds:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: >-
+            Overrides the configured grace period for this pass, in seconds. An
+            uncited layer younger than this is kept: a publish uploads its
+            layers before it writes the record that cites them.
+
+    ManagedLayerCollectReport:
+      required:
+        - mode
+        - citedLayers
+        - citedBytes
+        - orphanLayers
+        - orphanBytes
+        - unexpiredLayers
+        - unreadableLayers
+        - unknownLayers
+        - deletedLayers
+        - reclaimedBytes
+      properties:
+        mode:
+          $ref: "#/components/schemas/ManagedLayerCollectMode"
+        citedLayers:
+          type: integer
+          format: uint64
+          description: Managed layers a catalog record or live sandbox cites
+        citedBytes:
+          type: integer
+          format: uint64
+          description: Bytes of those cited layers
+        orphanLayers:
+          type: integer
+          format: uint64
+          description: Uncited layers older than the grace period
+        orphanBytes:
+          type: integer
+          format: uint64
+          description: Bytes of those orphan layers
+        unexpiredLayers:
+          type: integer
+          format: uint64
+          description: Uncited layers still inside the grace period, which stay
+        unreadableLayers:
+          type: integer
+          format: uint64
+          description: >-
+            Objects under managed-layers/ whose name is not a digest. They are
+            never deleted, because the substrate cannot prove what they are.
+        unknownLayers:
+          type: integer
+          format: uint64
+          description: >-
+            Layers the pass could not classify because the citation set was
+            unknowable (a live sandbox whose source left the catalog, or an
+            unreadable record). They are neither cited nor orphaned, and are
+            never deleted.
+        deletedLayers:
+          type: integer
+          format: uint64
+          description: Layers actually removed. Always zero in report mode.
+        reclaimedBytes:
+          type: integer
+          format: uint64
+          description: Bytes actually removed. Always zero in report mode.
+        downgradedReason:
+          type: string
+          description: >-
+            Present when the pass counted but deleted nothing even in enforce
+            mode, naming why. A live sandbox whose source left the catalog
+            downgrades the pass.
+        failures:
+          type: array
+          description: Objects the pass could not delete or classify
+          items:
+            $ref: "#/components/schemas/ManagedLayerCollectFailure"
+
+    ManagedLayerCollectFailure:
+      required:
+        - key
+        - message
+      properties:
+        key:
+          type: string
+          description: Repository-relative key of the object
+        message:
+          type: string
+          description: Why the object could not be handled
 
     Error:
       required:
@@ -2426,6 +2674,81 @@ paths:
         "500":
           $ref: "#/components/responses/500"
 
+  /sandboxes/{sandboxID}/resources:
+    get:
+      summary: Sandbox resources
+      description: >-
+        Get the sandbox's VM shape (maxCpuCount / maxMemoryMB), its effective
+        CPU and memory, and, while it runs, how the VMM enforces them. Poll
+        this after a resize to follow the guest's balloon.
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      tags: [sandboxes]
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "200":
+          description: Successfully returned the sandbox resources
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxResourceStatus"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+    patch:
+      summary: Resize sandbox
+      description: >-
+        Change the effective CPU and memory of a running sandbox, live, inside
+        its VM shape. Firecracker cannot add vCPUs or guest memory to a VM, so
+        maxCpuCount / maxMemoryMB are the ceiling: CPU is enforced as a cgroup
+        v2 quota on the VMM process and memory through the VM's
+        virtio-balloon. The call returns once the VMM enforces the new
+        limits; the guest then inflates or deflates the balloon, which
+        memoryState reports. 400 means the request can never succeed for this
+        sandbox on this node (invalid value, beyond the VM shape, or a missing
+        node capability); 409 means the sandbox is not running, another
+        operation is in progress, or the node lacks capacity for the growth.
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      tags: [sandboxes]
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxResourcesUpdate"
+      responses:
+        "200":
+          description: The new limits are enforced by the VMM
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxResourceStatus"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
   /sandboxes/{sandboxID}/custom-extension-params:
     get:
       description: >
@@ -3050,6 +3373,63 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/managed-layers/collect:
+    post:
+      summary: Collect managed layers no record cites
+      description: >-
+        Sweeps the repository's managed layers and, in enforce mode, deletes the
+        ones no catalog record cites and that are older than the grace period.
+        Report mode lists and counts without deleting. A managed layer is
+        content addressed and shared, so deleting a snapshot leaves its layers
+        behind; this is the only operation that removes them.
+
+        It runs under a repository lock, so two passes never overlap, and it
+        refuses to run at all while
+        `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED` is false.
+
+        The citation set is the whole cluster, not this node: the aggregate of
+        `GET /v2/sandboxes` on the gateway configured by
+        `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL`, because a sandbox
+        paused on another node keeps reading its source snapshot's layers.
+        Unset, or when any node of the gateway's fan-out fails, the pass cannot
+        prove a layer uncited: enforce answers 409 and only report runs.
+        Note that the credential this endpoint accepts is the node API key, so
+        anyone able to run a pass can delete layers.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedLayerCollectRequest"
+      responses:
+        "200":
+          description: Successfully ran one collection pass
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedLayerCollectReport"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "409":
+          description: >-
+            The pass is disabled on this node, another pass holds the lock,
+            enforce was requested before a report ran in this process, or
+            enforce was requested without a cluster gateway URL to list the
+            sandboxes of every node.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/500"
 

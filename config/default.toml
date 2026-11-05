@@ -180,6 +180,29 @@ vcpu_count = 2
 # iops = 3000                          # 3000 sustained IOPS
 # iops_burst = 500                     # 500 startup IOPS; not replenished
 
+[machine.balloon]
+# virtio-balloon device given to VMs at first boot (cold starts, template
+# builds). Restored VMs keep the device their snapshot was taken with.
+# false enforces memory limits below the VM shape; true lets the guest take
+# balloon memory back under pressure, which makes them advisory.
+deflate_on_oom = true
+# Balloon statistics interval in seconds; 0 disables them. Statistics let
+# GET /sandboxes/{sandboxID}/resources report the memory the balloon holds.
+stats_polling_interval_s = 0
+
+[resize]
+# Per-sandbox cpuCount/memoryMB below the VM shape on snapshot-based creates,
+# and live resize through PATCH /sandboxes/{sandboxID}/resources.
+enabled = false
+# Enforce CPU limits with a cgroup v2 cpu.max quota on the VMM process.
+cpu_quota = true
+# Smallest effective guest memory in MiB.
+min_memory_mib = 512
+# Optional node admission for resizes that grow a sandbox, as a percentage of
+# the node's CPUs / memory allocated to running sandboxes.
+# max_cpu_allocated_percent = 400
+# max_memory_allocated_percent = 90
+
 [envd]
 # Expected envd version baked into the tools drive.
 version = "0.5.15"
@@ -212,6 +235,16 @@ default_sandbox_timeout_secs = 15
 auto_resume_min_sandbox_timeout_secs = 300
 # Durable paused-sandbox metadata restored after a server restart.
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
+# Byte ceiling for one sandbox's paused artifact chain. A pause that would push
+# the chain past it compacts the runtime-owned generations into one and sweeps
+# unreferenced files from stale generations. 0 disables both. PROVISIONAL:
+# 51539607552 (48 GiB) comes from the OPSAI-5494 staging measurement.
+chain_bytes_ceiling = 51539607552
+# Periodic sweep of persisted-sandboxes/artifacts/ reclaiming a directory no
+# record and no cluster list names any more: "off", "report" (list and count
+# only) or "enforce" (move to artifacts/.trash/, delete after a second grace).
+# A failed or unconfigured cluster list downgrades a pass to a report.
+# paused_artifact_reap = "off"
 
 [snapshot]
 # Node-local cache for snapshot artifacts.
@@ -220,6 +253,7 @@ auto_resume_min_sandbox_timeout_secs = 300
 # Durable repository backend:
 # - "posix_fs" stores snapshots on a local or shared filesystem.
 # - "oss" stores snapshots in S3-compatible object storage.
+# - "gcs" stores snapshots in Google Cloud Storage.
 repository_backend = "posix_fs"
 
 # EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
@@ -247,6 +281,21 @@ algorithm = "lz4"
 # Workers compressing 4 KiB blocks. One is sequential; higher values run in
 # parallel without changing the output layout.
 workers = 1
+
+# Collecting managed layers no record cites. A layer is content addressed and
+# shared, so deleting a snapshot leaves its layers behind; this pass sweeps
+# them. It is off by default because a collected layer cannot be recreated
+# without its origin. The admin endpoint answers 409 while it is disabled.
+# [snapshot.managed_layer_collect]
+# enabled = false
+# How old an uncited layer must be before enforce may delete it. A publish
+# uploads its layers before it writes the record that cites them, so a layer
+# uploaded moments ago and not cited yet belongs to a publish in flight.
+# grace_secs = 7200
+# Cluster gateway base URL. The pass reads GET /v2/sandboxes from it, which
+# fans out to every node, so a sandbox paused on another node keeps its layers
+# cited. Unset, only this node's sandboxes are visible and enforce is refused.
+# gateway_url = "http://agentenv-gateway:8080"
 
 # Optional for OSS and POSIX backends: record the guest's startup memory pages once per snapshot
 # at publish time (a short local re-resume on the capture node, ~10s budget),
@@ -285,6 +334,20 @@ workers = 1
 # access_key_secret = "..."
 # security_token = "..."
 # cache_max_size_gb = 10              # 10 GiB node-local artifact cache
+
+# Google Cloud Storage requires a bucket and exactly one way to authenticate.
+# credential_path is recommended: a service-account key or an external_account
+# (Workload Identity Federation) JSON file, the only source consulted. The
+# metadata server is never used unless allow_application_default_credentials
+# is set, because guests that share the host's network can reach it too.
+# [backend.gcs]
+# bucket = "your-snapshot-bucket"
+# prefix = "snapshots/"
+# credential_path = "/etc/agentenv/gcp/credential.json"
+# allow_application_default_credentials = false  # opt in to ADC/metadata server
+# allow_anonymous = false                # emulators and public buckets only
+# endpoint = "http://127.0.0.1:4443"     # emulators only
+# cache_max_size_gb = 10                 # 10 GiB node-local artifact cache
 
 [ublk]
 # Explicit daemon executable. The default is under $AENV_HOME/ublk.
@@ -342,6 +405,10 @@ enabled = true
 startup_prewarm = true
 # Maximum concurrent process creations in one refill batch.
 fill_concurrency = 4
+# Seconds without warm-process acquisitions before the pool decays its refill
+# target back to the low watermark and drains the excess warm processes
+# (0 = never decay).
+idle_ttl_secs = 600
 
 [memory_snapshot]
 # Generated OverlayBD config dedicated to memory snapshot devices.
