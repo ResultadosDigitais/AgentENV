@@ -1716,6 +1716,63 @@ mod tests {
         Ok(())
     }
 
+    /// The record must survive the same event its artifacts survive.
+    ///
+    /// In the deployment the DaemonSet mounts one hostPath, the node's local
+    /// SSD, at `/workspace` (`deploy/k8s/base/agentenv-daemonset.yaml`), and
+    /// `AENV_HOME_PATH=/workspace/env` (`deploy/docker/Dockerfile.agentenv`)
+    /// puts the store root inside it, so `records.db` and `artifacts/` are two
+    /// subdirectories of one directory a recreated pod sees again. This test
+    /// holds that invariant: dropping the persister is the pod dying without a
+    /// graceful shutdown, and a new persister over the same directory must load
+    /// the record back with its generation still where the record points.
+    ///
+    /// `Sync` durability is the production setting (`FileBackedSandboxPersister::new`),
+    /// and it is what makes the record fsynced at the moment `persist_paused`
+    /// returns rather than only on a clean shutdown.
+    #[tokio::test]
+    async fn a_pod_recreated_over_the_same_store_root_loads_the_records_back() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        let persister = test_persister(&root).with_durability(LocalStoreDurability::Sync);
+        let sandbox_id = persist_test_record_with_generation(&persister, SandboxId::new()).await?;
+        let generation = persister.get_record(&sandbox_id).await?.artifact_root;
+        drop(persister);
+
+        // The pod comes back on the same node: same directory, new process.
+        let restarted = test_persister(&root).with_durability(LocalStoreDurability::Sync);
+        let artifacts_root = restarted.artifacts_root().expect("artifacts root");
+        assert_eq!(
+            restarted.records_db_path(),
+            root.join(RECORD_DB_DIR),
+            "the record DB lives in the store root"
+        );
+        assert!(
+            generation.starts_with(&artifacts_root),
+            "the generation lives in the same store root as the record, so a node \
+             that keeps one keeps the other"
+        );
+
+        let loaded = restarted.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the recreated pod must load the record the evicted one wrote"
+        );
+        assert_eq!(loaded[0].id, sandbox_id);
+        assert!(
+            generation.is_dir(),
+            "the generation the loaded record points at must still be on disk"
+        );
+        assert!(
+            quarantined_dirs(&artifacts_root, &sandbox_id).is_empty(),
+            "a record the new pod found is never quarantined"
+        );
+        Ok(())
+    }
+
     /// The previous behavior, now deliberately inverted: a generation with no
     /// record is moved to the quarantine, never deleted.
     ///
