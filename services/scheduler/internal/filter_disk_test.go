@@ -95,6 +95,43 @@ func TestDiskAdmissionFailsOpenWhenTargetMountIsMissing(t *testing.T) {
 	}
 }
 
+// The fail-open decision is named for the log: it points at the disk limit,
+// the mount it looked for and why it admitted the node, and it stays silent
+// for a node the disk limit could actually evaluate.
+func TestDiskLimitSkippedNamesTheMissingMount(t *testing.T) {
+	limit := &config.NodeResourceLimit{MaxDiskUsedPercent: uint32Ptr(79)}
+
+	missing, ok := diskLimitSkipped(&schedulerv1.NodeSnapshot{Disks: []*schedulerv1.DiskMetric{
+		diskMetric("/", 900*gib, 1000*gib),
+	}}, limit)
+	if !ok {
+		t.Fatal("expected the disk limit to be reported as skipped")
+	}
+	if missing.Limit != limitMaxDiskUsedPercent {
+		t.Fatalf("expected limit %q, got %q", limitMaxDiskUsedPercent, missing.Limit)
+	}
+	if missing.Threshold != "79" {
+		t.Fatalf("expected threshold 79, got %q", missing.Threshold)
+	}
+	if missing.Detail != "mount_point=/workspace reason=mount_missing" {
+		t.Fatalf("unexpected detail %q", missing.Detail)
+	}
+
+	if _, ok := diskLimitSkipped(&schedulerv1.NodeSnapshot{Disks: []*schedulerv1.DiskMetric{
+		diskMetric(workspaceMount, 500*gib, 737*gib),
+	}}, limit); ok {
+		t.Fatal("expected a measurable mount not to be reported as skipped")
+	}
+	if _, ok := diskLimitSkipped(&schedulerv1.NodeSnapshot{
+		Disks: []*schedulerv1.DiskMetric{diskMetric(workspaceMount, 5, 0)},
+	}, limit); !ok {
+		t.Fatal("expected an unmeasurable mount to be reported as skipped")
+	}
+	if _, ok := diskLimitSkipped(&schedulerv1.NodeSnapshot{}, &config.NodeResourceLimit{}); ok {
+		t.Fatal("expected no skip report when the disk limit is not configured")
+	}
+}
+
 // A target mount reporting total_bytes = 0 cannot be measured and is admitted.
 func TestDiskAdmissionAdmitsUnmeasurableMount(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxDiskUsedPercent: uint32Ptr(1)}

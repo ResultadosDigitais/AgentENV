@@ -16,6 +16,12 @@ type AdmissionObserver func(nodeID string, nominalAdmits, requestAdmits bool, de
 // candidate list. It must not block.
 type RejectionObserver func(nodeID string, violation LimitViolation)
 
+// DiskSkipObserver receives a node the disk limit could not evaluate because
+// its heartbeat does not carry the target mount. The node is admitted
+// (fail-open); reporting it keeps an inert limit visible in the log, not only
+// in the outcome counter. It must not block.
+type DiskSkipObserver func(nodeID string, violation LimitViolation)
+
 // LimitViolation names the node_resource_limit key that rejected a node, with
 // the observed value, the configured threshold and any extra context. Limit is
 // the JSON key of the limit, so the scheduler log reads like the config.
@@ -59,6 +65,13 @@ func FilterByResourceLimitObserved(nodes []RichNode, limit *config.NodeResourceL
 // optional observer invoked once per rejected node, carrying the named limit
 // that rejected it.
 func FilterByResourceLimitRejected(nodes []RichNode, limit *config.NodeResourceLimit, observe AdmissionObserver, reject RejectionObserver) []RichNode {
+	return FilterByResourceLimitReported(nodes, limit, observe, reject, nil)
+}
+
+// FilterByResourceLimitReported is FilterByResourceLimitRejected with an
+// optional observer invoked for a node the disk limit admitted because its
+// heartbeat does not carry the target mount.
+func FilterByResourceLimitReported(nodes []RichNode, limit *config.NodeResourceLimit, observe AdmissionObserver, reject RejectionObserver, skipDisk DiskSkipObserver) []RichNode {
 	if limit == nil {
 		return nodes
 	}
@@ -79,6 +92,9 @@ func FilterByResourceLimitRejected(nodes []RichNode, limit *config.NodeResourceL
 				reject(n.ID, violation)
 			}
 			continue
+		}
+		if skipped, ok := diskLimitSkipped(n.Snapshot, limit); ok && skipDisk != nil {
+			skipDisk(n.ID, skipped)
 		}
 		result = append(result, n)
 	}
@@ -154,6 +170,27 @@ func limitViolated(n RichNode, limit *config.NodeResourceLimit) (LimitViolation,
 		}
 	}
 	return LimitViolation{}, false
+}
+
+// diskLimitSkipped reports the fail-open case of the disk limit: the limit is
+// configured, but the heartbeat carries no measurable metric for the target
+// mount. It builds the payload for the log line only; the outcome counter is
+// incremented once, by diskViolation.
+func diskLimitSkipped(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (LimitViolation, bool) {
+	if limit.MaxDiskUsedPercent == nil {
+		return LimitViolation{}, false
+	}
+	mountPoint := limit.ResolvedDiskMountPoint()
+	for _, candidate := range s.GetDisks() {
+		if candidate.GetMountPoint() == mountPoint && candidate.GetTotalBytes() > 0 {
+			return LimitViolation{}, false
+		}
+	}
+	return LimitViolation{
+		Limit:     limitMaxDiskUsedPercent,
+		Threshold: strconv.FormatUint(uint64(*limit.MaxDiskUsedPercent), 10),
+		Detail:    "mount_point=" + mountPoint + " reason=mount_missing",
+	}, true
 }
 
 // diskViolation compares the used/total ratio of the configured mount point.

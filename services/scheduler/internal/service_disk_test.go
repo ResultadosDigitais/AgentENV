@@ -126,3 +126,53 @@ func TestScheduleDoesNotLogAdmittedNodeAsRejected(t *testing.T) {
 		t.Fatalf("expected no rejection log line, got %d", len(entries))
 	}
 }
+
+// Fail-open is a decision too: a node whose heartbeat does not carry the
+// target mount is admitted, and the log names the limit, the mount and the
+// node, so an inert limit is visible in the scheduler log as well as in the
+// agentenv_scheduler_disk_admission_total counter.
+func TestScheduleLogsDiskLimitSkippedWhenMountIsMissing(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	service := NewService(
+		zap.New(core),
+		NewAtomicNodeRegistry([]Node{{ID: "old-agent", Endpoint: "http://old-agent"}}, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+		WithNodeResourceLimit(&config.NodeResourceLimit{MaxDiskUsedPercent: uint32Ptr(75)}),
+	)
+	if _, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+		NodeId:            "old-agent",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-old",
+		Version:           "0.1.0",
+		Commit:            "abc123",
+		Snapshot: &schedulerv1.NodeSnapshot{
+			Status:           schedulerv1.NodeStatus_NODE_STATUS_READY,
+			ReportedAtUnixMs: 123,
+			Disks: []*schedulerv1.DiskMetric{
+				{MountPoint: "/", UsedBytes: 900 * gib, TotalBytes: 1000 * gib},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+
+	if _, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{}); err != nil {
+		t.Fatalf("expected the node to be admitted, got %v", err)
+	}
+
+	entries := logs.FilterMessage("scheduler skipped disk limit for node").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 skipped-limit log line, got %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if got := fields["node_id"]; got != "old-agent" {
+		t.Fatalf("expected node_id old-agent, got %v", got)
+	}
+	if got := fields["limit"]; got != "max_disk_used_percent" {
+		t.Fatalf("expected limit max_disk_used_percent, got %v", got)
+	}
+	if got := fields["detail"]; got != "mount_point=/workspace reason=mount_missing" {
+		t.Fatalf("expected the missing-mount detail, got %v", got)
+	}
+}
