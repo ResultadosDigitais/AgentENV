@@ -289,7 +289,7 @@ The record therefore cannot disappear in an eviction while its generation
 stays: a generation found without a record was either never given one or had it
 removed. Two paths produce that state, and both run against the same SSD. The
 first is resume, which deletes the record and keeps the generation
-(`Orchestrator::launch` calls `delete_record`, not `delete_record_and_artifacts`);
+(`launch_sandbox` calls `delete_record`, not `delete_record_and_artifacts`);
 nothing reclaims the directory while `paused_artifact_reap` is at its default
 `off`. The second is an eviction inside the window between
 `allocate_artifact_root` and `persist_paused`. The log line that separates them
