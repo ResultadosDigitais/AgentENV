@@ -854,12 +854,17 @@ fn paused_resume_metadata(sandbox_id: SandboxId) -> SandboxMetadata {
 /// `SandboxMetadata::default()`-shaped paused sandbox is the only entry in the
 /// store: no active running / starting contributions, and one Paused sandbox
 /// contributing its CPU / memory to the `paused_*` fields.
-fn expected_metrics_with_one_paused_default() -> OrchestratorMetrics {
+fn expected_metrics_with_one_paused_default(sandbox_id: SandboxId) -> OrchestratorMetrics {
     let resources = SandboxResources::default();
     OrchestratorMetrics {
         paused_sandbox_count: 1,
         paused_allocated_cpu: resources.cpu_count,
         paused_allocated_memory_bytes: u64::from(resources.memory_mib) * 1024 * 1024,
+        paused_sandboxes: vec![PausedSandboxResources {
+            sandbox_id,
+            cpu_count: resources.cpu_count,
+            memory_bytes: u64::from(resources.memory_mib) << 20,
+        }],
         ..OrchestratorMetrics::default()
     }
 }
@@ -895,12 +900,17 @@ async fn metrics_snapshot_omits_paused_records_without_resources() -> Result<()>
     setup();
     let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
     let sandbox_id = SandboxId::new();
-    // The default resources are all zero: an older record whose shape is
-    // unknown, which must be omitted rather than reported as an empty shape.
-    orchestrator
-        .store
-        .add(paused_resume_metadata(sandbox_id))
-        .await?;
+    // All-zero resources model an older record whose shape is unknown; it must
+    // be omitted rather than reported as an empty shape. `SandboxResources`'
+    // own default is a real shape (1 vCPU, 128 MiB), so it is set explicitly.
+    let mut metadata = paused_resume_metadata(sandbox_id);
+    metadata.resources = SandboxResources {
+        cpu_count: 0,
+        memory_mib: 0,
+        disk_size_mib: 0,
+        memory_request_mib: None,
+    };
+    orchestrator.store.add(metadata).await?;
 
     let metrics = current_metrics(orchestrator.as_ref()).await;
     assert!(metrics.paused_sandboxes.is_empty());
@@ -5333,11 +5343,11 @@ async fn launch_sandbox_resume_running_metadata_persist_failure_restores_paused_
     assert!(restored.paused_state.is_some());
     assert_proxy_paused(&orchestrator, &sandbox_id).await?;
     // The rolled-back paused sandbox still exists in the store, so derived
-    // metrics include its paused_* contribution; only the runtime fields are
-    // zero.
+    // metrics include its paused_* contribution and its per-sandbox shape; only
+    // the runtime fields are zero.
     assert_eq!(
         current_metrics(orchestrator.as_ref()).await,
-        expected_metrics_with_one_paused_default()
+        expected_metrics_with_one_paused_default(sandbox_id)
     );
     Ok(())
 }
@@ -5382,7 +5392,7 @@ async fn launch_sandbox_resume_missing_proxy_target_restores_paused_state() -> R
     // launch_sandbox_resume_running_metadata_persist_failure_restores_paused_state.
     assert_eq!(
         current_metrics(orchestrator.as_ref()).await,
-        expected_metrics_with_one_paused_default()
+        expected_metrics_with_one_paused_default(sandbox_id)
     );
     Ok(())
 }
