@@ -201,26 +201,33 @@ assert_eq "${node_count}" "${expected_nodes}" "admin /nodes exposes expected nod
 
 # OPSAI-6200: every node publishes the per-layer admission verdict computed by
 # the scheduler's single capacity rule. The reason is a closed set and is
-# omitted when the layer is admitted.
-if echo "${baseline_nodes_json}" | jq -e '
-  all(.[];
-    (.admission != null) and
-    (.admission.capacitySource == "allocatable" or .admission.capacitySource == "total") and
-    ([.admission.layers[].memoryGB] | sort == [8, 16, 32, 64]) and
-    (all(.admission.layers[]; . as $layer |
-      (($layer.admitted | type) == "boolean") and
-      (if $layer.admitted then
-        ($layer.reason == null or $layer.reason == "")
-       else
-        (["memory_allocated", "memory_used", "cpu", "starting", "disk"] | index($layer.reason)) != null
-       end))))
-  ' >/dev/null 2>&1; then
-  _pass "gateway /nodes publishes admission verdicts for every node"
+# omitted when the layer is admitted. Only a clustered deployment has a
+# scheduler and a gateway to compute and serve that verdict; in single-node mode
+# /nodes is the runtime's own node-local API, so the verdict lives where the
+# rule lives and the check does not apply.
+if e2e_mode_is_clustered; then
+  if echo "${baseline_nodes_json}" | jq -e '
+    all(.[];
+      (.admission != null) and
+      (.admission.capacitySource == "allocatable" or .admission.capacitySource == "total") and
+      ([.admission.layers[].memoryGB] | sort == [8, 16, 32, 64]) and
+      (all(.admission.layers[]; . as $layer |
+        (($layer.admitted | type) == "boolean") and
+        (if $layer.admitted then
+          ($layer.reason == null or $layer.reason == "")
+         else
+          (["memory_allocated", "memory_used", "cpu", "starting", "disk"] | index($layer.reason)) != null
+         end))))
+    ' >/dev/null 2>&1; then
+    _pass "gateway /nodes publishes admission verdicts for every node"
+  else
+    _fail \
+      "gateway /nodes publishes admission verdicts for every node" \
+      "admission.capacitySource and four layers (8,16,32,64) with a closed reason" \
+      "${baseline_nodes_json}"
+  fi
 else
-  _fail \
-    "gateway /nodes publishes admission verdicts for every node" \
-    "admission.capacitySource and four layers (8,16,32,64) with a closed reason" \
-    "${baseline_nodes_json}"
+  _pass "admission verdict check skipped outside clustered modes"
 fi
 
 while IFS=$'\t' read -r node_id sandbox_count allocated_cpu allocated_memory create_successes; do

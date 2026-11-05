@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestAdmissionLayerDefaultsAreEightSixteenThirtyTwoSixtyFour(t *testing.T) {
 	layers := (&NodeResourceLimit{}).ResolvedAdmissionLayers()
@@ -133,6 +136,37 @@ func TestLoadRejectsInvalidAdmissionLayers(t *testing.T) {
 		}
 	}`); err == nil {
 		t.Fatal("zero memory_gb must be rejected")
+	}
+}
+
+// The Docker Compose deployment the e2e runs must publish the same admission
+// verdict as the Kubernetes one. Without node_resource_limit the scheduler has
+// no rule to evaluate and /nodes omits the admission object entirely.
+func TestComposeDeployConfigPublishesAdmissionVerdicts(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "docker", "config", "default.json")
+	cfg, err := LoadScheduler(path, false)
+	if err != nil {
+		t.Fatalf("load compose config failed: %v", err)
+	}
+	limit := cfg.Scheduler.NodeResourceLimit
+	if limit == nil {
+		t.Fatal("compose config must configure node_resource_limit so /nodes publishes the verdict")
+	}
+	if !limit.ShapeAdmissionEnabled() {
+		t.Fatal("compose config must keep shape admission on")
+	}
+	if got := limit.ResolvedMemoryCapacitySource(); got != MemoryCapacitySourceTotal {
+		t.Fatalf("static discovery resolves capacity over memory_total, got %q", got)
+	}
+	layers := limit.ResolvedAdmissionLayers()
+	want := []uint64{8, 16, 32, 64}
+	if len(layers) != len(want) {
+		t.Fatalf("got %d layers, want %d", len(layers), len(want))
+	}
+	for i, memoryGB := range want {
+		if layers[i].MemoryGB != memoryGB {
+			t.Fatalf("layer %d memory_gb = %d, want %d", i, layers[i].MemoryGB, memoryGB)
+		}
 	}
 }
 
