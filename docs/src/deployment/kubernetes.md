@@ -133,4 +133,6 @@ make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 
 The scheduler watches EndpointSlices for the headless `agentenv-nodes` Service and watches Pods for optional label-based discovery policy. It schedules only serving, non-terminating DaemonSet Pods. Pods matching `scheduler.discovery.kubernetes.no_schedule_pod_selector` stay discoverable as lingering/no-schedule nodes, while Pods matching `scheduler.discovery.kubernetes.ignore_pod_selector` are excluded. Both IPv4 and IPv6 endpoint addresses are supported.
 
+The scheduler also watches cluster-scoped Nodes to read `status.allocatable.memory` for the admission ceiling (`memory_capacity_source: allocatable`, the default): the ceiling is the allocatable memory minus the runtime overhead, with `memory_total` as the fallback. This needs a read-only cluster-scoped `ClusterRole` with `get`, `list` and `watch` on `nodes` only, bound to the `agentenv-scheduler` ServiceAccount; the namespaced Role for EndpointSlices and Pods is unchanged. `GET /nodes` publishes the per-layer verdict in an `admission` object, and `POST /sandboxes/{id}/resume` is gated by the same rule (a deferred resume is `503` with `Retry-After`).
+
 > Sandbox bindings remain in-memory, so the scheduler should run as a single replica. Bindings are lost on restart.

@@ -27,7 +27,8 @@ use crate::volume::VolumeManager;
 
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
-    aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
+    aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, PausedSandboxResources,
+    SandboxContribution,
 };
 use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
@@ -2408,10 +2409,21 @@ where
         let mut metrics = OrchestratorMetrics::default();
         self.store
             .list_with_callback(|metadata| {
+                let resources = metadata.allocated_resources();
                 aggregate_resource_metrics(
                     &mut metrics,
-                    SandboxContribution::new(metadata.state, metadata.allocated_resources()),
+                    SandboxContribution::new(metadata.state, resources),
                 );
+                // A paused record from an older version may not carry its
+                // resources; omit it instead of reporting a zero shape the
+                // scheduler would treat as a real (empty) sandbox.
+                if matches!(metadata.state, SandboxState::Paused) && resources.memory_mib > 0 {
+                    metrics.paused_sandboxes.push(PausedSandboxResources {
+                        sandbox_id: metadata.id,
+                        cpu_count: resources.cpu_count,
+                        memory_bytes: u64::from(resources.memory_mib) << 20,
+                    });
+                }
             })
             .await?;
         metrics.create_successes = self.counters.create_successes();

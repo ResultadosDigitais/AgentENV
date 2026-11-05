@@ -14,8 +14,22 @@
       }
     },
     "node_resource_limit": {
+      "max_memory_allocated_percent": 80,
+      "max_memory_used_percent": 90,
+      "max_cpu_used_percent": 90,
+      "max_cpu_allocated_percent": 100,
+      "max_sandbox_starting_count": 4,
       "max_disk_used_percent": 75,
-      "disk_mount_point": "/workspace"
+      "disk_mount_point": "/workspace",
+      "memory_capacity_source": "allocatable",
+      "shape_admission": "on",
+      "cross_node_resume": false,
+      "admission_layers": [
+        {"memory_gb": 8},
+        {"memory_gb": 16},
+        {"memory_gb": 32},
+        {"memory_gb": 64}
+      ]
     }
   }
 }

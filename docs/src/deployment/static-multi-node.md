@@ -181,6 +181,12 @@ Create `/etc/agentenv/control-plane.json`:
 }
 ```
 
+Static discovery has no Kubernetes node object, so `memory_capacity_source`
+resolves to `total` and the admission ceiling keeps the historical
+`memory_total` math. `GET /nodes` still publishes the per-layer verdict
+(`admission` object) computed by the same capacity rule, and a paused-sandbox
+resume goes through that rule before it is proxied.
+
 Protect the configuration after editing it:
 
 ```bash

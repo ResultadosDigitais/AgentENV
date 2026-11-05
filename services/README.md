@@ -140,6 +140,10 @@ All fields are optional. Omitting a field (or setting the whole block to `null`)
 | `max_memory_limit_overcommit_ratio` | float | In `request`/`shadow` mode: cap on (sum of nominal VM sizes) / node memory. Default `1.5`; ignored in `nominal` |
 | `max_disk_used_percent` | uint32 | Maximum used percentage of the filesystem at `disk_mount_point` (0–100). Always effective: unlike the memory limits it does not take part in `admission_mode` |
 | `disk_mount_point` | string | Mount point of the heartbeat disk metric the disk limit reads, matched exactly. Default `/workspace`; only used when `max_disk_used_percent` is set |
+| `memory_capacity_source` | string | `allocatable` (default) computes the admission ceiling over the Kubernetes node's `status.allocatable.memory` minus the runtime overhead; `total` is the kill switch that restores the `memory_total` math |
+| `shape_admission` | string | `on` (default) publishes the per-layer verdict and gates resume with the same rule; `off` is the kill switch |
+| `cross_node_resume` | bool | Allow a paused sandbox rejected on its owner to resume on another admitted node. Off by default: only enable it once the paused artifacts are readable from another node |
+| `admission_layers` | array | VM shapes published per node: `{"memory_gb": 8, "cpu_count": 4}`. Default the 8, 16, 32 and 64 GiB layers; `cpu_count` is optional |
 
 Example:
 
@@ -152,11 +156,41 @@ Example:
   "max_memory_used_percent": 85,
   "max_memory_allocated_percent": 150,
   "max_disk_used_percent": 75,
-  "disk_mount_point": "/workspace"
+  "disk_mount_point": "/workspace",
+  "memory_capacity_source": "allocatable",
+  "shape_admission": "on",
+  "cross_node_resume": false,
+  "admission_layers": [
+    {"memory_gb": 8},
+    {"memory_gb": 16},
+    {"memory_gb": 32},
+    {"memory_gb": 64}
+  ]
 }
 ```
 
 The disk limit reads the real used/total ratio of one mount point and rejects the node when it is strictly above the limit. A heartbeat that does not carry that mount (an older agent) is admitted — fail-open — and counted in `agentenv_scheduler_disk_admission_total{outcome="mount_missing"}`, so an inert limit is visible instead of silent. Pausing a sandbox writes a chain of roughly one VM's worth of state to this filesystem, so the limit protects the next pause, not only the current usage.
+
+### Capacity rule and published admission verdict
+
+The admission ceiling is one rule. With `memory_capacity_source: allocatable` the scheduler reads the Kubernetes node's `status.allocatable.memory` (through the pod-to-node mapping of the EndpointSlice) and subtracts the runtime overhead, estimated conservatively as `memory_used - allocated`. Nodes without that data fall back to `memory_total`, exactly as before. Every memory check (allocated and used, in `nominal`, `request` and `shadow` modes) reads this base; the rule is identical in all three modes.
+
+`GET /nodes` publishes, per node, the capacity audit fields and a verdict for each configured layer:
+
+```json
+"admission": {
+  "allocatableMemoryBytes": 125148200960,
+  "runtimeOverheadBytes": 4194304000,
+  "capacityMemoryBytes": 120953896960,
+  "capacitySource": "allocatable",
+  "layers": [
+    {"memoryGB": 8, "admitted": true},
+    {"memoryGB": 16, "admitted": false, "reason": "memory_allocated"}
+  ]
+}
+```
+
+`reason` is a closed set — `memory_allocated`, `memory_used`, `cpu`, `starting`, `disk` — and is omitted when the layer is admitted. The same capacity check gates a paused-sandbox resume: `POST /sandboxes/{id}/resume` asks the scheduler whether the paused shape fits its owner. When it does not and `cross_node_resume` is off, the gateway returns `503` with `Retry-After: 5` and `{"code":"sandbox_capacity_deferred","reason":"..."}`; with cross-node resume on it moves the sandbox to an admitted node and records the new binding before proxying. When neither the heartbeat nor the gateway's recorded template shape is known, the resume is deferred without a reason instead of over-admitting the node.
 
 ### Memory admission modes
 

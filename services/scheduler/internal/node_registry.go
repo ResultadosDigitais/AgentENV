@@ -26,6 +26,9 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// PausedSandboxResources returns the persisted shape of one paused sandbox
+	// as reported by its owner's latest heartbeat.
+	PausedSandboxResources(nodeID string, sandboxID string) (cpuCount uint32, memoryBytes uint64, ok bool)
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -36,9 +39,10 @@ var (
 )
 
 type observedNodeRecord struct {
-	node        *schedulerv1.ObservedNode
-	p2pEndpoint *schedulerv1.P2PEndpoint
-	reportTTL   time.Duration
+	node            *schedulerv1.ObservedNode
+	p2pEndpoint     *schedulerv1.P2PEndpoint
+	pausedSandboxes map[string]*schedulerv1.PausedSandboxResources
+	reportTTL       time.Duration
 }
 
 type AtomicNodeRegistry struct {
@@ -170,8 +174,9 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 			LastSeenUnixMs:    nowMs,
 			Snapshot:          cloneSnapshot(req.GetSnapshot()),
 		},
-		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
-		reportTTL:   r.observedTTL,
+		p2pEndpoint:     cloneP2PEndpoint(req.GetP2PEndpoint()),
+		pausedSandboxes: pausedSandboxesFromHeartbeat(req.GetPausedSandboxes()),
+		reportTTL:       r.observedTTL,
 	}
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
 		record.node.Snapshot.ReportedAtUnixMs = nowMs
@@ -343,6 +348,43 @@ func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapsh
 		return nil
 	}
 	return cloneSnapshot(snapshot)
+}
+
+// pausedSandboxesFromHeartbeat indexes the heartbeat's paused shapes by
+// sandbox ID. A repeated entry with an empty ID is ignored.
+func pausedSandboxesFromHeartbeat(resources []*schedulerv1.PausedSandboxResources) map[string]*schedulerv1.PausedSandboxResources {
+	if len(resources) == 0 {
+		return nil
+	}
+	byID := make(map[string]*schedulerv1.PausedSandboxResources, len(resources))
+	for _, resource := range resources {
+		if resource == nil || strings.TrimSpace(resource.GetSandboxId()) == "" {
+			continue
+		}
+		cloned, ok := proto.Clone(resource).(*schedulerv1.PausedSandboxResources)
+		if !ok {
+			continue
+		}
+		byID[cloned.GetSandboxId()] = cloned
+	}
+	return byID
+}
+
+// PausedSandboxResources returns the shape of a paused sandbox reported by the
+// owner. It reports ok=false when the owner never heartbeated the sandbox,
+// which the scheduler treats as unknown.
+func (r *AtomicNodeRegistry) PausedSandboxResources(nodeID string, sandboxID string) (uint32, uint64, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	record, ok := r.observed[nodeID]
+	if !ok {
+		return 0, 0, false
+	}
+	resource, ok := record.pausedSandboxes[sandboxID]
+	if !ok {
+		return 0, 0, false
+	}
+	return resource.GetCpuCount(), resource.GetMemoryBytes(), true
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

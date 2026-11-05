@@ -864,6 +864,51 @@ fn expected_metrics_with_one_paused_default() -> OrchestratorMetrics {
     }
 }
 
+#[tokio::test]
+async fn metrics_snapshot_reports_each_paused_sandbox_shape() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let sandbox_id = SandboxId::new();
+    let mut metadata = paused_resume_metadata(sandbox_id);
+    metadata.resources = SandboxResources {
+        cpu_count: 2,
+        memory_mib: 4096,
+        disk_size_mib: 0,
+        memory_request_mib: None,
+    };
+    orchestrator.store.add(metadata).await?;
+
+    let metrics = current_metrics(orchestrator.as_ref()).await;
+    assert_eq!(
+        metrics.paused_sandboxes,
+        vec![PausedSandboxResources {
+            sandbox_id,
+            cpu_count: 2,
+            memory_bytes: 4096u64 << 20,
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_snapshot_omits_paused_records_without_resources() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let sandbox_id = SandboxId::new();
+    // The default resources are all zero: an older record whose shape is
+    // unknown, which must be omitted rather than reported as an empty shape.
+    orchestrator
+        .store
+        .add(paused_resume_metadata(sandbox_id))
+        .await?;
+
+    let metrics = current_metrics(orchestrator.as_ref()).await;
+    assert!(metrics.paused_sandboxes.is_empty());
+    // The aggregate counters still count the paused sandbox.
+    assert_eq!(metrics.paused_sandbox_count, 1);
+    Ok(())
+}
+
 async fn proxy_target_for<S, F, P>(
     orchestrator: &TestOrchestrator<S, F, P>,
     sandbox_id: &SandboxId,

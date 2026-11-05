@@ -18,6 +18,10 @@ service Scheduler {
   rpc LookupP2pArtifact(LookupP2pArtifactRequest) returns (LookupP2pArtifactResponse);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
+  // ScheduleResume applies the same capacity rule a new sandbox goes through
+  // before a paused sandbox resumes on its owner (or on another node when
+  // cross_node_resume is enabled).
+  rpc ScheduleResume(ScheduleResumeRequest) returns (ScheduleResumeResponse);
 }
 
 message Node {
@@ -153,6 +157,26 @@ message P2pEndpoint {
   string address = 2;
 }
 
+// AdmissionVerdict is the scheduler's admission decision for one VM shape on
+// one node. reason is a closed set (memory_allocated, memory_used, cpu,
+// starting, disk) and is empty when admitted.
+message AdmissionVerdict {
+  uint64 memory_gb = 1;
+  bool admitted = 2;
+  string reason = 3;
+}
+
+// NodeAdmission carries the capacity facts the verdict was computed over, so a
+// reader can reproduce the decision without duplicating the rule.
+message NodeAdmission {
+  uint64 allocatable_memory_bytes = 1;
+  uint64 runtime_overhead_bytes = 2;
+  uint64 capacity_memory_bytes = 3;
+  // "allocatable" or "total".
+  string capacity_source = 4;
+  repeated AdmissionVerdict layers = 5;
+}
+
 message ObservedNode {
   string node_id = 1;
   string endpoint = 2;
@@ -163,6 +187,16 @@ message ObservedNode {
   MachineInfo machine_info = 7;
   NodeSnapshot snapshot = 8;
   int64 last_seen_unix_ms = 9;
+  NodeAdmission admission = 10;
+}
+
+// PausedSandboxResources is the persisted shape of one paused sandbox on the
+// reporting node. The scheduler projects it when it decides whether a resume
+// fits, so a resume goes through the same capacity rule as a new sandbox.
+message PausedSandboxResources {
+  string sandbox_id = 1;
+  uint32 cpu_count = 2;
+  uint64 memory_bytes = 3;
 }
 
 message HeartbeatRequest {
@@ -175,6 +209,7 @@ message HeartbeatRequest {
   NodeSnapshot snapshot = 7;
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
+  repeated PausedSandboxResources paused_sandboxes = 10;
 }
 
 message HeartbeatResponse {
@@ -276,3 +311,21 @@ message UnregisterNodeRequest {
 }
 
 message UnregisterNodeResponse {}
+
+message ScheduleResumeRequest {
+  string sandbox_id = 1;
+  string cluster_id = 2;
+  // Template shape of the paused sandbox. The gateway supplies it while the
+  // node heartbeat does not carry per-sandbox paused resources yet; once the
+  // heartbeat reports them, that figure wins.
+  uint32 cpu_count = 3;
+  uint64 memory_bytes = 4;
+}
+
+message ScheduleResumeResponse {
+  Node node = 1;
+  bool admitted = 2;
+  // Closed admission reason (memory_allocated, memory_used, cpu, starting or
+  // disk); empty when admitted.
+  string reason = 3;
+}

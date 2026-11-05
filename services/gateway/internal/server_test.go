@@ -39,6 +39,7 @@ type stubSchedulerClient struct {
 	lookupP2pArtifactFunc  func(context.Context, *schedulerv1.LookupP2PArtifactRequest, ...grpc.CallOption) (*schedulerv1.LookupP2PArtifactResponse, error)
 	getNodeFunc            func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error)
 	unregisterNodeFunc     func(context.Context, *schedulerv1.UnregisterNodeRequest, ...grpc.CallOption) (*schedulerv1.UnregisterNodeResponse, error)
+	scheduleResumeFunc     func(context.Context, *schedulerv1.ScheduleResumeRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResumeResponse, error)
 }
 
 type trackingReadCloser struct {
@@ -149,6 +150,13 @@ func (s stubSchedulerClient) UnregisterNode(ctx context.Context, req *schedulerv
 		return nil, fmt.Errorf("unexpected UnregisterNode call")
 	}
 	return s.unregisterNodeFunc(ctx, req, opts...)
+}
+
+func (s stubSchedulerClient) ScheduleResume(ctx context.Context, req *schedulerv1.ScheduleResumeRequest, opts ...grpc.CallOption) (*schedulerv1.ScheduleResumeResponse, error) {
+	if s.scheduleResumeFunc == nil {
+		return nil, fmt.Errorf("unexpected ScheduleResume call")
+	}
+	return s.scheduleResumeFunc(ctx, req, opts...)
 }
 
 const testAPIKey = "test-api-key"
@@ -1727,7 +1735,7 @@ func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) 
 	resp.Header.Set(headerSandboxID, "sbx-from-header")
 
 	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, http.MethodPost, "/sandboxes/sbx-from-header"); err != nil {
+	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, http.MethodPost, "/sandboxes/sbx-from-header", nil); err != nil {
 		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
 	}
 

@@ -58,6 +58,27 @@ var (
 		},
 		[]string{"status"},
 	)
+	schedulerCapacitySource = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_capacity_source_total",
+			Help: "Per-node admission memory base by source (allocatable, total). Counted once per node per admission evaluation.",
+		},
+		[]string{"source"},
+	)
+	schedulerNodeAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_node_admission_total",
+			Help: "Published per-layer admission verdicts by layer, admitted and reason (none when admitted).",
+		},
+		[]string{"layer", "admitted", "reason"},
+	)
+	schedulerResumeAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_resume_admission_total",
+			Help: "Resume admission outcomes by outcome (owner, moved, deferred, disabled, error).",
+		},
+		[]string{"outcome"},
+	)
 )
 
 func MetricsUnaryInterceptor() grpc.UnaryServerInterceptor {
@@ -123,6 +144,8 @@ func schedulerRPCLabel(fullMethod string) string {
 		return "GetNode"
 	case "UnregisterNode":
 		return "UnregisterNode"
+	case "ScheduleResume":
+		return "ScheduleResume"
 	default:
 		return ""
 	}

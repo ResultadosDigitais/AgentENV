@@ -12,6 +12,20 @@ type Node struct {
 type RichNode struct {
 	Node
 	Snapshot *schedulerv1.NodeSnapshot // nil if no heartbeat received yet
+	// Capacity carries the node's Kubernetes allocatable memory when a
+	// cluster-scoped node capacity provider is wired. Nil keeps the legacy
+	// memory_total math.
+	Capacity *NodeCapacity
+}
+
+// NodeCapacity is the physical memory fact the admission rule reads. The
+// runtime overhead is not part of it: it is derived from the node's own
+// snapshot (memory_used - allocated) so a stale allocatable cannot erase the
+// runtime's own footprint.
+type NodeCapacity struct {
+	AllocatableMemoryBytes uint64
+	// Source names where the allocatable figure came from ("kubernetes").
+	Source string
 }
 
 func (n Node) ToProto() *schedulerv1.Node {

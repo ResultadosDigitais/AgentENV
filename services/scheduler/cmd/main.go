@@ -55,9 +55,11 @@ func main() {
 		logger.Info("scheduler query-only service enabled", zap.String("redis_addr", cfg.Scheduler.RedisAddr))
 	} else {
 		registry := scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
-		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
+		capacitySource := scheduler.NewNodeCapacitySource()
+		discoveryMode := strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode))
+		switch discoveryMode {
 		case "kubernetes":
-			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry)
+			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry, capacitySource)
 		default:
 			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
 			for _, n := range cfg.Scheduler.Nodes {
@@ -76,6 +78,7 @@ func main() {
 				cfg.Scheduler.ArtifactLookupNodeLimit,
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
+			scheduler.WithNodeCapacityProvider(capacitySource),
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)
@@ -188,6 +191,7 @@ func runKubernetesDiscoveryWithRetry(
 	logger *zap.Logger,
 	cfg config.SchedulerDiscoveryKubernetesConfig,
 	registry *scheduler.AtomicNodeRegistry,
+	capacitySource *scheduler.NodeCapacitySource,
 ) {
 	const (
 		initialBackoff = 1 * time.Second
@@ -225,6 +229,7 @@ func runKubernetesDiscoveryWithRetry(
 			continue
 		}
 
+		capacitySource.Set(discovery)
 		err = discovery.Run(ctx)
 		if err == nil || errors.Is(err, context.Canceled) {
 			return

@@ -8,6 +8,8 @@ resources:
   - serviceaccount.yaml
   - role.yaml
   - rolebinding.yaml
+  - clusterrole.yaml
+  - clusterrolebinding.yaml
   - scheduler-service.yaml
   - scheduler-deployment.yaml
   - gateway-service.yaml

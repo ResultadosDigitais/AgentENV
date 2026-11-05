@@ -199,6 +199,30 @@ baseline_nodes_json="${HTTP_BODY}"
 node_count="$(echo "${baseline_nodes_json}" | jq 'length')"
 assert_eq "${node_count}" "${expected_nodes}" "admin /nodes exposes expected node count"
 
+# OPSAI-6200: every node publishes the per-layer admission verdict computed by
+# the scheduler's single capacity rule. The reason is a closed set and is
+# omitted when the layer is admitted.
+if echo "${baseline_nodes_json}" | jq -e '
+  all(.[];
+    (.admission != null) and
+    (.admission.capacitySource == "allocatable" or .admission.capacitySource == "total") and
+    ([.admission.layers[].memoryGB] | sort == [8, 16, 32, 64]) and
+    (all(.admission.layers[]; . as $layer |
+      (($layer.admitted | type) == "boolean") and
+      (if $layer.admitted then
+        ($layer.reason == null or $layer.reason == "")
+       else
+        (["memory_allocated", "memory_used", "cpu", "starting", "disk"] | index($layer.reason)) != null
+       end))))
+  ' >/dev/null 2>&1; then
+  _pass "gateway /nodes publishes admission verdicts for every node"
+else
+  _fail \
+    "gateway /nodes publishes admission verdicts for every node" \
+    "admission.capacitySource and four layers (8,16,32,64) with a closed reason" \
+    "${baseline_nodes_json}"
+fi
+
 while IFS=$'\t' read -r node_id sandbox_count allocated_cpu allocated_memory create_successes; do
   [[ -n "${node_id}" ]] || continue
   BASELINE_SANDBOX_COUNT["${node_id}"]="${sandbox_count}"

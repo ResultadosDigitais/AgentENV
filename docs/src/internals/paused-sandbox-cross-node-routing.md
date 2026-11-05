@@ -68,8 +68,16 @@ premise 1, which is what a recreated node does on its own.
 
 ## Consequence for the card
 
-No gateway or scheduler change is required, and none is added to the scope. The
-acceptance criterion "pause, delete the pod, resume on another node, reach
+Ownership routing itself needs no change. OPSAI-6200 adds a separate gate on
+top of it: `POST /sandboxes/{id}/resume` now asks the scheduler
+(`ScheduleResume`) whether the paused shape fits its owner before proxying. A
+resume that does not fit is deferred (`503` with `Retry-After`) or, when
+`cross_node_resume` is enabled and the shape is known, moved to an admitted node
+and rebound before the proxy. The storage and load path below is still what
+makes a cross-node resume reachable; the gate only decides whether it may happen
+now.
+
+The acceptance criterion "pause, delete the pod, resume on another node, reach
 READY" is reachable through the storage and load path alone, provided:
 
 - the paused record is still listed by the loading node when its runtime state is

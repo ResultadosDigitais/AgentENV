@@ -1,7 +1,18 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::SandboxState;
-use crate::types::SandboxResources;
+use crate::types::{SandboxId, SandboxResources};
+
+/// Persisted shape of one paused sandbox, reported in the node heartbeat so the
+/// scheduler can project it before admitting a resume. The aggregate
+/// `paused_allocated_*` totals are not enough: a resume needs the shape of the
+/// specific sandbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PausedSandboxResources {
+    pub sandbox_id: SandboxId,
+    pub cpu_count: u32,
+    pub memory_bytes: u64,
+}
 
 /// A point-in-time snapshot of orchestrator metrics, returned by
 /// `Orchestrator::metrics_snapshot()`.
@@ -26,6 +37,10 @@ pub struct OrchestratorMetrics {
     pub paused_sandbox_count: u32,
     pub paused_allocated_cpu: u32,
     pub paused_allocated_memory_bytes: u64,
+    /// Per-sandbox shape of every paused record whose resources are known.
+    /// Empty when no sandbox is paused; older records without resources are
+    /// omitted rather than reported as zero.
+    pub paused_sandboxes: Vec<PausedSandboxResources>,
 }
 
 /// Monotonic creation counters maintained by the orchestrator.

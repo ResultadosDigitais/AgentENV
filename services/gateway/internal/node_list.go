@@ -49,6 +49,21 @@ type nodeListMetrics struct {
 	PausedAllocatedMemoryBytes uint64                `json:"pausedAllocatedMemoryBytes"`
 }
 
+type nodeListAdmissionLayer struct {
+	MemoryGB uint64 `json:"memoryGB"`
+	Admitted bool   `json:"admitted"`
+	// Reason is omitted when the layer is admitted.
+	Reason string `json:"reason,omitempty"`
+}
+
+type nodeListAdmission struct {
+	AllocatableMemoryBytes uint64                   `json:"allocatableMemoryBytes"`
+	RuntimeOverheadBytes   uint64                   `json:"runtimeOverheadBytes"`
+	CapacityMemoryBytes    uint64                   `json:"capacityMemoryBytes"`
+	CapacitySource         string                   `json:"capacitySource"`
+	Layers                 []nodeListAdmissionLayer `json:"layers"`
+}
+
 type nodeListItem struct {
 	Version              string              `json:"version"`
 	Commit               string              `json:"commit"`
@@ -59,10 +74,35 @@ type nodeListItem struct {
 	Status               string              `json:"status"`
 	SandboxCount         uint32              `json:"sandboxCount"`
 	Metrics              nodeListMetrics     `json:"metrics"`
+	Admission            *nodeListAdmission  `json:"admission,omitempty"`
 	CreateSuccesses      uint64              `json:"createSuccesses"`
 	CreateFails          uint64              `json:"createFails"`
 	SandboxStartingCount uint32              `json:"sandboxStartingCount"`
 	SandboxPausedCount   uint32              `json:"sandboxPausedCount"`
+}
+
+// mapNodeAdmission converts the scheduler verdict into the gateway's JSON
+// shape, preserving the closed reason set and omitting the reason when the
+// layer is admitted.
+func mapNodeAdmission(admission *schedulerv1.NodeAdmission) *nodeListAdmission {
+	if admission == nil {
+		return nil
+	}
+	layers := make([]nodeListAdmissionLayer, 0, len(admission.GetLayers()))
+	for _, layer := range admission.GetLayers() {
+		layers = append(layers, nodeListAdmissionLayer{
+			MemoryGB: layer.GetMemoryGb(),
+			Admitted: layer.GetAdmitted(),
+			Reason:   layer.GetReason(),
+		})
+	}
+	return &nodeListAdmission{
+		AllocatableMemoryBytes: admission.GetAllocatableMemoryBytes(),
+		RuntimeOverheadBytes:   admission.GetRuntimeOverheadBytes(),
+		CapacityMemoryBytes:    admission.GetCapacityMemoryBytes(),
+		CapacitySource:         admission.GetCapacitySource(),
+		Layers:                 layers,
+	}
 }
 
 func isNodeListRequest(r *http.Request) bool {
@@ -135,6 +175,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			},
 			Status:       nodeStatusToString(snapshot.GetStatus()),
 			SandboxCount: snapshot.GetSandboxCount(),
+			Admission:    mapNodeAdmission(observed.GetAdmission()),
 			Metrics: nodeListMetrics{
 				AllocatedCPU:               snapshot.GetAllocatedCpu(),
 				AllocatedMemoryBytes:       snapshot.GetAllocatedMemoryBytes(),
