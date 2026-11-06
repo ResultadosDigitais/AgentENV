@@ -326,6 +326,94 @@ pub(crate) fn is_paused_chain_limit_exceeded(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<PausedChainLimitExceeded>().is_some())
 }
 
+/// Named, recoverable failure code: compacting the runtime-owned suffix would
+/// need more free bytes at the artifact root than the node has. The pause is
+/// refused **before** the compaction starts, so the node never runs a rewrite
+/// that would fill the disk half-way; the sandbox is resumed in place like the
+/// chain-limit refusals.
+pub(crate) const COMPACTION_HEADROOM_INSUFFICIENT: &str = "COMPACTION_HEADROOM_INSUFFICIENT";
+
+/// Transient disk the compaction of one device needs, refused pre-emptively.
+///
+/// The merged commit is written beside its inputs and only renamed into place
+/// when complete, so while the compaction runs both the inputs and the output
+/// exist. The output is the union of the inputs' blocks, which is bounded by the
+/// device's virtual size and by the sum of the inputs' allocated bytes, so the
+/// smaller of the two is already an upper bound. `free_bytes` is `None` when the
+/// filesystem probe failed — the refusal is then fail-closed, because starting
+/// a rewrite without being able to prove headroom is exactly the half-way
+/// failure this check exists to prevent.
+#[derive(Debug)]
+pub(crate) struct CompactionHeadroomInsufficient {
+    pub required_bytes: u64,
+    pub free_bytes: Option<u64>,
+}
+
+impl std::fmt::Display for CompactionHeadroomInsufficient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.free_bytes {
+            Some(free_bytes) => write!(
+                f,
+                "{COMPACTION_HEADROOM_INSUFFICIENT}: compaction needs {required} bytes of free \
+                 space at the artifact root but the filesystem reports {free} bytes; the pause is \
+                 refused before the rewrite starts",
+                required = self.required_bytes,
+                free = free_bytes,
+            ),
+            None => write!(
+                f,
+                "{COMPACTION_HEADROOM_INSUFFICIENT}: compaction needs {required} bytes of free \
+                 space at the artifact root but the filesystem probe failed; the pause is refused \
+                 before the rewrite starts",
+                required = self.required_bytes,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompactionHeadroomInsufficient {}
+
+fn compaction_headroom_insufficient(required_bytes: u64, free_bytes: Option<u64>) -> anyhow::Error {
+    anyhow::Error::new(CompactionHeadroomInsufficient {
+        required_bytes,
+        free_bytes,
+    })
+}
+
+/// Whether `error` is a pause refusal the pause path can recover from by
+/// resuming the VM in place.
+///
+/// Both refusals are capacity decisions taken after the device restack only
+/// because their numbers are known then, and both leave the device usable, so
+/// neither may become a terminal capture failure.
+pub(crate) fn is_recoverable_pause_refusal(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<PausedChainLimitExceeded>().is_some()
+            || cause
+                .downcast_ref::<CompactionHeadroomInsufficient>()
+                .is_some()
+    })
+}
+
+/// The stable code carried by a recoverable pause refusal, when the error is
+/// one.
+///
+/// The API layer reads the code from here so the node's HTTP response and the
+/// backend log line name the refusal identically, without either of them
+/// matching on message text.
+pub(crate) fn pause_refusal_code(error: &anyhow::Error) -> Option<&'static str> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<PausedChainLimitExceeded>()
+            .map(|exceeded| exceeded.limit.as_str())
+            .or_else(|| {
+                cause
+                    .downcast_ref::<CompactionHeadroomInsufficient>()
+                    .map(|_| COMPACTION_HEADROOM_INSUFFICIENT)
+            })
+    })
+}
+
 /// The chain measured **before** the pause mutates the live runtime.
 ///
 /// A restack is the point of no return: it seals the writable upper and reopens
@@ -454,6 +542,10 @@ mod chain_metrics {
     /// rejection was skipped because it provably could not fire.
     pub(super) const PREFLIGHT_GUARANTEED_FIT: &str =
         "agentenv_paused_sandbox_chain_preflight_guaranteed_fit_total";
+    /// Pauses refused before a compaction because the artifact root could not
+    /// hold the merged output beside its inputs.
+    pub(super) const COMPACTION_HEADROOM_REFUSED: &str =
+        "agentenv_paused_sandbox_compaction_headroom_refused_total";
 
     pub(super) fn record_chain_bytes(kind: &'static str, bytes: u64, ceiling: u64) {
         metrics::gauge!(CHAIN_BYTES, "kind" => kind).set(bytes as f64);
@@ -497,6 +589,10 @@ mod chain_metrics {
 
     pub(super) fn record_preflight_guaranteed_fit(kind: &'static str) {
         metrics::counter!(PREFLIGHT_GUARANTEED_FIT, "kind" => kind).increment(1);
+    }
+
+    pub(super) fn record_compaction_headroom_refused(kind: &'static str) {
+        metrics::counter!(COMPACTION_HEADROOM_REFUSED, "kind" => kind).increment(1);
     }
 }
 
@@ -622,10 +718,10 @@ impl LiveOverlaybdSnapshotState {
         match self {
             Self::ReadOnly => staged_snapshot,
             Self::Restacked(_) => staged_snapshot.map_err(|error| {
-                if is_paused_chain_limit_exceeded(&error) {
+                if is_recoverable_pause_refusal(&error) {
                     debug!(
-                        "keeping a post-restack chain ceiling rejection recoverable so the \
-                         sandbox is resumed instead of stopped"
+                        "keeping a post-restack pause refusal recoverable so the sandbox is \
+                         resumed instead of stopped"
                     );
                     error
                 } else {
@@ -1017,6 +1113,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     limits: ChainLimits,
     runtime_owned_roots: &[PathBuf],
     preflight: ChainPreflight,
+    compaction_view_bytes: u64,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -1060,7 +1157,11 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
-        ChainLimitPolicy { limits, preflight },
+        ChainLimitPolicy {
+            limits,
+            preflight,
+            compaction_view_bytes,
+        },
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -1085,6 +1186,11 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
 pub(super) struct ChainLimitPolicy {
     pub(super) limits: ChainLimits,
     pub(super) preflight: ChainPreflight,
+    /// Virtual size, in bytes, of the device the compactable layers describe:
+    /// the upper bound of the merged commit compaction writes. `0` disables the
+    /// pre-compaction headroom check — right for a chain with no device size to
+    /// bound it, never a way to skip the check on a device that has one.
+    pub(super) compaction_view_bytes: u64,
 }
 
 impl ChainLimitPolicy {
@@ -1099,6 +1205,74 @@ impl ChainLimitPolicy {
     }
 }
 
+/// Fraction of the compacted view reserved for the commit's index and metadata
+/// on top of its data blocks (one eighth).
+const COMPACTION_HEADROOM_OVERHEAD_DIVISOR: u64 = 8;
+
+/// Upper bound of the transient disk a compaction needs.
+///
+/// The merged commit cannot exceed the device's virtual size and cannot exceed
+/// the sum of its inputs' allocated bytes, because blocks rewritten by several
+/// layers are stored once; the smaller bound wins. The index and metadata add a
+/// fraction of the data, covered by the overhead divisor.
+fn compaction_transient_bytes(view_bytes: u64, compactable_bytes: u64) -> u64 {
+    let merged_bytes = view_bytes.min(compactable_bytes);
+    merged_bytes.saturating_add(merged_bytes / COMPACTION_HEADROOM_OVERHEAD_DIVISOR)
+}
+
+/// Refuse before a compaction that the node cannot finish.
+///
+/// Called immediately before the rewrite starts, while the inputs and the
+/// output would coexist on the artifact root. Refusing here keeps the failure
+/// clean: the alternative is an `ENOSPC` after the device was already restacked
+/// and half the merged commit was written.
+fn ensure_compaction_headroom(
+    output_dir: &Path,
+    view_bytes: u64,
+    compactable: &[LayerConfig],
+    kind: &'static str,
+) -> Result<()> {
+    ensure_compaction_headroom_with(
+        output_dir,
+        view_bytes,
+        compactable,
+        kind,
+        chain_refusal_log::filesystem_space,
+    )
+}
+
+fn ensure_compaction_headroom_with(
+    output_dir: &Path,
+    view_bytes: u64,
+    compactable: &[LayerConfig],
+    kind: &'static str,
+    filesystem_space: impl Fn(&Path) -> Option<(u64, u64)>,
+) -> Result<()> {
+    if view_bytes == 0 {
+        return Ok(());
+    }
+    let compactable_bytes =
+        chain_allocated_bytes(compactable.iter().map(|lower| Path::new(&lower.file)));
+    let required_bytes = compaction_transient_bytes(view_bytes, compactable_bytes);
+    let free_bytes = filesystem_space(output_dir).map(|(free, _)| free);
+    if free_bytes.is_some_and(|free| free >= required_bytes) {
+        return Ok(());
+    }
+    warn!(
+        kind,
+        artifact_root = %output_dir.display(),
+        required_bytes,
+        free_bytes,
+        view_bytes,
+        compactable_bytes,
+        compaction_inputs = compactable.len(),
+        "compaction needs more transient disk than the artifact root has; \
+         refusing the pause before the rewrite starts"
+    );
+    chain_metrics::record_compaction_headroom_refused(kind);
+    Err(compaction_headroom_insufficient(required_bytes, free_bytes))
+}
+
 async fn rewrite_lowers_with_runtime_roots(
     existing_lowers: Vec<LayerConfig>,
     output_dir: &Path,
@@ -1108,7 +1282,11 @@ async fn rewrite_lowers_with_runtime_roots(
     compaction_output: OverlaybdCompactOutput,
     policy: ChainLimitPolicy,
 ) -> Result<Vec<LayerConfig>> {
-    let ChainLimitPolicy { limits, preflight } = policy;
+    let ChainLimitPolicy {
+        limits,
+        preflight,
+        compaction_view_bytes,
+    } = policy;
     let limits_enforced = limits.enabled();
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
@@ -1194,6 +1372,17 @@ async fn rewrite_lowers_with_runtime_roots(
         if compactable.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
         }
+        // Refuse before the rewrite if the node cannot hold both the inputs
+        // and the merged output at once. The check is inside this branch, not
+        // on the adoption path, because only a compaction needs the transient
+        // space; and it runs before `compact_layers` so a pause on a full node
+        // fails cleanly instead of half-writing the output.
+        ensure_compaction_headroom(
+            output_dir,
+            compaction_view_bytes,
+            &compactable,
+            compaction_output_name,
+        )?;
         let compacted_path = compact_layers(
             &compactable,
             &output_dir.join(compaction_output_name),
@@ -1466,6 +1655,9 @@ pub(super) async fn build_mem_snapshot_image_config(
             // it just wrote, so there is no pre-mutation measurement to take and
             // the post-compaction check stays the only judge.
             preflight: ChainPreflight::disabled(),
+            // The card's transient-disk refusal is about the rootfs chain; the
+            // memory chain keeps today's behavior.
+            compaction_view_bytes: 0,
         },
     )
     .await?;
@@ -1493,6 +1685,9 @@ pub(super) struct RestackSnapshotDevice<'a> {
     pub(super) kind: &'static str,
     pub(super) limits: ChainLimits,
     pub(super) runtime_owned_roots: &'a [PathBuf],
+    /// Virtual size of the device, the bound of the merged commit the compaction
+    /// would write. `0` disables the pre-compaction headroom check.
+    pub(super) compaction_view_bytes: u64,
 }
 
 /// Stage a persisted snapshot config from the current live overlaybd runtime.
@@ -1513,6 +1708,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         kind,
         limits,
         runtime_owned_roots,
+        compaction_view_bytes,
     } = request;
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -1564,6 +1760,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         limits,
         runtime_owned_roots,
         preflight,
+        compaction_view_bytes,
     )
     .await;
 
@@ -1577,6 +1774,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     snapshot_root: &Path,
     limits: ChainLimits,
     runtime_owned_roots: &[PathBuf],
+    compaction_view_bytes: u64,
 ) -> Result<PathBuf> {
     restack_snapshot_overlaybd_device(RestackSnapshotDevice {
         ublk_device,
@@ -1587,6 +1785,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         kind: "rootfs",
         limits,
         runtime_owned_roots,
+        compaction_view_bytes,
     })
     .await
 }
@@ -2607,6 +2806,7 @@ mod tests {
                     whole_chain_ceiling: 0,
                 },
                 preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 0,
             },
         )
         .await
@@ -2661,6 +2861,7 @@ mod tests {
                     whole_chain_ceiling: 0,
                 },
                 preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 0,
             },
         )
         .await
@@ -2842,6 +3043,7 @@ mod tests {
                     whole_chain_ceiling: 0,
                 },
                 preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 0,
             },
         )
         .await
@@ -2910,6 +3112,7 @@ mod tests {
                         whole_chain_ceiling: limit_bytes,
                     },
                     preflight: ChainPreflight::disabled(),
+                    compaction_view_bytes: 0,
                 },
             )
             .await
@@ -2936,6 +3139,172 @@ mod tests {
             final_bytes <= limit_bytes,
             "ten pauses rewriting the same block must leave the chain at or under {limit_bytes} \
              bytes: {final_bytes} bytes across {final_paths:?}"
+        );
+    }
+
+    /// The transient bound is the smaller of the device view and the inputs,
+    /// plus the index overhead: a chain far larger than its disk must not demand
+    /// its whole chain size in free space.
+    #[test]
+    fn compaction_transient_bytes_is_bounded_by_the_smaller_side() {
+        let with_overhead = |bytes: u64| bytes + bytes / 8;
+        assert_eq!(super::compaction_transient_bytes(0, 1_000_000), 0);
+        assert_eq!(
+            super::compaction_transient_bytes(4096, 1 << 20),
+            with_overhead(4096),
+            "the device view bounds the merged commit when the inputs are larger"
+        );
+        assert_eq!(
+            super::compaction_transient_bytes(1 << 20, 4096),
+            with_overhead(4096),
+            "the inputs bound the merged commit when the device view is larger"
+        );
+    }
+
+    /// The headroom refusal is typed, recoverable and fail-closed when the
+    /// filesystem cannot be probed: starting a rewrite without proven headroom
+    /// is the half-way failure the check exists to prevent.
+    #[test]
+    fn compaction_headroom_refusal_is_typed_and_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layer = temp.path().join("generation.commit");
+        std::fs::write(&layer, vec![0xABu8; 65536]).expect("write runtime layer");
+        let compactable = [local_layer_config(&layer)];
+        let compactable_bytes = super::chain_allocated_bytes([layer.as_path()]);
+        let required = super::compaction_transient_bytes(4096, compactable_bytes);
+        assert!(required > 0, "the fixture must allocate bytes");
+
+        // Exactly enough free space passes: the check must not be stricter than
+        // the bound it documents.
+        assert!(
+            super::ensure_compaction_headroom_with(
+                temp.path(),
+                4096,
+                &compactable,
+                MANAGED_BASE_LAYER_FILE,
+                |_| Some((required, required)),
+            )
+            .is_ok(),
+            "free bytes equal to the requirement must pass"
+        );
+
+        let error = super::ensure_compaction_headroom_with(
+            temp.path(),
+            4096,
+            &compactable,
+            MANAGED_BASE_LAYER_FILE,
+            |_| Some((required - 1, required)),
+        )
+        .expect_err("one byte short must refuse");
+        assert_eq!(
+            super::pause_refusal_code(&error),
+            Some(super::COMPACTION_HEADROOM_INSUFFICIENT)
+        );
+        assert!(
+            error.to_string().contains(&required.to_string()),
+            "the refusal must carry the requirement: {error}"
+        );
+
+        let error = super::ensure_compaction_headroom_with(
+            temp.path(),
+            4096,
+            &compactable,
+            MANAGED_BASE_LAYER_FILE,
+            |_| None,
+        )
+        .expect_err("an unreadable filesystem must fail closed");
+        assert_eq!(
+            super::pause_refusal_code(&error),
+            Some(super::COMPACTION_HEADROOM_INSUFFICIENT)
+        );
+
+        // `0` is the documented disable switch.
+        assert!(
+            super::ensure_compaction_headroom_with(
+                temp.path(),
+                0,
+                &compactable,
+                MANAGED_BASE_LAYER_FILE,
+                |_| None,
+            )
+            .is_ok(),
+            "a zero view must disable the check"
+        );
+    }
+
+    /// A full artifact root must refuse the pause before `compact_layers`
+    /// writes anything, and the refusal must stay recoverable so the pause path
+    /// resumes the VM instead of stopping it.
+    #[tokio::test]
+    async fn rewrite_refuses_before_compaction_when_the_artifact_root_lacks_headroom() {
+        // `/proc` reports zero free bytes and is never written to; the rewrite
+        // must refuse before it reaches the output path there.
+        let free =
+            super::chain_refusal_log::filesystem_space(Path::new("/proc")).map(|(free, _)| free);
+        assert_eq!(
+            free,
+            Some(0),
+            "this fixture relies on /proc reporting zero free bytes"
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        let mut layers = Vec::new();
+        for (index, byte) in [0xAAu8, 0xBB].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("gen-{index}"),
+                8192,
+                &[(0, byte), (4096, byte)],
+            )
+            .await;
+            layers.push(local_layer_config(&path));
+        }
+        let appended = seal_raw_test_layer(&runtime_root, "appended", 8192, &[(0, 0xCC)]).await;
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let error = rewrite_lowers_with_runtime_roots(
+            layers,
+            Path::new("/proc"),
+            Some(local_layer_config(&appended)),
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: 1,
+                    whole_chain_ceiling: 0,
+                },
+                preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 8192,
+            },
+        )
+        .await
+        .expect_err("a compaction on a full artifact root must refuse");
+
+        assert_eq!(
+            super::pause_refusal_code(&error),
+            Some(super::COMPACTION_HEADROOM_INSUFFICIENT)
+        );
+        assert!(
+            !Path::new("/proc").join(MANAGED_BASE_LAYER_FILE).exists(),
+            "the refusal must happen before the rewrite writes its output"
+        );
+
+        // The pause path classifies by error type: a headroom refusal after the
+        // restack must be resumed in place, never torn down.
+        let classified = LiveOverlaybdSnapshotState::Restacked(PathBuf::from("/tmp/unused"))
+            .finish_staging(Err(error))
+            .expect_err("a headroom refusal is still an error");
+        let capture_error = SandboxCaptureError::from(classified);
+        assert!(
+            !capture_error.is_terminal(),
+            "a headroom refusal must stay recoverable: {capture_error:#}"
+        );
+        assert_eq!(
+            super::pause_refusal_code(capture_error.inner()),
+            Some(super::COMPACTION_HEADROOM_INSUFFICIENT)
         );
     }
 
@@ -2996,6 +3365,7 @@ mod tests {
                     whole_chain_ceiling: limit_bytes,
                 },
                 preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 0,
             },
         )
         .await
@@ -3057,6 +3427,7 @@ mod tests {
                     whole_chain_ceiling: limit_bytes,
                 },
                 preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 0,
             },
         )
         .await
@@ -3123,6 +3494,7 @@ mod tests {
                     whole_chain_ceiling: 0,
                 },
                 preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 0,
             },
         )
         .await
@@ -3302,6 +3674,7 @@ mod tests {
             ChainLimits::disabled(),
             &[],
             ChainPreflight::disabled(),
+            0,
         )
         .await
         .expect("stage snapshot");

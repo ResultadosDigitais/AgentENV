@@ -28,7 +28,7 @@ pub use sandbox::{FirecrackerCaptureArtifacts, FirecrackerPausedState, Firecrack
 // Re-exported for the orchestrator's recoverable-pause branch: it must recognize
 // the named chain-ceiling refusal by error type, never by message text, so the
 // classification cannot drift from the code that produces it.
-pub(crate) use overlaybd_snapshot::is_paused_chain_limit_exceeded;
+pub(crate) use overlaybd_snapshot::{is_paused_chain_limit_exceeded, pause_refusal_code};
 #[cfg(test)]
 pub(crate) use overlaybd_snapshot::{paused_chain_limit_error, PausedChainLimit};
 pub(crate) use startup_pack::record_startup_pack;

@@ -1295,6 +1295,7 @@ impl FirecrackerSandbox {
                 snapshot_dir,
                 rootfs_limits,
                 &runtime_owned_roots,
+                size,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
@@ -2824,6 +2825,7 @@ impl FirecrackerSandbox {
                         whole_chain_ceiling: 0,
                     },
                     runtime_owned_roots: &runtime_owned_roots,
+                    compaction_view_bytes: runtime.actual_virtual_size,
                 })
                 .await
                 .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -2878,6 +2880,7 @@ impl FirecrackerSandbox {
                     whole_chain_ceiling: 0,
                 },
                 runtime_owned_roots: &runtime_owned_roots,
+                compaction_view_bytes: runtime.actual_virtual_size,
             })
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;

@@ -132,6 +132,20 @@ impl ApiImpl {
         models::Error::new(code, message.into())
     }
 
+    /// An error that also carries a stable, machine-readable code, so a caller
+    /// can classify a deliberate refusal without parsing the message.
+    fn error_with_code(
+        code: i32,
+        error_code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> models::Error {
+        models::Error {
+            code,
+            error_code: Some(error_code.into()),
+            message: message.into(),
+        }
+    }
+
     fn internal_error(err: &dyn std::error::Error) -> models::Error {
         let mut message = err.to_string();
         let mut current = err.source();
