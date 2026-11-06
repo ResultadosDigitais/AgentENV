@@ -51,6 +51,69 @@ const ALLOCATION_BLOCK_SIZE: u64 = 512;
 /// the sandbox keeps its runtime state.
 pub(crate) const CHAIN_BYTES_CEILING_EXCEEDED: &str = "CHAIN_BYTES_CEILING_EXCEEDED";
 
+/// Named, recoverable failure code: the whole deduplicated rootfs chain of one
+/// sandbox (its stable prefix plus its runtime-owned generations) is still above
+/// `orchestrator.rootfs_chain_disk_multiple` times the guest rootfs disk after
+/// compaction. The pause is rejected and the sandbox resumed in place, exactly
+/// like the absolute ceiling above; the two differ only in what they bound.
+pub(crate) const ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED: &str = "ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED";
+
+/// Which paused-chain bound a pause breached.
+///
+/// The two bounds answer different questions and are recoverable in exactly the
+/// same way, so the concrete error carries the variant and every consumer reads
+/// the stable code from [`PausedChainLimit::as_str`] instead of matching text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PausedChainLimit {
+    /// The absolute cap on the reclaimable part (`chain_bytes_ceiling`).
+    ChainBytesCeiling,
+    /// The relative cap on the whole rootfs chain (`rootfs_chain_disk_multiple`).
+    RootfsDiskMultiple,
+}
+
+impl PausedChainLimit {
+    /// The stable, grep-able code carried by logs, metrics and the error.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ChainBytesCeiling => CHAIN_BYTES_CEILING_EXCEEDED,
+            Self::RootfsDiskMultiple => ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED,
+        }
+    }
+}
+
+/// The bounds a paused-chain rewrite enforces, each `0` meaning disabled.
+///
+/// `reclaimable_ceiling` is the absolute cap that existed before this type:
+/// the part this sandbox's pauses add (runtime-owned lowers plus the appended
+/// layer). `whole_chain_ceiling` is the relative cap the card adds: the whole
+/// deduplicated chain, the shared stable prefix included, against a small
+/// multiple of the guest rootfs disk. Only the rootfs chain sets the second one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChainLimits {
+    pub(super) reclaimable_ceiling: u64,
+    pub(super) whole_chain_ceiling: u64,
+}
+
+impl ChainLimits {
+    #[cfg(test)]
+    pub(super) fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Whether either bound is enforced.
+    pub(super) fn enabled(self) -> bool {
+        self.reclaimable_ceiling != 0 || self.whole_chain_ceiling != 0
+    }
+}
+
+/// The first bound a measured chain breaches, with the numbers that name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChainLimitBreach {
+    pub(super) limit: PausedChainLimit,
+    pub(super) observed_bytes: u64,
+    pub(super) limit_bytes: u64,
+}
+
 /// What the byte ceiling bounds: the bytes the sandbox's own pauses add.
 ///
 /// The ceiling exists so one sandbox's pause churn cannot fill a node's disk,
@@ -80,10 +143,16 @@ pub(crate) const CHAIN_BYTES_CEILING_EXCEEDED: &str = "CHAIN_BYTES_CEILING_EXCEE
 /// sandbox that cannot stop.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct ChainByteAccounting {
-    /// Bounded by the ceiling: runtime-owned lowers plus the appended layer.
+    /// Bounded by the absolute ceiling: runtime-owned lowers plus the appended
+    /// layer.
     pub(super) reclaimable_bytes: u64,
-    /// Reported, never charged: immutable lowers shared across sandboxes.
+    /// Reported and only judged by the relative bound: immutable lowers shared
+    /// across sandboxes.
     pub(super) stable_prefix_bytes: u64,
+    /// The whole deduplicated chain, prefix included. The two parts are disjoint
+    /// through the shared inode set, so this is exactly the `du` figure the card
+    /// measures per generation.
+    pub(super) total_bytes: u64,
 }
 
 impl ChainByteAccounting {
@@ -118,17 +187,33 @@ impl ChainByteAccounting {
         Self {
             reclaimable_bytes,
             stable_prefix_bytes,
+            total_bytes: stable_prefix_bytes.saturating_add(reclaimable_bytes),
         }
     }
 
-    /// The bytes the ceiling refuses, or `None` when the chain fits.
+    /// The first bound this chain breaches, or `None` when it fits.
     ///
-    /// Only the reclaimable part is judged: it is the part this sandbox's
-    /// pauses add and the part compaction can shrink. `stable_prefix_bytes` is
-    /// carried for the rejection message, never compared with the ceiling — see
-    /// the type-level note for why a shared prefix must not reject a pause.
-    pub(super) fn ceiling_breach(self, ceiling: u64) -> Option<u64> {
-        (self.reclaimable_bytes > ceiling).then_some(self.reclaimable_bytes)
+    /// The absolute bound keeps judging only the reclaimable part: it is the
+    /// part this sandbox's pauses add and the part compaction can shrink, and
+    /// the shared prefix must never reject a pause on its own. The relative
+    /// bound is the card's invariant and judges the whole deduplicated chain,
+    /// prefix included; it is only enabled for the rootfs.
+    pub(super) fn breach(self, limits: ChainLimits) -> Option<ChainLimitBreach> {
+        if limits.reclaimable_ceiling != 0 && self.reclaimable_bytes > limits.reclaimable_ceiling {
+            return Some(ChainLimitBreach {
+                limit: PausedChainLimit::ChainBytesCeiling,
+                observed_bytes: self.reclaimable_bytes,
+                limit_bytes: limits.reclaimable_ceiling,
+            });
+        }
+        if limits.whole_chain_ceiling != 0 && self.total_bytes > limits.whole_chain_ceiling {
+            return Some(ChainLimitBreach {
+                limit: PausedChainLimit::RootfsDiskMultiple,
+                observed_bytes: self.total_bytes,
+                limit_bytes: limits.whole_chain_ceiling,
+            });
+        }
+        None
     }
 }
 
@@ -157,29 +242,32 @@ pub(crate) struct ChainCeilingBreakdown {
 /// Ceiling rejection for one sandbox's paused artifact chain.
 ///
 /// Kept as a concrete error so the pause path can classify it as recoverable
-/// through `context` layers, instead of matching on message text.
+/// through `context` layers, instead of matching on message text. `limit` says
+/// which bound refused, so the absolute ceiling and the rootfs disk multiple
+/// stay distinguishable by type and code after every wrapper.
 ///
-/// `observed_bytes` is the reclaimable part the ceiling bounds, not the chain
-/// total: the immutable stable prefix is reported by the breakdown and never
-/// charged, because it is shared by every sandbox of the same image and grows
-/// with nothing.
+/// `observed_bytes` is the measured part the refusing bound judges: the
+/// reclaimable part for [`PausedChainLimit::ChainBytesCeiling`], the whole
+/// deduplicated chain for [`PausedChainLimit::RootfsDiskMultiple`].
 #[derive(Debug)]
-pub(crate) struct ChainBytesCeilingExceeded {
+pub(crate) struct PausedChainLimitExceeded {
+    pub limit: PausedChainLimit,
     pub observed_bytes: u64,
-    pub ceiling_bytes: u64,
+    pub limit_bytes: u64,
     pub breakdown: ChainCeilingBreakdown,
 }
 
-impl std::fmt::Display for ChainBytesCeilingExceeded {
+impl std::fmt::Display for PausedChainLimitExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let breakdown = &self.breakdown;
         write!(
             f,
-            "{CHAIN_BYTES_CEILING_EXCEEDED}: reclaimable paused sandbox chain needs {} bytes \
-             against the {} byte ceiling (compacted {} lowers into {} bytes; appended layer: {} \
-             bytes; immutable stable prefix not charged: {} lowers, {} bytes)",
+            "{}: paused sandbox chain needs {} bytes against the {} byte limit (compacted {} \
+             lowers into {} bytes; appended layer: {} bytes; immutable stable prefix not charged: \
+             {} lowers, {} bytes)",
+            self.limit.as_str(),
             self.observed_bytes,
-            self.ceiling_bytes,
+            self.limit_bytes,
             breakdown.compacted_lowers,
             breakdown.compacted_bytes,
             breakdown.appended_bytes,
@@ -189,46 +277,53 @@ impl std::fmt::Display for ChainBytesCeilingExceeded {
     }
 }
 
-impl std::error::Error for ChainBytesCeilingExceeded {}
+impl std::error::Error for PausedChainLimitExceeded {}
 
-fn chain_ceiling_exceeded(
+fn paused_chain_limit_exceeded(
+    limit: PausedChainLimit,
     observed_bytes: u64,
-    ceiling_bytes: u64,
+    limit_bytes: u64,
     breakdown: ChainCeilingBreakdown,
 ) -> anyhow::Error {
-    anyhow::Error::new(ChainBytesCeilingExceeded {
+    anyhow::Error::new(PausedChainLimitExceeded {
+        limit,
         observed_bytes,
-        ceiling_bytes,
+        limit_bytes,
         breakdown,
     })
 }
 
-/// A [`ChainBytesCeilingExceeded`] with no breakdown detail.
+/// A [`PausedChainLimitExceeded`] with no breakdown detail.
 ///
 /// Test-only: the orchestrator's recoverable-pause branch classifies by error
 /// type, and the mock backend needs to produce that exact type (never a message
 /// that merely spells the code) for the branch to be exercised for real.
 #[cfg(test)]
-pub(crate) fn chain_ceiling_error(observed_bytes: u64, ceiling_bytes: u64) -> anyhow::Error {
-    chain_ceiling_exceeded(
+pub(crate) fn paused_chain_limit_error(
+    limit: PausedChainLimit,
+    observed_bytes: u64,
+    limit_bytes: u64,
+) -> anyhow::Error {
+    paused_chain_limit_exceeded(
+        limit,
         observed_bytes,
-        ceiling_bytes,
+        limit_bytes,
         ChainCeilingBreakdown::default(),
     )
 }
 
-/// Whether `error` carries a [`ChainBytesCeilingExceeded`] anywhere in its
+/// Whether `error` carries a [`PausedChainLimitExceeded`] anywhere in its
 /// `context` chain.
 ///
-/// The pause path wraps the ceiling rejection with context at several layers
-/// (the restack of one device, the staging of its snapshot config, the pause
+/// The pause path wraps the rejection with context at several layers (the
+/// restack of one device, the staging of its snapshot config, the pause
 /// itself), so matching the concrete error type through the chain is the only
 /// classification that survives that nesting. Matching on message text would
 /// also reclassify an unrelated error that merely mentions the code.
-pub(crate) fn is_chain_bytes_ceiling_exceeded(error: &anyhow::Error) -> bool {
+pub(crate) fn is_paused_chain_limit_exceeded(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .any(|cause| cause.downcast_ref::<ChainBytesCeilingExceeded>().is_some())
+        .any(|cause| cause.downcast_ref::<PausedChainLimitExceeded>().is_some())
 }
 
 /// The chain measured **before** the pause mutates the live runtime.
@@ -242,7 +337,7 @@ pub(crate) fn is_chain_bytes_ceiling_exceeded(error: &anyhow::Error) -> bool {
 /// and is skipped; the pause then never pays for a refusal it provably does not
 /// need.
 ///
-/// It is deliberately *not* a refusal. `measured_bytes` is an upper bound, not a
+/// It is deliberately *not* a refusal. `measured_reclaimable_bytes` is an upper bound, not a
 /// floor: the appended bytes are the writable upper's allocated blocks, and
 /// compaction folds those same blocks into the generation it writes. Refusing on
 /// an upper bound would reject pauses that would have fit, which is worse than
@@ -251,9 +346,12 @@ pub(crate) fn is_chain_bytes_ceiling_exceeded(error: &anyhow::Error) -> bool {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ChainPreflight {
     /// Reclaimable chain bytes plus the writable upper's allocated bytes.
-    pub(super) measured_bytes: u64,
-    /// Ceiling in force; `0` means the ceiling is disabled.
-    pub(super) ceiling_bytes: u64,
+    pub(super) measured_reclaimable_bytes: u64,
+    /// Whole deduplicated chain bytes plus the writable upper's allocated bytes.
+    pub(super) measured_total_bytes: u64,
+    /// The bounds the post-compaction check will enforce; disabled when neither
+    /// is set.
+    pub(super) limits: ChainLimits,
 }
 
 impl ChainPreflight {
@@ -262,28 +360,37 @@ impl ChainPreflight {
         Self::default()
     }
 
-    /// Measure the live chain plus its writable upper.
+    /// Measure the live chain plus its writable upper against both bounds.
     pub(super) fn measure(
         chain: impl IntoIterator<Item = LayerConfig>,
         upper_paths: &[PathBuf],
         runtime_owned_roots: &[PathBuf],
-        ceiling_bytes: u64,
+        limits: ChainLimits,
     ) -> Self {
-        if ceiling_bytes == 0 {
+        if !limits.enabled() {
             return Self::disabled();
         }
         let accounting = ChainByteAccounting::measure(chain, None, runtime_owned_roots);
         let upper_bytes = chain_allocated_bytes(upper_paths.iter().map(PathBuf::as_path));
         Self {
-            measured_bytes: accounting.reclaimable_bytes.saturating_add(upper_bytes),
-            ceiling_bytes,
+            measured_reclaimable_bytes: accounting.reclaimable_bytes.saturating_add(upper_bytes),
+            measured_total_bytes: accounting.total_bytes.saturating_add(upper_bytes),
+            limits,
         }
     }
 
-    /// Whether the measured chain already fits, so compaction cannot push it
-    /// past the ceiling and the post-compaction rejection is provably moot.
+    /// Whether the measured chain already fits every enabled bound, so
+    /// compaction cannot push it past one and the post-compaction rejection is
+    /// provably moot.
     pub(super) fn guaranteed_fit(&self) -> bool {
-        self.ceiling_bytes != 0 && self.measured_bytes <= self.ceiling_bytes
+        if !self.limits.enabled() {
+            return false;
+        }
+        let reclaimable_fits = self.limits.reclaimable_ceiling == 0
+            || self.measured_reclaimable_bytes <= self.limits.reclaimable_ceiling;
+        let total_fits = self.limits.whole_chain_ceiling == 0
+            || self.measured_total_bytes <= self.limits.whole_chain_ceiling;
+        reclaimable_fits && total_fits
     }
 }
 
@@ -296,9 +403,9 @@ impl ChainPreflight {
 fn preflight_chain_before_restack(
     live_runtime_image_config_path: &Path,
     runtime_owned_roots: &[PathBuf],
-    chain_bytes_ceiling: u64,
+    limits: ChainLimits,
 ) -> Result<ChainPreflight> {
-    if chain_bytes_ceiling == 0 {
+    if !limits.enabled() {
         return Ok(ChainPreflight::disabled());
     }
     let image_config = overlaybd::config::load_image_config(live_runtime_image_config_path)
@@ -318,7 +425,7 @@ fn preflight_chain_before_restack(
         image_config.lowers,
         &upper_paths,
         runtime_owned_roots,
-        chain_bytes_ceiling,
+        limits,
     ))
 }
 
@@ -327,7 +434,15 @@ fn preflight_chain_before_restack(
 /// Labels stay bounded: `kind` is one of `rootfs` / `memory`, never a sandbox
 /// id, so a node with thousands of sandboxes cannot explode cardinality.
 mod chain_metrics {
+    use super::{ChainByteAccounting, ChainLimits, PausedChainLimit};
+
     pub(super) const CHAIN_BYTES: &str = "agentenv_paused_sandbox_chain_bytes";
+    /// How close every pause ran to each enabled bound. Labels stay bounded:
+    /// `kind` is the compaction output name the existing chain-bytes gauge
+    /// already uses (`managed-base.commit` for a rootfs/drive/volume suffix,
+    /// `mem_compacted.commit` for memory) and `limit` is one of the two stable
+    /// codes, never a sandbox id or a path.
+    pub(super) const LIMIT_RATIO: &str = "agentenv_paused_sandbox_chain_limit_ratio";
     pub(super) const COMPACTIONS: &str = "agentenv_paused_sandbox_chain_compactions_total";
     pub(super) const CEILING_EXCEEDED: &str =
         "agentenv_paused_sandbox_chain_ceiling_exceeded_total";
@@ -343,6 +458,32 @@ mod chain_metrics {
     pub(super) fn record_chain_bytes(kind: &'static str, bytes: u64, ceiling: u64) {
         metrics::gauge!(CHAIN_BYTES, "kind" => kind).set(bytes as f64);
         metrics::gauge!(CHAIN_BYTES, "kind" => "ceiling").set(ceiling as f64);
+    }
+
+    /// Record the ratio every enabled bound judges, so the seven-day check can
+    /// assert that no post-rollout rootfs pause ran above its limit without
+    /// re-deriving the accounting.
+    pub(super) fn record_limit_ratios(
+        kind: &'static str,
+        accounting: ChainByteAccounting,
+        limits: ChainLimits,
+    ) {
+        if limits.reclaimable_ceiling != 0 {
+            metrics::histogram!(
+                LIMIT_RATIO,
+                "kind" => kind,
+                "limit" => PausedChainLimit::ChainBytesCeiling.as_str()
+            )
+            .record(accounting.reclaimable_bytes as f64 / limits.reclaimable_ceiling as f64);
+        }
+        if limits.whole_chain_ceiling != 0 {
+            metrics::histogram!(
+                LIMIT_RATIO,
+                "kind" => kind,
+                "limit" => PausedChainLimit::RootfsDiskMultiple.as_str()
+            )
+            .record(accounting.total_bytes as f64 / limits.whole_chain_ceiling as f64);
+        }
     }
 
     pub(super) fn record_compaction(kind: &'static str) {
@@ -481,7 +622,7 @@ impl LiveOverlaybdSnapshotState {
         match self {
             Self::ReadOnly => staged_snapshot,
             Self::Restacked(_) => staged_snapshot.map_err(|error| {
-                if is_chain_bytes_ceiling_exceeded(&error) {
+                if is_paused_chain_limit_exceeded(&error) {
                     debug!(
                         "keeping a post-restack chain ceiling rejection recoverable so the \
                          sandbox is resumed instead of stopped"
@@ -873,7 +1014,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,
-    chain_bytes_ceiling: u64,
+    limits: ChainLimits,
     runtime_owned_roots: &[PathBuf],
     preflight: ChainPreflight,
 ) -> Result<PathBuf> {
@@ -919,10 +1060,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
-        ChainCeilingPolicy {
-            ceiling_bytes: chain_bytes_ceiling,
-            preflight,
-        },
+        ChainLimitPolicy { limits, preflight },
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -936,25 +1074,25 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     Ok(output_path)
 }
 
-/// The ceiling knobs a rewrite enforces, grouped so the positional argument
-/// list stays readable.
+/// The bound knobs a rewrite enforces, grouped so the positional argument list
+/// stays readable.
 ///
-/// `ceiling_bytes` and the pre-flight always travel together — one is the bound,
-/// the other the pre-mutation measurement of the same bound — and keeping them in
-/// one value is what stops a caller from pairing a ceiling with a pre-flight
-/// taken under a different one.
+/// The limits and the pre-flight always travel together — one is the bound, the
+/// other the pre-mutation measurement of the same bounds — and keeping them in
+/// one value is what stops a caller from pairing a limit with a pre-flight taken
+/// under a different one.
 #[derive(Debug, Default, Clone, Copy)]
-pub(super) struct ChainCeilingPolicy {
-    pub(super) ceiling_bytes: u64,
+pub(super) struct ChainLimitPolicy {
+    pub(super) limits: ChainLimits,
     pub(super) preflight: ChainPreflight,
 }
 
-impl ChainCeilingPolicy {
-    /// Enforcement disabled (`chain_bytes_ceiling = 0`).
+impl ChainLimitPolicy {
+    /// Enforcement disabled (`chain_bytes_ceiling = 0` and no disk multiple).
     ///
-    /// Test-only: production always reaches a rewrite through a live ceiling
+    /// Test-only: production always reaches a rewrite through a live limit
     /// value, so the disabled policy exists to keep the unit fixtures that do not
-    /// exercise the ceiling readable.
+    /// exercise a bound readable.
     #[cfg(test)]
     pub(super) fn disabled() -> Self {
         Self::default()
@@ -968,12 +1106,10 @@ async fn rewrite_lowers_with_runtime_roots(
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
-    policy: ChainCeilingPolicy,
+    policy: ChainLimitPolicy,
 ) -> Result<Vec<LayerConfig>> {
-    let ChainCeilingPolicy {
-        ceiling_bytes: chain_bytes_ceiling,
-        preflight,
-    } = policy;
+    let ChainLimitPolicy { limits, preflight } = policy;
+    let limits_enforced = limits.enabled();
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
 
@@ -988,23 +1124,22 @@ async fn rewrite_lowers_with_runtime_roots(
         .saturating_sub(lowers.len() / 4)
         .max(1);
     let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
-    // The byte ceiling is the stricter of the two triggers: a chain can stay
-    // inside the layer-count budget for many pauses and still fill the node's
-    // disk, because each generation rewrites far more bytes than it shares. A
-    // ceiling of 0 keeps the pre-ceiling behavior: no byte accounting and no
-    // compaction on bytes.
+    // The bounds are the stricter of the triggers: a chain can stay inside the
+    // layer-count budget for many pauses and still fill the node's disk, because
+    // each generation rewrites far more bytes than it shares. Both bounds `0`
+    // keeps the pre-bound behavior: no byte accounting and no compaction on
+    // bytes.
     //
-    // It bounds the reclaimable part — the runtime-owned lowers plus the layer
-    // this pause appends — never the whole chain. The stable prefix is
-    // materialized from the image once, identical for every sandbox of that
-    // image, and compaction cannot reclaim it; charging it here would count the
-    // same node bytes once per sandbox and reject a chain whose own growth is
-    // far under the ceiling. A stable prefix is never a breach on its own,
-    // whatever its size: judging it would refuse the pause of every sandbox of
-    // that image for a number none of their pauses can change.
-    let accounting = if chain_bytes_ceiling == 0 {
-        ChainByteAccounting::default()
-    } else {
+    // The absolute bound judges the reclaimable part — the runtime-owned lowers
+    // plus the layer this pause appends — never the whole chain, because the
+    // stable prefix is materialized from the image once, identical for every
+    // sandbox of that image, and compaction cannot reclaim it; charging it per
+    // sandbox would count the same node bytes once per sandbox. The relative
+    // bound is the card's invariant and judges the whole deduplicated chain,
+    // stable prefix included, against a small multiple of the guest disk. It is
+    // only set for the rootfs, so a prefix is never a breach of the absolute
+    // bound while the rootfs chain as a whole still is.
+    let accounting = if limits_enforced {
         ChainByteAccounting::measure(
             lowers
                 .iter()
@@ -1014,10 +1149,12 @@ async fn rewrite_lowers_with_runtime_roots(
             appended_layer.as_ref(),
             runtime_owned_roots,
         )
+    } else {
+        ChainByteAccounting::default()
     };
-    let over_ceiling = accounting.ceiling_breach(chain_bytes_ceiling).is_some();
-    if compactable_count > max_runtime_owned_layers || over_ceiling {
-        // The byte trigger decides what it rewrites by classification, never by
+    let breach = accounting.breach(limits);
+    if compactable_count > max_runtime_owned_layers || breach.is_some() {
+        // A bound trigger decides what it rewrites by classification, never by
         // position: `split_runtime_suffix` hands over everything from the first
         // runtime-owned lower onward, which is the right unit to adopt but the
         // wrong one to blame for bytes. Compaction therefore rewrites exactly
@@ -1028,7 +1165,7 @@ async fn rewrite_lowers_with_runtime_roots(
         // this split closes. Under the count trigger the positional suffix is
         // kept as it was, because there the chain is not being blamed for its
         // size, only rewritten to stay below overlaybd's layer limit.
-        let mut compactable = if over_ceiling {
+        let mut compactable = if breach.is_some() {
             let (stable_prefix, runtime_owned) = split_chain_by_classification(
                 std::mem::take(&mut lowers)
                     .into_iter()
@@ -1042,11 +1179,10 @@ async fn rewrite_lowers_with_runtime_roots(
         };
         // Measure the parts before compaction folds them into one layer: the
         // rejection has to state whether the bytes it refused live in an
-        // untouchable prefix or in a compacted layer that did not shrink. A
-        // ceiling of 0 keeps the pre-ceiling cost too, so nothing is measured
-        // when enforcement is disabled.
-        let ceiling_enforced = chain_bytes_ceiling != 0;
-        let appended_bytes = if ceiling_enforced {
+        // untouchable prefix or in a compacted layer that did not shrink. The
+        // disabled policy keeps the pre-bound cost too, so nothing is measured
+        // when enforcement is off.
+        let appended_bytes = if limits_enforced {
             chain_allocated_bytes(appended_layer.iter().map(|layer| Path::new(&layer.file)))
         } else {
             0
@@ -1071,7 +1207,7 @@ async fn rewrite_lowers_with_runtime_roots(
             stable_prefix_lowers: lowers.len(),
             stable_prefix_bytes: accounting.stable_prefix_bytes,
             compacted_lowers,
-            compacted_bytes: if ceiling_enforced {
+            compacted_bytes: if limits_enforced {
                 compacted_path
                     .as_deref()
                     .map(|path| chain_allocated_bytes([path]))
@@ -1084,53 +1220,67 @@ async fn rewrite_lowers_with_runtime_roots(
         if let Some(compacted_path) = compacted_path.as_ref() {
             lowers.push(local_layer_config(compacted_path));
         }
-        if ceiling_enforced {
-            // Re-measure the bounded part on the result and refuse the pause by
-            // name when compaction could not bring it under the ceiling. After
-            // compaction the reclaimable part is exactly the generation it
+        if limits_enforced {
+            // Re-measure both bounded parts on the result and refuse the pause by
+            // name when compaction could not bring them under their limits.
+            // After compaction the reclaimable part is exactly the generation it
             // produced — the appended layer and every rewritten lower live
-            // inside it — so a compacted layer still above the ceiling means
-            // compaction did not shrink the chain. The stable prefix is carried
-            // for the message and not judged, exactly as it was before.
+            // inside it — while the whole chain adds the untouched stable prefix.
             //
             // The pre-flight is skipped here, not trusted: a measurement taken
             // before the restack that already fits cannot become a breach by
             // compaction, which only drops blocks, so re-measuring would only
             // cost a stat pass and could never change the answer.
-            let accounting_after = ChainByteAccounting {
-                reclaimable_bytes: match compacted_path.as_deref() {
-                    Some(path) => chain_allocated_bytes([path]),
-                    None => accounting.reclaimable_bytes,
-                },
-                stable_prefix_bytes: breakdown.stable_prefix_bytes,
+            let reclaimable_after = match compacted_path.as_deref() {
+                Some(path) => chain_allocated_bytes([path]),
+                None => accounting.reclaimable_bytes,
             };
+            let accounting_after = ChainByteAccounting {
+                reclaimable_bytes: reclaimable_after,
+                stable_prefix_bytes: breakdown.stable_prefix_bytes,
+                total_bytes: breakdown
+                    .stable_prefix_bytes
+                    .saturating_add(reclaimable_after),
+            };
+            chain_metrics::record_chain_bytes(
+                compaction_output_name,
+                accounting_after.reclaimable_bytes,
+                limits.reclaimable_ceiling,
+            );
+            chain_metrics::record_limit_ratios(compaction_output_name, accounting_after, limits);
             if preflight.guaranteed_fit() {
                 chain_metrics::record_preflight_guaranteed_fit(compaction_output_name);
                 debug!(
                     kind = compaction_output_name,
-                    measured_bytes = preflight.measured_bytes,
-                    ceiling_bytes = chain_bytes_ceiling,
-                    "pre-flight chain already fits; skipping the post-compaction ceiling check"
+                    measured_reclaimable_bytes = preflight.measured_reclaimable_bytes,
+                    measured_total_bytes = preflight.measured_total_bytes,
+                    reclaimable_ceiling = limits.reclaimable_ceiling,
+                    whole_chain_ceiling = limits.whole_chain_ceiling,
+                    "pre-flight chain already fits; skipping the post-compaction limit check"
                 );
-            } else if let Some(observed_bytes) =
-                accounting_after.ceiling_breach(chain_bytes_ceiling)
-            {
-                // The refusal carries the five numbers the seven-day
-                // measurement reads from this layer: observed chain bytes, the
-                // ceiling, the appended-upper bytes, and the node's free and
-                // total bytes at the artifact root. The paused-sandbox count is
-                // logged by the orchestrator's recoverable-pause branch, the
-                // only layer with the metadata store; both lines carry the named
-                // code, so one query reads the whole refusal. The disk probe
-                // answers `None` rather than failing the refusal, so the fields
-                // are absent instead of invented when statvfs fails.
+            } else if let Some(breach_after) = accounting_after.breach(limits) {
+                // The refusal carries the numbers the seven-day measurement
+                // reads from this layer: the stable code of the bound that
+                // refused, the observed bytes, the limit, the appended-upper
+                // bytes, and the node's free and total bytes at the artifact
+                // root. The paused-sandbox count is logged by the orchestrator's
+                // recoverable-pause branch, the only layer with the metadata
+                // store; both lines carry the named code, so one query reads the
+                // whole refusal. The disk probe answers `None` rather than
+                // failing the refusal, so the fields are absent instead of
+                // invented when statvfs fails.
                 let space = chain_refusal_log::filesystem_space(output_dir);
                 warn!(
                     kind = compaction_output_name,
-                    ceiling_bytes = chain_bytes_ceiling,
-                    observed_bytes = observed_bytes,
+                    limit = breach_after.limit.as_str(),
+                    limit_bytes = breach_after.limit_bytes,
+                    observed_bytes = breach_after.observed_bytes,
+                    whole_chain_bytes = accounting_after.total_bytes,
+                    reclaimable_bytes = accounting_after.reclaimable_bytes,
                     appended_bytes = breakdown.appended_bytes,
-                    measured_before_restack_bytes = preflight.measured_bytes,
+                    measured_before_restack_reclaimable_bytes =
+                        preflight.measured_reclaimable_bytes,
+                    measured_before_restack_total_bytes = preflight.measured_total_bytes,
                     artifact_root = %output_dir.display(),
                     node_free_bytes = space.map(|(free, _)| free),
                     node_total_bytes = space.map(|(_, total)| total),
@@ -1138,7 +1288,7 @@ async fn rewrite_lowers_with_runtime_roots(
                     stable_prefix_bytes = breakdown.stable_prefix_bytes,
                     compacted_lowers = breakdown.compacted_lowers,
                     compacted_bytes = breakdown.compacted_bytes,
-                    "paused sandbox chain is still above the byte ceiling after compaction; \
+                    "paused sandbox chain is still above a limit after compaction; \
                      the pause is refused and the sandbox is resumed"
                 );
                 // The pause is rejected, so this generation must not survive:
@@ -1149,22 +1299,18 @@ async fn rewrite_lowers_with_runtime_roots(
                         warn!(
                             path = %compacted_path.display(),
                             error = %error,
-                            "failed to remove compacted layer after a ceiling rejection"
+                            "failed to remove compacted layer after a limit rejection"
                         );
                     }
                 }
                 // Classified by the caller: the rootfs restack already mutated
                 // the live runtime and stays terminal through `finish_staging`,
                 // while the memory-config path is still recoverable.
-                chain_metrics::record_chain_bytes(
-                    compaction_output_name,
-                    observed_bytes,
-                    chain_bytes_ceiling,
-                );
                 chain_metrics::record_ceiling_exceeded(compaction_output_name);
-                return Err(chain_ceiling_exceeded(
-                    observed_bytes,
-                    chain_bytes_ceiling,
+                return Err(paused_chain_limit_exceeded(
+                    breach_after.limit,
+                    breach_after.observed_bytes,
+                    breach_after.limit_bytes,
                     breakdown,
                 ));
             }
@@ -1189,12 +1335,13 @@ async fn rewrite_lowers_with_runtime_roots(
     if let Some(layer) = appended_layer {
         lowers.push(layer);
     }
-    if chain_bytes_ceiling != 0 {
+    if limits_enforced {
         chain_metrics::record_chain_bytes(
             compaction_output_name,
             accounting.reclaimable_bytes,
-            chain_bytes_ceiling,
+            limits.reclaimable_ceiling,
         );
+        chain_metrics::record_limit_ratios(compaction_output_name, accounting, limits);
     }
 
     Ok(lowers)
@@ -1300,7 +1447,7 @@ pub(super) async fn build_mem_snapshot_image_config(
     new_layer_path: &Path,
     output_dir: &Path,
     memory_output: OverlaybdCompactOutput,
-    chain_bytes_ceiling: u64,
+    limits: ChainLimits,
     runtime_owned_roots: &[PathBuf],
 ) -> Result<ImageConfig> {
     let inherited_image_config =
@@ -1313,8 +1460,8 @@ pub(super) async fn build_mem_snapshot_image_config(
         "mem_compacted.commit",
         runtime_owned_roots,
         memory_output,
-        ChainCeilingPolicy {
-            ceiling_bytes: chain_bytes_ceiling,
+        ChainLimitPolicy {
+            limits,
             // The memory chain is not restacked: the pause appends a fresh layer
             // it just wrote, so there is no pre-mutation measurement to take and
             // the post-compaction check stays the only judge.
@@ -1344,7 +1491,7 @@ pub(super) struct RestackSnapshotDevice<'a> {
     pub(super) output_dir: &'a Path,
     pub(super) snapshot_layer_file_name: &'a str,
     pub(super) kind: &'static str,
-    pub(super) chain_bytes_ceiling: u64,
+    pub(super) limits: ChainLimits,
     pub(super) runtime_owned_roots: &'a [PathBuf],
 }
 
@@ -1364,7 +1511,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         output_dir,
         snapshot_layer_file_name,
         kind,
-        chain_bytes_ceiling,
+        limits,
         runtime_owned_roots,
     } = request;
     tokio::fs::create_dir_all(output_dir)
@@ -1388,20 +1535,16 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     let preflight = if read_only {
         ChainPreflight::disabled()
     } else {
-        preflight_chain_before_restack(
-            live_runtime_image_config_path,
-            runtime_owned_roots,
-            chain_bytes_ceiling,
-        )
-        .unwrap_or_else(|error| {
-            warn!(
-                kind,
-                error = %format_args!("{error:#}"),
-                "failed to measure the chain before the restack; the post-compaction check \
-                 still decides"
-            );
-            ChainPreflight::disabled()
-        })
+        preflight_chain_before_restack(live_runtime_image_config_path, runtime_owned_roots, limits)
+            .unwrap_or_else(|error| {
+                warn!(
+                    kind,
+                    error = %format_args!("{error:#}"),
+                    "failed to measure the chain before the restack; the post-compaction check \
+                     still decides"
+                );
+                ChainPreflight::disabled()
+            })
     };
 
     let live_snapshot = capture_live_overlaybd_snapshot(
@@ -1418,7 +1561,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         live_runtime_image_config_path,
         output_dir,
         live_snapshot.snapshot_layer_path(),
-        chain_bytes_ceiling,
+        limits,
         runtime_owned_roots,
         preflight,
     )
@@ -1432,7 +1575,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     snapshot_root: &Path,
-    chain_bytes_ceiling: u64,
+    limits: ChainLimits,
     runtime_owned_roots: &[PathBuf],
 ) -> Result<PathBuf> {
     restack_snapshot_overlaybd_device(RestackSnapshotDevice {
@@ -1442,7 +1585,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         output_dir: &snapshot_root.join("rootfs"),
         snapshot_layer_file_name: "snapshot.commit",
         kind: "rootfs",
-        chain_bytes_ceiling,
+        limits,
         runtime_owned_roots,
     })
     .await
@@ -1866,7 +2009,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ChainCeilingPolicy::disabled(),
+            ChainLimitPolicy::disabled(),
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -1947,10 +2090,15 @@ mod tests {
         };
         // Verbatim shape of the incident: the chain needed 61,167,910,912 bytes
         // against a 51,539,607,552 byte ceiling.
-        let ceiling = chain_ceiling_exceeded(61_167_910_912, 51_539_607_552, breakdown)
-            // The pause path wraps the rejection with context before it reaches
-            // `finish_staging`; the classification has to survive that.
-            .context("snapshot overlaybd runtime state to persistent dir");
+        let ceiling = paused_chain_limit_exceeded(
+            PausedChainLimit::ChainBytesCeiling,
+            61_167_910_912,
+            51_539_607_552,
+            breakdown,
+        )
+        // The pause path wraps the rejection with context before it reaches
+        // `finish_staging`; the classification has to survive that.
+        .context("snapshot overlaybd runtime state to persistent dir");
 
         let classified = LiveOverlaybdSnapshotState::Restacked(PathBuf::from("/tmp/unused"))
             .finish_staging(Err(ceiling))
@@ -2021,7 +2169,8 @@ mod tests {
     /// only stable answer. This pins both halves.
     #[test]
     fn ceiling_classification_survives_context_layers_and_ignores_lookalikes() {
-        let real = chain_ceiling_exceeded(
+        let real = paused_chain_limit_exceeded(
+            PausedChainLimit::ChainBytesCeiling,
             61_167_910_912,
             51_539_607_552,
             ChainCeilingBreakdown::default(),
@@ -2030,14 +2179,14 @@ mod tests {
         .context("restack rootfs")
         .context("pause");
         assert!(
-            super::is_chain_bytes_ceiling_exceeded(&real),
+            super::is_paused_chain_limit_exceeded(&real),
             "the real rejection must be recognized through three context layers"
         );
 
         let lookalike =
             anyhow::anyhow!("CHAIN_BYTES_CEILING_EXCEEDED: a message that only mentions the code");
         assert!(
-            !super::is_chain_bytes_ceiling_exceeded(&lookalike),
+            !super::is_paused_chain_limit_exceeded(&lookalike),
             "a message that merely mentions the code must not be reclassified"
         );
     }
@@ -2163,27 +2312,44 @@ mod tests {
             chain.clone(),
             std::slice::from_ref(&upper_data),
             &roots,
-            u64::MAX,
+            ChainLimits {
+                reclaimable_ceiling: u64::MAX,
+                whole_chain_ceiling: 0,
+            },
         );
         assert!(generous.guaranteed_fit());
+        let measured_layer = super::chain_allocated_bytes([layer.as_path()]);
         assert_eq!(
-            generous.measured_bytes,
-            super::chain_allocated_bytes([layer.as_path()]) + measured_upper
+            generous.measured_reclaimable_bytes,
+            measured_layer + measured_upper
+        );
+        assert_eq!(
+            generous.measured_total_bytes,
+            measured_layer + measured_upper,
+            "with no stable prefix the whole chain is the reclaimable part"
         );
 
         // A ceiling below the chain alone: not a guaranteed fit, and crucially
         // not a refusal either — the pre-flight only reports. The value stays
         // above zero so it is a real bound and not the disabled value.
-        let tight = ChainPreflight::measure(chain, std::slice::from_ref(&upper_data), &roots, 1);
+        let tight = ChainPreflight::measure(
+            chain,
+            std::slice::from_ref(&upper_data),
+            &roots,
+            ChainLimits {
+                reclaimable_ceiling: 1,
+                whole_chain_ceiling: 0,
+            },
+        );
         assert!(!tight.guaranteed_fit());
-        assert_eq!(tight.ceiling_bytes, 1);
+        assert_eq!(tight.limits.reclaimable_ceiling, 1);
 
-        // The disabled ceiling measures nothing and fits nothing.
+        // The disabled bounds measure nothing and fit nothing.
         let disabled = ChainPreflight::measure(
             [local_layer_config(&layer)],
             std::slice::from_ref(&upper_data),
             &roots,
-            0,
+            ChainLimits::disabled(),
         );
         assert_eq!(disabled, super::ChainPreflight::disabled());
         assert!(!disabled.guaranteed_fit());
@@ -2227,13 +2393,20 @@ mod tests {
         );
 
         // Compaction folds the appended layer into the generation it writes, so
-        // the reclaimable part after compaction is that generation alone.
+        // the reclaimable part after compaction is that generation alone. The
+        // absolute bound stays the only one enabled here: the relative rootfs
+        // bound judges the whole chain and has its own tests.
+        let absolute_only = ChainLimits {
+            reclaimable_ceiling: ceiling_bytes,
+            whole_chain_ceiling: 0,
+        };
         let after_compaction = ChainByteAccounting {
             reclaimable_bytes: compacted_bytes,
             stable_prefix_bytes,
+            total_bytes: stable_prefix_bytes + compacted_bytes,
         };
         assert_eq!(
-            after_compaction.ceiling_breach(ceiling_bytes),
+            after_compaction.breach(absolute_only),
             None,
             "a compacted chain whose reclaimable part is {compacted_bytes} bytes must fit the \
              {ceiling_bytes} byte ceiling; only the shared {stable_prefix_bytes} byte prefix \
@@ -2242,30 +2415,32 @@ mod tests {
 
         // The named rejection survives for the part that really does not fit:
         // compaction left a generation above the ceiling.
-        assert_eq!(
-            ChainByteAccounting {
-                reclaimable_bytes: ceiling_bytes + 1,
-                stable_prefix_bytes,
-            }
-            .ceiling_breach(ceiling_bytes),
-            Some(ceiling_bytes + 1),
-            "a compacted generation above the ceiling must still be refused, naming its bytes"
-        );
+        let over_absolute = ChainByteAccounting {
+            reclaimable_bytes: ceiling_bytes + 1,
+            stable_prefix_bytes,
+            total_bytes: stable_prefix_bytes + ceiling_bytes + 1,
+        }
+        .breach(absolute_only)
+        .expect("a compacted generation above the ceiling must still be refused");
+        assert_eq!(over_absolute.limit, PausedChainLimit::ChainBytesCeiling);
+        assert_eq!(over_absolute.observed_bytes, ceiling_bytes + 1);
+        assert_eq!(over_absolute.limit_bytes, ceiling_bytes);
 
-        // And a prefix above the ceiling is not a breach at all, however large
-        // it is: the prefix belongs to the image, so judging it would refuse the
-        // pause of every sandbox of that image forever. The rootfs chain is
-        // restacked under this same ceiling on every pause and its image prefix
-        // alone is 690,712,576 bytes, so this is the case a live sandbox meets,
-        // not a corner.
+        // And a prefix above the ceiling is not a breach of the absolute bound,
+        // however large it is: the prefix belongs to the image, so judging it
+        // there would refuse the pause of every sandbox of that image forever.
+        // The rootfs chain is restacked under this same ceiling on every pause
+        // and its image prefix alone is 690,712,576 bytes, so this is the case a
+        // live sandbox meets, not a corner.
         assert_eq!(
             ChainByteAccounting {
                 reclaimable_bytes: 1,
                 stable_prefix_bytes: ceiling_bytes + 1,
+                total_bytes: ceiling_bytes + 2,
             }
-            .ceiling_breach(ceiling_bytes),
+            .breach(absolute_only),
             None,
-            "a shared prefix above the ceiling must be reported, never refused"
+            "a shared prefix above the absolute ceiling must be reported, never refused"
         );
     }
 
@@ -2329,6 +2504,10 @@ mod tests {
             chain_bytes,
             "the two parts must sum to the chain, so the shared inode is charged once"
         );
+        assert_eq!(
+            accounting.total_bytes, chain_bytes,
+            "the whole-chain total must be the deduplicated chain, not a per-part sum"
+        );
         // The prefix is measured first, so the shared inode lands there: those
         // bytes exist for the image already, and leaving them out of the
         // reclaimable part keeps the ceiling from charging them as pause growth.
@@ -2338,10 +2517,13 @@ mod tests {
             chain_bytes - shared_bytes,
             "the runtime-owned part must count only the layer that is not shared"
         );
-        // No part alone breaches a ceiling above each, so the chain fits even
+        // No part alone breaches a limit above each, so the chain fits even
         // though the naive prefix-plus-suffix sum would not.
         assert_eq!(
-            accounting.ceiling_breach(chain_bytes),
+            accounting.breach(ChainLimits {
+                reclaimable_ceiling: chain_bytes,
+                whole_chain_ceiling: 0,
+            }),
             None,
             "a chain whose parts fit individually must fit as a whole"
         );
@@ -2419,8 +2601,11 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ChainCeilingPolicy {
-                ceiling_bytes: ceiling,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: ceiling,
+                    whole_chain_ceiling: 0,
+                },
                 preflight: ChainPreflight::disabled(),
             },
         )
@@ -2470,8 +2655,11 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ChainCeilingPolicy {
-                ceiling_bytes: 1,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: 1,
+                    whole_chain_ceiling: 0,
+                },
                 preflight: ChainPreflight::disabled(),
             },
         )
@@ -2483,7 +2671,7 @@ mod tests {
             "error must carry the named code: {err:#}"
         );
         assert!(
-            err.downcast_ref::<ChainBytesCeilingExceeded>().is_some(),
+            err.downcast_ref::<PausedChainLimitExceeded>().is_some(),
             "the error must stay downcastable so the pause path classifies it"
         );
         assert!(
@@ -2540,7 +2728,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ChainCeilingPolicy::disabled(),
+            ChainLimitPolicy::disabled(),
         )
         .await
         .expect("rewrite with deep stable prefix");
@@ -2648,8 +2836,11 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ChainCeilingPolicy {
-                ceiling_bytes: ceiling,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: ceiling,
+                    whole_chain_ceiling: 0,
+                },
                 preflight: ChainPreflight::disabled(),
             },
         )
@@ -2666,6 +2857,221 @@ mod tests {
         assert!(
             chain_allocated_bytes(std::slice::from_ref(&compacted)) <= ceiling,
             "the compacted generation must fit under the ceiling"
+        );
+    }
+
+    /// The negative control: ten pause cycles that rewrite the same block must
+    /// not grow the chain ten times.
+    ///
+    /// Every cycle feeds the previous rewrite back as the live chain and appends
+    /// a fresh generation covering the same guest offsets. Without compaction the
+    /// chain would be ten copies of the region, well above twice the disk; the
+    /// relative bound must trigger a compaction and leave the final chain within
+    /// the multiple. This is the shape of the incident, reduced to the unit.
+    #[tokio::test]
+    async fn ten_pauses_rewriting_the_same_block_do_not_grow_the_chain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        const DISK_BYTES: u64 = 1024 * 1024;
+        const REGION_BYTES: u64 = 256 * 1024;
+        const CYCLES: usize = 10;
+        let limit_bytes = 2 * DISK_BYTES;
+        let writes = |byte: u8| -> Vec<(u64, u8)> {
+            (0..REGION_BYTES / 4096)
+                .map(|index| (index * 4096, byte))
+                .collect()
+        };
+
+        let mut lowers: Vec<LayerConfig> = Vec::new();
+        let mut compaction_seen = false;
+        for cycle in 0..CYCLES {
+            let appended = seal_raw_test_layer(
+                &runtime_root,
+                &format!("cycle-{cycle}"),
+                DISK_BYTES,
+                &writes(cycle as u8 + 1),
+            )
+            .await;
+            let output_dir = runtime_root.join(format!("out-{cycle}"));
+            std::fs::create_dir_all(&output_dir).expect("create output dir");
+            let rewritten = rewrite_lowers_with_runtime_roots(
+                std::mem::take(&mut lowers),
+                &output_dir,
+                Some(local_layer_config(&appended)),
+                MANAGED_BASE_LAYER_FILE,
+                &runtime_owned_roots,
+                OverlaybdCompactOutput::Raw,
+                ChainLimitPolicy {
+                    limits: ChainLimits {
+                        reclaimable_ceiling: 0,
+                        whole_chain_ceiling: limit_bytes,
+                    },
+                    preflight: ChainPreflight::disabled(),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("cycle {cycle} must compact instead of refusing: {error:#}")
+            });
+            if output_dir.join(MANAGED_BASE_LAYER_FILE).exists() {
+                compaction_seen = true;
+            }
+            lowers = rewritten;
+        }
+
+        let final_paths: Vec<PathBuf> = lowers
+            .iter()
+            .filter(|lower| !lower.file.is_empty())
+            .map(|lower| PathBuf::from(&lower.file))
+            .collect();
+        let final_bytes = chain_allocated_bytes(&final_paths);
+        assert!(
+            compaction_seen,
+            "ten rewritten cycles must compact at least once"
+        );
+        assert!(
+            final_bytes <= limit_bytes,
+            "ten pauses rewriting the same block must leave the chain at or under {limit_bytes} \
+             bytes: {final_bytes} bytes across {final_paths:?}"
+        );
+    }
+
+    /// A whole rootfs chain above the disk multiple must compact even when the
+    /// reclaimable part alone is far below the absolute ceiling.
+    ///
+    /// This is the incident's accounting: the stable prefix plus the runtime
+    /// generations crossed the relative bound while the part compaction can
+    /// reclaim stayed under the 48 GiB absolute ceiling, so the old check never
+    /// fired. The relative bound has to see the whole deduplicated chain.
+    #[tokio::test]
+    async fn whole_rootfs_chain_above_the_disk_multiple_compacts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let stable_root = temp.path().join("image-cache");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&stable_root).expect("create stable root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        const DISK_BYTES: u64 = 768 * 1024;
+        const REGION_BYTES: u64 = 256 * 1024;
+        let limit_bytes = 2 * DISK_BYTES;
+        let stable = stable_root.join("sha256-prefix.overlaybd.commit");
+        std::fs::write(&stable, vec![0x11u8; 1024 * 1024]).expect("write stable prefix");
+        let writes = |byte: u8| -> Vec<(u64, u8)> {
+            (0..REGION_BYTES / 4096)
+                .map(|index| (index * 4096, byte))
+                .collect()
+        };
+        let mut lowers = vec![local_layer_config(&stable)];
+        for (index, byte) in [0xAAu8, 0xBB, 0xCC].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("gen-{index}"),
+                DISK_BYTES,
+                &writes(byte),
+            )
+            .await;
+            lowers.push(local_layer_config(&path));
+        }
+        let appended =
+            seal_raw_test_layer(&runtime_root, "appended", DISK_BYTES, &writes(0xDD)).await;
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            Some(local_layer_config(&appended)),
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    // The reclaimable part alone fits comfortably; only the
+                    // whole chain, prefix included, crosses the relative bound.
+                    reclaimable_ceiling: 48 * 1024 * 1024 * 1024,
+                    whole_chain_ceiling: limit_bytes,
+                },
+                preflight: ChainPreflight::disabled(),
+            },
+        )
+        .await
+        .expect("the whole chain above the relative bound must compact, not refuse");
+
+        assert_eq!(
+            rewritten.len(),
+            2,
+            "the stable prefix plus one compacted generation, got {rewritten:#?}"
+        );
+        assert_eq!(PathBuf::from(&rewritten[0].file), stable);
+        let compacted = PathBuf::from(&rewritten[1].file);
+        assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
+        let whole_chain = chain_allocated_bytes(&[stable, compacted]);
+        assert!(
+            whole_chain <= limit_bytes,
+            "the compacted chain must fit the disk multiple: {whole_chain} > {limit_bytes}"
+        );
+    }
+
+    /// A prefix near the disk plus one full generation near the disk fits the
+    /// multiple exactly and must not compact or refuse.
+    ///
+    /// Two times the disk is the floor: an immutable prefix and one complete
+    /// generation can each approach the disk size, so a tighter multiple would
+    /// refuse a legitimate pause. This guards the default from being lowered.
+    #[tokio::test]
+    async fn prefix_and_one_full_generation_fit_the_disk_multiple() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let stable_root = temp.path().join("image-cache");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&stable_root).expect("create stable root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        const DISK_BYTES: u64 = 1024 * 1024;
+        const PART_BYTES: u64 = 768 * 1024;
+        let limit_bytes = 2 * DISK_BYTES;
+        let stable = stable_root.join("sha256-prefix.overlaybd.commit");
+        std::fs::write(&stable, vec![0x11u8; PART_BYTES as usize]).expect("write stable prefix");
+        let writes: Vec<(u64, u8)> = (0..PART_BYTES / 4096)
+            .map(|index| (index * 4096, 0xAA))
+            .collect();
+        let generation =
+            seal_raw_test_layer(&runtime_root, "generation", DISK_BYTES, &writes).await;
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            vec![local_layer_config(&stable), local_layer_config(&generation)],
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: 48 * 1024 * 1024 * 1024,
+                    whole_chain_ceiling: limit_bytes,
+                },
+                preflight: ChainPreflight::disabled(),
+            },
+        )
+        .await
+        .expect("a chain that fits the multiple must not be refused");
+
+        assert_eq!(rewritten.len(), 2);
+        assert_eq!(PathBuf::from(&rewritten[0].file), stable);
+        assert!(
+            !output_dir.join(MANAGED_BASE_LAYER_FILE).exists(),
+            "a chain that already fits must be adopted, never compacted"
+        );
+        let whole_chain = chain_allocated_bytes(&[stable, generation]);
+        assert!(
+            whole_chain <= limit_bytes,
+            "the fixture must fit the multiple: {whole_chain} > {limit_bytes}"
         );
     }
 
@@ -2711,8 +3117,11 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ChainCeilingPolicy {
-                ceiling_bytes: ceiling,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: ceiling,
+                    whole_chain_ceiling: 0,
+                },
                 preflight: ChainPreflight::disabled(),
             },
         )
@@ -2770,7 +3179,7 @@ mod tests {
                 MANAGED_BASE_LAYER_FILE,
                 &runtime_owned_roots,
                 OverlaybdCompactOutput::Raw,
-                ChainCeilingPolicy::disabled(),
+                ChainLimitPolicy::disabled(),
             )
             .await
             .expect("rewrite with the ceiling disabled");
@@ -2844,7 +3253,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
-            ChainCeilingPolicy::disabled(),
+            ChainLimitPolicy::disabled(),
         )
         .await
         .expect("rewrite with shrinking budget");
@@ -2890,7 +3299,7 @@ mod tests {
             &live_runtime_image_config_path,
             &output_dir,
             Some(&snapshot_lower),
-            0,
+            ChainLimits::disabled(),
             &[],
             ChainPreflight::disabled(),
         )
@@ -2939,7 +3348,7 @@ mod tests {
             &new_layer,
             temp.path(),
             OverlaybdCompactOutput::Raw,
-            0,
+            ChainLimits::disabled(),
             &[],
         )
         .await

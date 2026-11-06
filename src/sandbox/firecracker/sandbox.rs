@@ -20,7 +20,7 @@ use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
     relocate_sealed_layer_for_rejected_pause, restack_snapshot_overlaybd_device,
-    restack_snapshot_overlaybd_rootfs, RestackSnapshotDevice,
+    restack_snapshot_overlaybd_rootfs, ChainLimits, RestackSnapshotDevice,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
@@ -211,6 +211,12 @@ pub struct FirecrackerSandbox {
     /// stays in one place and a test can drive the pause path with its own
     /// ceiling without mutating process-wide configuration.
     chain_bytes_ceiling: u64,
+    /// Multiple of the guest rootfs disk that bounds the whole deduplicated
+    /// rootfs chain, resolved once when the sandbox is built from
+    /// `orchestrator.rootfs_chain_disk_multiple` (`0` disables the bound).
+    /// Only the rootfs restack receives it; drive, volume and memory chains keep
+    /// the absolute ceiling alone.
+    rootfs_chain_disk_multiple: u32,
     /// Node-local artifact store the persister allocates paused generations
     /// from, resolved once when the sandbox is built.
     ///
@@ -782,6 +788,22 @@ impl FirecrackerSandbox {
         self
     }
 
+    /// Override the rootfs chain disk multiple for this sandbox.
+    ///
+    /// Production never calls this: [`FirecrackerSandbox::build`] fills it from
+    /// `orchestrator.rootfs_chain_disk_multiple`, which stays the single source
+    /// of the production value. This exists so an integration test can exercise
+    /// the relative bound without mutating process-wide configuration.
+    pub fn with_rootfs_chain_disk_multiple(mut self, rootfs_chain_disk_multiple: u32) -> Self {
+        self.rootfs_chain_disk_multiple = rootfs_chain_disk_multiple;
+        self
+    }
+
+    /// The rootfs chain disk multiple this sandbox's pause enforces (`0` = off).
+    pub fn rootfs_chain_disk_multiple(&self) -> u32 {
+        self.rootfs_chain_disk_multiple
+    }
+
     /// Override the node-local artifact store used as a runtime-owned root.
     ///
     /// Production never calls this: [`FirecrackerSandbox::build`] fills it from
@@ -845,6 +867,17 @@ impl FirecrackerSandbox {
     /// in force, so a caller never has to re-derive the classification and
     /// disagree with the pause path.
     pub fn chain_bytes_for_pause(&self, image_config_path: &Path) -> Result<(u64, u64)> {
+        let (reclaimable, stable_prefix, _) = self.chain_accounting_for_pause(image_config_path)?;
+        Ok((reclaimable, stable_prefix))
+    }
+
+    /// The `(reclaimable, shared_prefix, whole_chain)` byte parts of a pause.
+    ///
+    /// The third value is the deduplicated chain total the relative rootfs bound
+    /// judges and the per-generation `du` figure the card measures. Computed by
+    /// the production accounting, with the roots in force, so a caller never has
+    /// to re-derive the classification and disagree with the pause path.
+    pub fn chain_accounting_for_pause(&self, image_config_path: &Path) -> Result<(u64, u64, u64)> {
         let image_config = overlaybd::config::load_image_config(image_config_path)
             .with_context(|| format!("load image config {}", image_config_path.display()))?;
         let pause_output_dir = image_config_path.parent().unwrap_or(image_config_path);
@@ -854,7 +887,11 @@ impl FirecrackerSandbox {
             None,
             &roots,
         );
-        Ok((accounting.reclaimable_bytes, accounting.stable_prefix_bytes))
+        Ok((
+            accounting.reclaimable_bytes,
+            accounting.stable_prefix_bytes,
+            accounting.total_bytes,
+        ))
     }
 
     /// The dedicated pack-recording memory device's id, when this sandbox was
@@ -1196,7 +1233,12 @@ impl FirecrackerSandbox {
             &mem_layer_path,
             snapshot_dir,
             OverlaybdCompactOutput::Raw,
-            self.chain_bytes_ceiling,
+            ChainLimits {
+                reclaimable_ceiling: self.chain_bytes_ceiling,
+                // The relative bound is the rootfs chain's invariant; a memory
+                // chain has no guest disk to be a multiple of.
+                whole_chain_ceiling: 0,
+            },
             &runtime_owned_roots,
         )
         .await?;
@@ -1235,19 +1277,27 @@ impl FirecrackerSandbox {
                 .rootfs_runtime
                 .as_ref()
                 .context("overlaybd snapshot requires an active ublk device")?;
+            // The relative bound is computed once from the guest disk the pause
+            // is capturing: a small, measured multiple of it, never the absolute
+            // ceiling that only bounds the reclaimable part.
+            let size = self
+                .snapshot_rootfs_virtual_size()
+                .context("persist rootfs virtual size for snapshot")?;
+            let rootfs_limits = ChainLimits {
+                reclaimable_ceiling: self.chain_bytes_ceiling,
+                whole_chain_ceiling: u64::from(self.rootfs_chain_disk_multiple)
+                    .saturating_mul(size),
+            };
             let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
                 &rootfs_runtime.device,
                 overlaybd_source.read_only,
                 &rootfs_runtime.image_config_path,
                 snapshot_dir,
-                self.chain_bytes_ceiling,
+                rootfs_limits,
                 &runtime_owned_roots,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
             (rootfs_image_path, size)
         } else {
             let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
@@ -1811,6 +1861,9 @@ impl FirecrackerSandbox {
             chain_bytes_ceiling: ConfigManager::global_config()
                 .orchestrator
                 .chain_bytes_ceiling,
+            rootfs_chain_disk_multiple: ConfigManager::global_config()
+                .orchestrator
+                .rootfs_chain_disk_multiple,
             persisted_sandbox_store_root: super::overlaybd_snapshot::persisted_sandbox_store_root(),
             cpu_cgroup: None,
             memory_cgroup: None,
@@ -2766,7 +2819,10 @@ impl FirecrackerSandbox {
                     output_dir: &output_dir,
                     snapshot_layer_file_name: &snapshot_layer_file_name,
                     kind: "drive",
-                    chain_bytes_ceiling: self.chain_bytes_ceiling,
+                    limits: ChainLimits {
+                        reclaimable_ceiling: self.chain_bytes_ceiling,
+                        whole_chain_ceiling: 0,
+                    },
                     runtime_owned_roots: &runtime_owned_roots,
                 })
                 .await
@@ -2817,7 +2873,10 @@ impl FirecrackerSandbox {
                 output_dir,
                 snapshot_layer_file_name: &snapshot_layer_file_name,
                 kind: "volume",
-                chain_bytes_ceiling: self.chain_bytes_ceiling,
+                limits: ChainLimits {
+                    reclaimable_ceiling: self.chain_bytes_ceiling,
+                    whole_chain_ceiling: 0,
+                },
                 runtime_owned_roots: &runtime_owned_roots,
             })
             .await

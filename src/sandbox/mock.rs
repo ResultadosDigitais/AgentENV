@@ -21,7 +21,7 @@ use super::backend::{
     SandboxBackend, SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult,
     SandboxForkSpec, SandboxRuntimeInfo,
 };
-use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
+use super::{FreshSandboxBuildSpec, PausedChainLimit, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
 use crate::types::RuntimeArtifactSet;
@@ -76,16 +76,17 @@ pub enum MockAction {
         delay: Duration,
         message: String,
     },
-    /// Fail with the real `ChainBytesCeilingExceeded` type, not a message that
+    /// Fail with the real `PausedChainLimitExceeded` type, not a message that
     /// spells the code.
     ///
     /// The orchestrator's recoverable-pause branch classifies the refusal by
     /// error TYPE, so a message-carrying variant would exercise the string path
     /// and leave the typed one untested. This variant lets a test drive the
-    /// branch with the exact error the backend produces.
-    FailChainCeiling {
+    /// branch with the exact error the backend produces, for either bound.
+    FailPausedChainLimit {
+        limit: PausedChainLimit,
         observed_bytes: u64,
-        ceiling_bytes: u64,
+        limit_bytes: u64,
     },
 }
 
@@ -210,8 +211,8 @@ impl MockBehavior {
             // Only the capture path carries a typed ceiling error; the generic
             // action runners never see this variant, and reaching it there is a
             // test bug rather than a runtime case.
-            MockAction::FailChainCeiling { .. } => {
-                unreachable!("FailChainCeiling is only produced by apply_capture_result")
+            MockAction::FailPausedChainLimit { .. } => {
+                unreachable!("FailPausedChainLimit is only produced by apply_capture_result")
             }
         }
     }
@@ -237,8 +238,8 @@ impl MockBehavior {
                 thread::sleep(delay);
                 Err(fail(message))
             }
-            MockAction::FailChainCeiling { .. } => {
-                unreachable!("FailChainCeiling is only produced by apply_capture_result")
+            MockAction::FailPausedChainLimit { .. } => {
+                unreachable!("FailPausedChainLimit is only produced by apply_capture_result")
             }
         }
     }
@@ -249,11 +250,12 @@ impl MockBehavior {
         // would, so the orchestrator's type-based classification is what the test
         // exercises, not a string that happens to spell the code.
         match self.pop_action(operation) {
-            MockAction::FailChainCeiling {
+            MockAction::FailPausedChainLimit {
+                limit,
                 observed_bytes,
-                ceiling_bytes,
+                limit_bytes,
             } => Err(SandboxCaptureError::recoverable(
-                super::firecracker::chain_ceiling_error(observed_bytes, ceiling_bytes),
+                super::firecracker::paused_chain_limit_error(limit, observed_bytes, limit_bytes),
             )),
             action => {
                 Self::run_async_action(

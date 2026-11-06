@@ -690,7 +690,9 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     let ballast_mib = (mem_size_mib / 8).max(1);
     let pause_count = 10;
 
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    // This test exercises the absolute ceiling, so the relative rootfs bound
+    // stays off and cannot refuse a pause for a different reason.
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?.with_rootfs_chain_disk_multiple(0);
     sandbox.start().await?;
     write_disk_marker(&mut sandbox).await?;
     if !chain_ballast_dir_is_tmpfs(&mut sandbox).await? {
@@ -725,8 +727,9 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     // The growth it adds is one pause's worth of churn, which is what decides how
     // soon the chain crosses the ceiling.
     let steady_first = current.clone();
-    let mut steady_sandbox =
-        FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(0);
+    let mut steady_sandbox = FirecrackerSandbox::from_snapshot_config(&current)?
+        .with_chain_bytes_ceiling(0)
+        .with_rootfs_chain_disk_multiple(0);
     steady_sandbox.start().await?;
     rewrite_chain_ballast(&mut steady_sandbox, ballast_mib).await?;
     let steady_second = steady_sandbox.pause().await?;
@@ -797,8 +800,9 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     let mut final_reclaimable = 0u64;
     let mut final_prefix = 0u64;
     for pause_index in 0..pause_count {
-        let mut resumed =
-            FirecrackerSandbox::from_snapshot_config(&current)?.with_chain_bytes_ceiling(ceiling);
+        let mut resumed = FirecrackerSandbox::from_snapshot_config(&current)?
+            .with_chain_bytes_ceiling(ceiling)
+            .with_rootfs_chain_disk_multiple(0);
         resumed.start().await?;
         rewrite_chain_ballast(&mut resumed, ballast_mib)
             .await
@@ -823,6 +827,7 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
                 return Err(error);
             }
         };
+        emit_chain_accounting(pause_index + 1, &resumed, &snapshot)?;
 
         let lowers =
             lower_file_paths_from_image_config(&snapshot.mem_overlaybd_config.image_config_path)?;
@@ -910,6 +915,110 @@ async fn ten_consecutive_pauses_stay_under_the_chain_bytes_ceiling() -> Result<(
     Ok(())
 }
 
+/// The KVM sibling of the unit negative control: ten pause/resume cycles that
+/// rewrite the same block on the overlay rootfs must not grow the rootfs chain
+/// past the disk multiple.
+///
+/// The unit test proves the bound with real overlaybd layers and a synthetic
+/// disk size; this one proves the same rule through a real guest writing to the
+/// overlay rootfs and the real pause path. Every pause prints the per-generation
+/// accounting (`chain-accounting ...`) the card measures, and the rootfs total
+/// is asserted against `rootfs_chain_disk_multiple` times the guest disk. It
+/// skips cleanly without `/dev/kvm`, like the other VM tests.
+#[tokio::test]
+async fn ten_pauses_rewriting_the_rootfs_stay_under_the_disk_multiple() -> Result<()> {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!(
+            "skipping ten_pauses_rewriting_the_rootfs_stay_under_the_disk_multiple: /dev/kvm is \
+             not available on this host"
+        );
+        return Ok(());
+    }
+    common::setup().await;
+
+    const ROOTFS_BALLAST_PATH: &str = "/root/aenv-rootfs-chain-ballast";
+    const BALLAST_MIB: u64 = 8;
+    const PAUSE_COUNT: usize = 10;
+    const MULTIPLE: u32 = 2;
+
+    let sandbox_config = common::default_sandbox_config()?;
+    let mut sandbox =
+        FirecrackerSandbox::new(sandbox_config)?.with_rootfs_chain_disk_multiple(MULTIPLE);
+    sandbox.start().await?;
+
+    // Seed the region once, before the first pause. Every later cycle rewrites
+    // the same offsets, which is the shape compaction can reclaim; a cycle that
+    // appended instead would grow the chain by design.
+    let seed = sandbox
+        .run_command(
+            "dd",
+            &[
+                "if=/dev/urandom",
+                &format!("of={ROOTFS_BALLAST_PATH}"),
+                "bs=1M",
+                &format!("count={BALLAST_MIB}"),
+            ],
+        )
+        .await
+        .context("seed the rootfs chain ballast")?;
+    anyhow::ensure!(
+        seed.exit_code == 0,
+        "rootfs ballast seed failed ({}): {}",
+        seed.exit_code,
+        seed.stderr
+    );
+
+    let mut current = sandbox.pause().await?;
+    emit_chain_accounting(1, &sandbox, &current)?;
+
+    for pause_index in 0..PAUSE_COUNT {
+        let mut resumed = FirecrackerSandbox::from_snapshot_config(&current)?
+            .with_rootfs_chain_disk_multiple(MULTIPLE);
+        resumed.start().await?;
+        let rewrite = resumed
+            .run_command(
+                "dd",
+                &[
+                    "if=/dev/urandom",
+                    &format!("of={ROOTFS_BALLAST_PATH}"),
+                    "bs=1M",
+                    &format!("count={BALLAST_MIB}"),
+                    "conv=notrunc",
+                ],
+            )
+            .await
+            .with_context(|| format!("rewrite the rootfs ballast for pause {pause_index}"))?;
+        anyhow::ensure!(
+            rewrite.exit_code == 0,
+            "rootfs ballast rewrite failed ({}): {}",
+            rewrite.exit_code,
+            rewrite.stderr
+        );
+
+        let snapshot = resumed
+            .pause()
+            .await
+            .with_context(|| format!("pause {pause_index} after rewriting the rootfs"))?;
+        emit_chain_accounting(pause_index + 2, &resumed, &snapshot)?;
+
+        let (_, _, rootfs_total) = rootfs_chain_accounting(&resumed, &snapshot)?;
+        let guest_disk_bytes = snapshot.common.rootfs_virtual_size.unwrap_or(0);
+        let limit_bytes = u64::from(MULTIPLE).saturating_mul(guest_disk_bytes);
+        assert!(
+            limit_bytes > 0,
+            "the fixture must know the guest rootfs disk size to judge the bound"
+        );
+        assert!(
+            rootfs_total <= limit_bytes,
+            "pause {} must leave the whole rootfs chain at or under {MULTIPLE} times the guest \
+             disk: {rootfs_total} > {limit_bytes} ({guest_disk_bytes} byte disk)",
+            pause_index + 2
+        );
+        current = snapshot;
+    }
+    Ok(())
+}
+
 /// A pause whose chain grows with data compaction cannot reclaim fails named
 /// and keeps the sandbox.
 ///
@@ -943,7 +1052,9 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
     // the writes cannot hit ENOSPC and turn the assertion into a storage failure.
     let unique_mib = (mem_size_mib / 8).max(1);
 
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    // This test exercises the absolute ceiling, so the relative rootfs bound
+    // stays off and cannot refuse a pause for a different reason.
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?.with_rootfs_chain_disk_multiple(0);
     sandbox.start().await?;
     write_disk_marker(&mut sandbox).await?;
     if !chain_ballast_dir_is_tmpfs(&mut sandbox).await? {
@@ -984,8 +1095,9 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
         base_mem_reclaimable > 0,
         "the unique region must allocate a memory generation to bound"
     );
-    let mut measure_sandbox =
-        FirecrackerSandbox::from_snapshot_config(&base_snapshot)?.with_chain_bytes_ceiling(0);
+    let mut measure_sandbox = FirecrackerSandbox::from_snapshot_config(&base_snapshot)?
+        .with_chain_bytes_ceiling(0)
+        .with_rootfs_chain_disk_multiple(0);
     measure_sandbox.start().await?;
     write_unique_chain_data(&mut measure_sandbox, unique_mib, 1).await?;
     let grown_snapshot = measure_sandbox.pause().await?;
@@ -1036,8 +1148,9 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
     // Resume the base chain — the one that fits — under the tight ceiling and add
     // one more unique region. The next chain carries both regions, and compaction
     // cannot drop either, so the pause must be refused by name.
-    let mut resumed =
-        FirecrackerSandbox::from_snapshot_config(&base_snapshot)?.with_chain_bytes_ceiling(ceiling);
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(&base_snapshot)?
+        .with_chain_bytes_ceiling(ceiling)
+        .with_rootfs_chain_disk_multiple(0);
     resumed.start().await?;
     write_unique_chain_data(&mut resumed, unique_mib, 1).await?;
     let error = SandboxBackend::pause(&mut resumed, None)
@@ -1075,7 +1188,9 @@ async fn unique_chain_growth_past_the_ceiling_fails_named_and_keeps_the_sandbox(
 
     // And the same sandbox pauses as soon as the ceiling allows it, which is what
     // makes the rejection recoverable rather than a lost sandbox.
-    let mut resumed = resumed.with_chain_bytes_ceiling(0);
+    let mut resumed = resumed
+        .with_chain_bytes_ceiling(0)
+        .with_rootfs_chain_disk_multiple(0);
     let snapshot = FirecrackerSandbox::pause(&mut resumed)
         .await
         .context("a rejected pause must be retryable once the ceiling is lifted")?;
@@ -1117,7 +1232,9 @@ async fn rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running() -> Result<(
     let mem_size_mib = u64::from(sandbox_config.mem_size_mib);
     let unique_mib = (mem_size_mib / 8).max(1);
 
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    // This test exercises the absolute ceiling, so the relative rootfs bound
+    // stays off and cannot refuse a pause for a different reason.
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?.with_rootfs_chain_disk_multiple(0);
     sandbox.start().await?;
     write_disk_marker(&mut sandbox).await?;
     if !rootfs_unique_dir_is_rootfs_backed(&mut sandbox).await? {
@@ -1155,8 +1272,9 @@ async fn rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running() -> Result<(
         base_rootfs_reclaimable > 0,
         "the rootfs unique region must allocate a generation to bound"
     );
-    let mut measure_sandbox =
-        FirecrackerSandbox::from_snapshot_config(&base_snapshot)?.with_chain_bytes_ceiling(0);
+    let mut measure_sandbox = FirecrackerSandbox::from_snapshot_config(&base_snapshot)?
+        .with_chain_bytes_ceiling(0)
+        .with_rootfs_chain_disk_multiple(0);
     measure_sandbox.start().await?;
     write_rootfs_unique_chain_data(&mut measure_sandbox, unique_mib, 1).await?;
     let measure_dir = artifact_root.path().join("measure");
@@ -1200,8 +1318,9 @@ async fn rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running() -> Result<(
     // The negative control is the same fixture below the ceiling: it pauses
     // normally, proving the refusal above is the ceiling and not a broken
     // fixture.
-    let mut resumed =
-        FirecrackerSandbox::from_snapshot_config(&base_snapshot)?.with_chain_bytes_ceiling(ceiling);
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(&base_snapshot)?
+        .with_chain_bytes_ceiling(ceiling)
+        .with_rootfs_chain_disk_multiple(0);
     resumed.start().await?;
     write_rootfs_unique_chain_data(&mut resumed, unique_mib, 1).await?;
     let rejected_dir = artifact_root.path().join("rejected");
@@ -1247,7 +1366,9 @@ async fn rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running() -> Result<(
     );
 
     // Negative control: the same sandbox pauses once the ceiling is lifted.
-    let mut resumed = resumed.with_chain_bytes_ceiling(0);
+    let mut resumed = resumed
+        .with_chain_bytes_ceiling(0)
+        .with_rootfs_chain_disk_multiple(0);
     let lifted_dir = artifact_root.path().join("lifted");
     FirecrackerSandbox::pause_to_dir(&mut resumed, &lifted_dir)
         .await
@@ -1477,6 +1598,94 @@ fn rootfs_chain_parts(
         .as_ref()
         .context("paused snapshot should carry a rootfs image config")?;
     sandbox.chain_bytes_for_pause(&rootfs.image_config_path)
+}
+
+/// The `(reclaimable, shared_prefix, whole_chain)` byte parts of a snapshot's
+/// rootfs chain.
+fn rootfs_chain_accounting(
+    sandbox: &FirecrackerSandbox,
+    snapshot: &FirecrackerSnapshotConfig,
+) -> Result<(u64, u64, u64)> {
+    let rootfs = snapshot
+        .common
+        .rootfs_image_config
+        .as_ref()
+        .context("paused snapshot should carry a rootfs image config")?;
+    sandbox.chain_accounting_for_pause(&rootfs.image_config_path)
+}
+
+/// The `(reclaimable, shared_prefix, whole_chain)` byte parts of a snapshot's
+/// memory chain.
+fn memory_chain_accounting(
+    sandbox: &FirecrackerSandbox,
+    snapshot: &FirecrackerSnapshotConfig,
+) -> Result<(u64, u64, u64)> {
+    sandbox.chain_accounting_for_pause(&snapshot.mem_overlaybd_config.image_config_path)
+}
+
+/// Print the per-generation accounting the card measures, one machine-parseable
+/// line per pause.
+///
+/// The shape is the one the incident report needs: what each part of the
+/// generation costs, the generation-level deduplicated total (the same
+/// `st_blocks`-by-inode figure `du` reports), the guest disk and the relative
+/// bound computed from it. `other_bytes` is the part of the generation that is
+/// neither rootfs nor memory layers — the VM state and the configs — computed by
+/// subtracting the local layer bytes from the directory total.
+fn emit_chain_accounting(
+    pause_index: usize,
+    sandbox: &FirecrackerSandbox,
+    snapshot: &FirecrackerSnapshotConfig,
+) -> Result<()> {
+    let (rootfs_reclaimable, rootfs_prefix, rootfs_total) =
+        rootfs_chain_accounting(sandbox, snapshot)?;
+    let (memory_reclaimable, memory_prefix, memory_total) =
+        memory_chain_accounting(sandbox, snapshot)?;
+    let snapshot_dir = snapshot
+        .mem_overlaybd_config
+        .image_config_path
+        .parent()
+        .context("memory image config should have a parent directory")?;
+    let generation_total = allocated_bytes_in_directory(snapshot_dir);
+    let other_bytes = generation_total
+        .saturating_sub(rootfs_reclaimable)
+        .saturating_sub(memory_reclaimable);
+    let guest_disk_bytes = snapshot.common.rootfs_virtual_size.unwrap_or(0);
+    let multiple = sandbox.rootfs_chain_disk_multiple();
+    let limit_bytes = u64::from(multiple).saturating_mul(guest_disk_bytes);
+    eprintln!(
+        "chain-accounting pause={pause_index} rootfs_reclaimable={rootfs_reclaimable} \
+         rootfs_prefix={rootfs_prefix} rootfs_total={rootfs_total} \
+         memory_reclaimable={memory_reclaimable} memory_prefix={memory_prefix} \
+         memory_total={memory_total} other_bytes={other_bytes} \
+         generation_total={generation_total} guest_disk_bytes={guest_disk_bytes} \
+         multiple={multiple} limit_bytes={limit_bytes}"
+    );
+    Ok(())
+}
+
+/// Allocated bytes under a directory, deduplicated by device and inode.
+fn allocated_bytes_in_directory(root: &Path) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
+                total = total.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+        }
+    }
+    total
 }
 
 /// Report how `sandbox` classifies each lower of `snapshot`'s memory chain.

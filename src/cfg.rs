@@ -817,6 +817,20 @@ pub struct OrchestratorConfig {
     #[config(default = 51539607552u64, env = "AENV_CHAIN_BYTES_CEILING")]
     pub chain_bytes_ceiling: u64,
 
+    /// Multiple of the guest rootfs disk that bounds the whole deduplicated
+    /// rootfs chain of a single sandbox — its immutable stable prefix plus its
+    /// runtime-owned generations. The absolute `chain_bytes_ceiling` above only
+    /// judges the reclaimable part; this relative bound is the invariant that
+    /// keeps one sandbox's rootfs chain from growing past a small, measured
+    /// multiple of the disk it reports to the guest. A pause over the bound
+    /// compacts the runtime-owned suffix and refuses recoverably only when the
+    /// whole chain is still above it. `0` disables the bound. Default `2`: two
+    /// times the disk is the mathematical floor for admitting a fully allocated
+    /// disk, because the immutable prefix and one complete generation can each
+    /// approach the disk size.
+    #[config(default = 2u32, env = "AENV_ROOTFS_CHAIN_DISK_MULTIPLE")]
+    pub rootfs_chain_disk_multiple: u32,
+
     /// Paused-artifact sweep kill switch; see [`PausedArtifactReapMode`].
     #[config(default = "off", env = "AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP")]
     pub paused_artifact_reap: PausedArtifactReapMode,
@@ -2202,6 +2216,89 @@ mod tests {
         std::fs::write(&disabled_path, "[orchestrator]\nchain_bytes_ceiling = 0\n")?;
         let disabled = ConfigManager::new_from_path(&disabled_path)?;
         assert_eq!(disabled.config().orchestrator.chain_bytes_ceiling, 0);
+        Ok(())
+    }
+
+    /// `rootfs_chain_disk_multiple` is bound to its own env var, ships the
+    /// measured default of 2, and accepts `0` as the documented kill switch.
+    #[test]
+    fn rootfs_chain_disk_multiple_default_env_binding_and_disabled_value() -> Result<()> {
+        fn find_leaf(
+            meta: &confique::meta::Meta,
+            prefix: &str,
+            wanted: &str,
+        ) -> Option<(Option<&'static str>, Option<confique::meta::Expr>)> {
+            for field in meta.fields {
+                let path = if prefix.is_empty() {
+                    field.name.to_string()
+                } else {
+                    format!("{prefix}.{}", field.name)
+                };
+                match field.kind {
+                    confique::meta::FieldKind::Leaf { env, kind } => {
+                        if path == wanted {
+                            let default = match kind {
+                                confique::meta::LeafKind::Required { default } => default,
+                                confique::meta::LeafKind::Optional => None,
+                            };
+                            return Some((env, default));
+                        }
+                    }
+                    confique::meta::FieldKind::Nested { meta } => {
+                        if let Some(found) = find_leaf(meta, &path, wanted) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let (env, default) = find_leaf(
+            &AppConfig::META,
+            "",
+            "orchestrator.rootfs_chain_disk_multiple",
+        )
+        .expect("orchestrator.rootfs_chain_disk_multiple must exist in the schema");
+        assert_eq!(
+            env,
+            Some("AENV_ROOTFS_CHAIN_DISK_MULTIPLE"),
+            "the knob must be overridable by its own documented env var"
+        );
+        assert!(
+            default.is_some(),
+            "the schema must carry a default, not require the knob"
+        );
+
+        // The schema default and the shipped config file must agree.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shipped = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert_eq!(
+            shipped.config().orchestrator.rootfs_chain_disk_multiple,
+            2,
+            "the measured default multiple is 2"
+        );
+        let temp = tempdir()?;
+        let schema_path = temp.path().join("schema-default.toml");
+        std::fs::write(&schema_path, "[orchestrator]\n")?;
+        let schema_default = ConfigManager::new_from_path(&schema_path)?;
+        assert_eq!(
+            schema_default
+                .config()
+                .orchestrator
+                .rootfs_chain_disk_multiple,
+            2,
+            "the schema default must be the measured multiple"
+        );
+
+        // `0` is a legal value: it is the kill switch, not a validation error.
+        let disabled_path = temp.path().join("disabled-multiple.toml");
+        std::fs::write(
+            &disabled_path,
+            "[orchestrator]\nrootfs_chain_disk_multiple = 0\n",
+        )?;
+        let disabled = ConfigManager::new_from_path(&disabled_path)?;
+        assert_eq!(disabled.config().orchestrator.rootfs_chain_disk_multiple, 0);
         Ok(())
     }
 

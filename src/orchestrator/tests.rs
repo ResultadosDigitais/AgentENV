@@ -33,9 +33,9 @@ use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
 use crate::sandbox::{
-    BaseSandboxNetworkPolicy, PausedSandboxState, RuntimeArtifactSet, SandboxLaunchConfig,
-    SandboxLogEntry, SandboxMetric, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
-    SandboxRuntimeInfo,
+    BaseSandboxNetworkPolicy, PausedChainLimit, PausedSandboxState, RuntimeArtifactSet,
+    SandboxLaunchConfig, SandboxLogEntry, SandboxMetric, SandboxNetworkEgressPolicy,
+    SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
@@ -3999,7 +3999,7 @@ async fn pause_chain_ceiling_exceeded_keeps_running_and_allows_retry_after_raise
 ///
 /// The sibling test above drives the branch with a message that spells
 /// `CHAIN_BYTES_CEILING_EXCEEDED`, which is what a string match would pass on.
-/// The backend actually returns the concrete `ChainBytesCeilingExceeded` error,
+/// The backend actually returns the concrete `PausedChainLimitExceeded` error,
 /// so this test hands the branch exactly that error and asserts the same
 /// outcome: the VM is never stopped, the handle and route come back, and the
 /// sandbox is `Running` again — the card's "no ceiling path kills the VM".
@@ -4009,9 +4009,10 @@ async fn chain_ceiling_pause_failure_is_classified_by_error_type_and_keeps_the_v
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
         MockOperation::Pause,
-        MockAction::FailChainCeiling {
+        MockAction::FailPausedChainLimit {
+            limit: PausedChainLimit::ChainBytesCeiling,
             observed_bytes: 61_167_910_912,
-            ceiling_bytes: 51_539_607_552,
+            limit_bytes: 51_539_607_552,
         },
     );
     let orchestrator =
@@ -4062,6 +4063,97 @@ async fn chain_ceiling_pause_failure_is_classified_by_error_type_and_keeps_the_v
     assert_proxy_ready(&orchestrator, &sandbox_id).await?;
 
     orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+/// Both paused-chain bounds carry their own stable code and are recoverable.
+///
+/// The absolute ceiling and the rootfs disk multiple answer different questions
+/// (reclaimable growth against a fixed budget; the whole chain against a
+/// multiple of the guest disk), but the pause path must treat them exactly the
+/// same: a refusal that names the bound and resumes the VM in place. The codes
+/// are pinned as exact strings because the seven-day check greps them.
+#[tokio::test]
+async fn both_paused_chain_limits_are_named_and_recoverable() -> Result<()> {
+    setup();
+    assert_eq!(
+        PausedChainLimit::ChainBytesCeiling.as_str(),
+        "CHAIN_BYTES_CEILING_EXCEEDED"
+    );
+    assert_eq!(
+        PausedChainLimit::RootfsDiskMultiple.as_str(),
+        "ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED"
+    );
+
+    for limit in [
+        PausedChainLimit::ChainBytesCeiling,
+        PausedChainLimit::RootfsDiskMultiple,
+    ] {
+        let behavior = Arc::new(MockBehavior::new());
+        behavior.push_action(
+            MockOperation::Pause,
+            MockAction::FailPausedChainLimit {
+                limit,
+                observed_bytes: 130_000_000_000,
+                limit_bytes: 128_000_000_000,
+            },
+        );
+        let orchestrator = make_orchestrator_with_factory(MockBackendFactory::with_behavior(
+            Arc::clone(&behavior),
+        ))
+        .await;
+
+        let created = orchestrator
+            .create_sandbox(create_request(
+                Some(60),
+                &[("team", "pause-limit-recoverable")],
+            ))
+            .await?;
+        let sandbox_id = created.id;
+
+        let err = orchestrator
+            .pause_sandbox(sandbox_id)
+            .await
+            .expect_err("a paused-chain limit breach must fail the pause");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(limit.as_str()),
+            "the failure must surface the stable code for {limit:?}: {message}"
+        );
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::SandboxOperationFailed {
+                    operation: SandboxOperation::Pause,
+                    ..
+                }
+            ),
+            "a {limit:?} refusal must stay a recoverable pause failure"
+        );
+        assert_eq!(
+            behavior.stop_calls(),
+            0,
+            "a {limit:?} refusal must never stop the VM"
+        );
+
+        let metadata = orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("the sandbox must survive the refusal");
+        assert_eq!(metadata.state, SandboxState::Running);
+        assert!(metadata.paused_state.is_none());
+        assert!(
+            orchestrator
+                .sandboxes
+                .read()
+                .await
+                .contains_key(&sandbox_id),
+            "the runtime handle must be reinserted"
+        );
+        assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+
+        orchestrator.delete_sandbox(sandbox_id).await?;
+    }
     Ok(())
 }
 
