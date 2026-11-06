@@ -61,6 +61,8 @@ type nodeListAdmission struct {
 	RuntimeOverheadBytes   uint64                   `json:"runtimeOverheadBytes"`
 	CapacityMemoryBytes    uint64                   `json:"capacityMemoryBytes"`
 	CapacitySource         string                   `json:"capacitySource"`
+	ReservedMemoryBytes    uint64                   `json:"reservedMemoryBytes"`
+	ReservedCPU            uint32                   `json:"reservedCPU"`
 	Layers                 []nodeListAdmissionLayer `json:"layers"`
 }
 
@@ -101,6 +103,8 @@ func mapNodeAdmission(admission *schedulerv1.NodeAdmission) *nodeListAdmission {
 		RuntimeOverheadBytes:   admission.GetRuntimeOverheadBytes(),
 		CapacityMemoryBytes:    admission.GetCapacityMemoryBytes(),
 		CapacitySource:         admission.GetCapacitySource(),
+		ReservedMemoryBytes:    admission.GetReservedMemoryBytes(),
+		ReservedCPU:            admission.GetReservedCpu(),
 		Layers:                 layers,
 	}
 }

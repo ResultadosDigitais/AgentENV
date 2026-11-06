@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -253,6 +254,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
 	var scheduledShape *sandboxShape
+	// reservationID is the scheduler reservation made by the admission
+	// decision. It is settled once the upstream outcome is known so the node
+	// stops counting the in-flight shape.
+	reservationID := ""
 
 	if hasSandbox && resumeRequest {
 		resumeReq := &schedulerv1.ScheduleResumeRequest{
@@ -275,6 +280,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node = resp.GetNode()
+		reservationID = resp.GetReservationId()
 	} else if hasSandbox {
 		rpcStart := time.Now()
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
@@ -308,6 +314,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				CPUCount:    cold.GetCpuCount(),
 				MemoryBytes: cold.GetMemoryMb() << 20,
 			}
+		} else if sandbox := hint.GetNewSandbox(); sandbox != nil && sandbox.GetMemoryMb() > 0 {
+			scheduledShape = &sandboxShape{
+				CPUCount:    sandbox.GetCpuCount(),
+				MemoryBytes: sandbox.GetMemoryMb() << 20,
+			}
 		}
 		rpcStart := time.Now()
 		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
@@ -319,6 +330,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node = resp.GetNode()
+		reservationID = resp.GetReservationId()
 	}
 
 	s.logger.Debug("gateway routed request",
@@ -334,6 +346,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
 	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
 	if err != nil {
+		s.settleAdmission(r.Context(), reservationID, reservationOutcomeFailed)
 		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
 		return
 	}
@@ -360,6 +373,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
 			shape:            scheduledShape,
+			reservationID:    reservationID,
 		},
 	)
 }
@@ -390,6 +404,9 @@ type proxyRequestOptions struct {
 	// under the sandbox ID the upstream returns so a later resume can project
 	// it before the heartbeat reports paused resources.
 	shape *sandboxShape
+	// reservationID is the scheduler reservation the admission decision made;
+	// it is settled with the upstream outcome.
+	reservationID string
 }
 
 func (s *Server) proxyRequest(
@@ -400,8 +417,16 @@ func (s *Server) proxyRequest(
 	node *schedulerv1.Node,
 	options proxyRequestOptions,
 ) {
+	// ReverseProxy calls ErrorHandler after a ModifyResponse error, so the
+	// reservation is settled at most once per request with the first outcome.
+	var settleOnce sync.Once
+	settle := func(outcome string) {
+		settleOnce.Do(func() { s.settleAdmission(originalCtx, options.reservationID, outcome) })
+	}
+
 	upstreamURL, err := url.Parse(target)
 	if err != nil {
+		settle(reservationOutcomeFailed)
 		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
 		return
 	}
@@ -432,12 +457,19 @@ func (s *Server) proxyRequest(
 					resp.Header.Set(headerNodeID, nodeID)
 				}
 			}
+			// Settle with the status before anything that can fail: a 2xx
+			// upstream means the sandbox exists even if recording its binding
+			// fails afterwards.
+			settle(reservationOutcomeForStatus(resp.StatusCode))
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
 			}
 			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.Method, proxyReq.URL.Path, options.shape)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
+			// The reservation must not survive a request that never reached the
+			// upstream.
+			settle(reservationOutcomeFailed)
 			if errors.Is(err, context.Canceled) {
 				logLevel := zap.WarnLevel
 				if isStreamInputProxyRequest(proxyReq) {
@@ -502,114 +534,6 @@ func (e *proxyResponseError) Error() string {
 	return e.message
 }
 
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath string, shape *sandboxShape) error {
-	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
-	defer cancelRecord()
-	route, _ := matchPathRoute(requestMethod, requestPath)
-	if route.owner == ownerNewBuild {
-		if err := s.recordAssignment(recordCtx, route.id, node, "template_build"); err != nil {
-			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
-		}
-		return nil
-	}
-	if route.owner == ownerNewBuildConfirmed {
-		buildID := strings.TrimSpace(resp.Header.Get("x-agentenv-build-id"))
-		if buildID == "" {
-			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response is missing its build ID"}
-		}
-		if buildID != route.id {
-			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response ID does not match the request"}
-		}
-		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
-			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
-		}
-		return nil
-	}
-
-	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
-		if shape != nil {
-			s.sandboxShapes.set(sandboxID, *shape)
-		}
-		s.recordAssignment(recordCtx, sandboxID, node, "response_header")
-		return nil
-	}
-
-	body, truncated, err := readBodyWithLimit(resp.Body, s.maxRespSize)
-	if err != nil {
-		return &proxyResponseError{
-			statusCode: http.StatusBadGateway,
-			message:    "failed to read upstream response",
-			cause:      err,
-		}
-	}
-	if truncated {
-		s.logger.Warn("upstream response exceeded configured forwarding limit",
-			zap.Int64("max_response_size_bytes", s.maxRespSize),
-			zap.Int64("upstream_content_length", resp.ContentLength),
-			zap.String("content_type", resp.Header.Get("Content-Type")),
-		)
-		return &proxyResponseError{
-			statusCode: http.StatusBadGateway,
-			message:    "upstream response too large",
-		}
-	}
-	_ = resp.Body.Close()
-
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-	if resp.Header == nil {
-		resp.Header = make(http.Header)
-	}
-	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-
-	ids := extractSandboxIDsFromResponse(body)
-	if route.owner == ownerSandboxFork {
-		ids = extractForkSandboxIDsFromResponse(body)
-	}
-	for _, sandboxID := range ids {
-		if shape != nil {
-			s.sandboxShapes.set(sandboxID, *shape)
-		}
-		s.recordAssignment(recordCtx, sandboxID, node, "response_body")
-	}
-	return nil
-}
-
-// writeCapacityDeferred answers a resume the scheduler deferred because the
-// paused shape does not fit the owner. It is retryable: Retry-After tells the
-// client when to try again and the body carries a stable code plus the closed
-// admission reason (empty when the shape is not known yet).
-func writeCapacityDeferred(w http.ResponseWriter, reason string) {
-	w.Header().Set("Retry-After", "5")
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	body := struct {
-		Code   string `json:"code"`
-		Reason string `json:"reason,omitempty"`
-	}{
-		Code:   "sandbox_capacity_deferred",
-		Reason: reason,
-	}
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, source string) error {
-	rpcStart := time.Now()
-	_, err := s.scheduler.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{SandboxId: sandboxID, Node: node})
-	recordGatewaySchedulerRPC("RecordAssignment", rpcStart, err)
-	if err != nil {
-		s.logger.Warn("record assignment failed", zap.Error(err), zap.String("sandbox_id", sandboxID), zap.String("node_id", node.GetNodeId()))
-		return err
-	}
-
-	s.logger.Debug("gateway recorded sandbox assignment",
-		zap.String("sandbox_id", sandboxID),
-		zap.String("node_id", node.GetNodeId()),
-		zap.String("source", source),
-	)
-	return nil
-}
-
 func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
 	if limit <= 0 {
 		body, err := io.ReadAll(src)
@@ -623,16 +547,6 @@ func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
 		return nil, true, nil
 	}
 	return body, false, nil
-}
-
-func recordAssignmentTimeout(requestTimeout time.Duration) time.Duration {
-	if requestTimeout <= 0 {
-		return maxRecordAssignmentTimeout
-	}
-	if requestTimeout < maxRecordAssignmentTimeout {
-		return requestTimeout
-	}
-	return maxRecordAssignmentTimeout
 }
 
 func flushInterval(flushImmediately bool) time.Duration {

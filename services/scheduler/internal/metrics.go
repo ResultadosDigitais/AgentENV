@@ -79,7 +79,24 @@ var (
 		},
 		[]string{"outcome"},
 	)
+	schedulerAdmissionReservation = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_admission_reservation_total",
+			Help: "Admission reservations by outcome (reserved, confirmed, settled, released, expired).",
+		},
+		[]string{"outcome"},
+	)
 )
+
+func recordAdmissionReservation(outcome string) {
+	schedulerAdmissionReservation.WithLabelValues(outcome).Inc()
+}
+
+func recordAdmissionReservationCount(outcome string, count int) {
+	if count > 0 {
+		schedulerAdmissionReservation.WithLabelValues(outcome).Add(float64(count))
+	}
+}
 
 func MetricsUnaryInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -146,6 +163,8 @@ func schedulerRPCLabel(fullMethod string) string {
 		return "UnregisterNode"
 	case "ScheduleResume":
 		return "ScheduleResume"
+	case "SettleAdmission":
+		return "SettleAdmission"
 	default:
 		return ""
 	}

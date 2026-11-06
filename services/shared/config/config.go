@@ -105,6 +105,17 @@ type NodeResourceLimit struct {
 	// on another admitted node. Off by default: moving a resume before the
 	// paused artifacts are cluster-readable loses the sandbox.
 	CrossNodeResume *bool `json:"cross_node_resume"`
+	// AdmissionReservation reserves, at decision time, the shape of every
+	// admitted create and resume until the gateway confirms its outcome.
+	// Default "on": absence of the key must not disable the correction.
+	AdmissionReservation *string `json:"admission_reservation"`
+	// AdmissionReservationTTL is how long a reservation keeps occupying node
+	// capacity: until the gateway settles it, a confirmed one is released on
+	// the first node snapshot produced after the confirmation, and the TTL is
+	// the backstop when that snapshot never arrives. Deployments should set it
+	// to gateway.request_timeout + AdmissionReservationTTLMargin; the default
+	// is AdmissionReservationTTLFor(DefaultGatewayRequestTimeout).
+	AdmissionReservationTTL *string `json:"admission_reservation_ttl"`
 }
 
 // AdmissionLayer is one VM shape whose admission the scheduler publishes.
@@ -136,7 +147,38 @@ const (
 	// Shape admission modes accepted by NodeResourceLimit.ShapeAdmission.
 	ShapeAdmissionOn  = "on"
 	ShapeAdmissionOff = "off"
+
+	// DefaultGatewayRequestTimeout is the gateway request timeout applied when
+	// gateway.request_timeout is absent.
+	DefaultGatewayRequestTimeout = 30 * time.Second
+
+	// AdmissionReservationTTLMargin is how much longer than the gateway
+	// request timeout a reservation is held. A cold 32 GiB create spends most
+	// of the request timeout pulling its image and booting; the margin covers
+	// that cold start, the settlement RPC and the heartbeat that reports the
+	// new sandbox, so a reservation never expires under a request still in
+	// flight.
+	AdmissionReservationTTLMargin = 60 * time.Second
+
+	// DefaultAdmissionReservationTTL applies when admission_reservation_ttl is
+	// absent. It is derived from the default request timeout plus the margin,
+	// so a slow create is not released while it still runs, and short enough
+	// that a lost gateway response stops consuming node capacity. A deployment
+	// that raises gateway.request_timeout must raise this key with it:
+	// ValidateAdmissionReservationTTL refuses a TTL at or below the timeout,
+	// and the deploy parity test enforces the full margin for the shipped
+	// configs.
+	DefaultAdmissionReservationTTL = DefaultGatewayRequestTimeout + AdmissionReservationTTLMargin
 )
+
+// AdmissionReservationTTLFor returns the reservation TTL that outlives a
+// gateway request timeout by AdmissionReservationTTLMargin.
+func AdmissionReservationTTLFor(requestTimeout time.Duration) time.Duration {
+	if requestTimeout <= 0 {
+		requestTimeout = DefaultGatewayRequestTimeout
+	}
+	return requestTimeout + AdmissionReservationTTLMargin
+}
 
 // DefaultAdmissionLayerMemoryGB is the set of VM shapes published per node
 // when admission_layers is absent.
@@ -192,6 +234,63 @@ func (l *NodeResourceLimit) ResolvedAdmissionLayers() []AdmissionLayer {
 // CrossNodeResumeEnabled reports whether a resume may move off its owner.
 func (l *NodeResourceLimit) CrossNodeResumeEnabled() bool {
 	return l != nil && l.CrossNodeResume != nil && *l.CrossNodeResume
+}
+
+// ResolvedAdmissionReservation returns "on" or "off", defaulting to "on".
+func (l *NodeResourceLimit) ResolvedAdmissionReservation() string {
+	if l == nil || l.AdmissionReservation == nil {
+		return ShapeAdmissionOn
+	}
+	if strings.ToLower(strings.TrimSpace(*l.AdmissionReservation)) == ShapeAdmissionOff {
+		return ShapeAdmissionOff
+	}
+	return ShapeAdmissionOn
+}
+
+// AdmissionReservationEnabled reports whether the in-flight reservation
+// ledger is on.
+func (l *NodeResourceLimit) AdmissionReservationEnabled() bool {
+	return l.ResolvedAdmissionReservation() == ShapeAdmissionOn
+}
+
+// ResolvedAdmissionReservationTTL returns the configured reservation TTL,
+// defaulting to DefaultAdmissionReservationTTL. An unparsable or non-positive
+// value also falls back to the default; Validate rejects it at startup so a
+// typo cannot go unnoticed.
+func (l *NodeResourceLimit) ResolvedAdmissionReservationTTL() time.Duration {
+	if l == nil || l.AdmissionReservationTTL == nil {
+		return DefaultAdmissionReservationTTL
+	}
+	ttl, err := time.ParseDuration(strings.TrimSpace(*l.AdmissionReservationTTL))
+	if err != nil || ttl <= 0 {
+		return DefaultAdmissionReservationTTL
+	}
+	return ttl
+}
+
+// ValidateAdmissionReservationTTL refuses a reservation TTL that does not
+// outlive the gateway request timeout. A TTL at or below request_timeout
+// expires while the gateway is still waiting for a cold 32 GiB create to pull
+// its image, so the reservation would stop projecting before the request it
+// protects settles and two creates could once again pass together.
+func (l *NodeResourceLimit) ValidateAdmissionReservationTTL(requestTimeout time.Duration) error {
+	if l == nil || l.AdmissionReservationTTL == nil {
+		return nil
+	}
+	ttl, err := time.ParseDuration(strings.TrimSpace(*l.AdmissionReservationTTL))
+	if err != nil {
+		return fmt.Errorf("scheduler.node_resource_limit.admission_reservation_ttl must be a duration, got %q", *l.AdmissionReservationTTL)
+	}
+	if requestTimeout <= 0 {
+		requestTimeout = DefaultGatewayRequestTimeout
+	}
+	if ttl <= requestTimeout {
+		return fmt.Errorf(
+			"scheduler.node_resource_limit.admission_reservation_ttl (%s) must exceed gateway.request_timeout (%s) so a cold create keeps its reservation until the gateway settles it",
+			ttl, requestTimeout,
+		)
+	}
+	return nil
 }
 
 // ResolvedAdmissionMode returns the configured mode, defaulting to nominal.
@@ -257,6 +356,22 @@ func (l *NodeResourceLimit) Validate() error {
 		case ShapeAdmissionOn, ShapeAdmissionOff:
 		default:
 			return fmt.Errorf("scheduler.node_resource_limit.shape_admission must be one of on, off, got %q", *l.ShapeAdmission)
+		}
+	}
+	if l.AdmissionReservation != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.AdmissionReservation)) {
+		case ShapeAdmissionOn, ShapeAdmissionOff:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.admission_reservation must be one of on, off, got %q", *l.AdmissionReservation)
+		}
+	}
+	if l.AdmissionReservationTTL != nil {
+		ttl, err := time.ParseDuration(strings.TrimSpace(*l.AdmissionReservationTTL))
+		if err != nil {
+			return fmt.Errorf("scheduler.node_resource_limit.admission_reservation_ttl must be a duration, got %q", *l.AdmissionReservationTTL)
+		}
+		if ttl <= 0 {
+			return fmt.Errorf("scheduler.node_resource_limit.admission_reservation_ttl must be greater than zero, got %q", *l.AdmissionReservationTTL)
 		}
 	}
 	seenLayers := make(map[uint64]struct{}, len(l.AdmissionLayers))
@@ -516,7 +631,7 @@ func defaultConfig(service string) Config {
 			HTTPListenAddr:      ":8080",
 			MetricsListenAddr:   ":9102",
 			SchedulerAddr:       "127.0.0.1:9090",
-			RequestTimeout:      30 * time.Second,
+			RequestTimeout:      DefaultGatewayRequestTimeout,
 			ForwardResponseSize: 4 << 20,
 			SandboxProxyDomains: []string{},
 		},
@@ -662,6 +777,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")
 		}
 		if err := c.Scheduler.NodeResourceLimit.Validate(); err != nil {
+			return err
+		}
+		if err := c.Scheduler.NodeResourceLimit.ValidateAdmissionReservationTTL(c.Gateway.RequestTimeout); err != nil {
 			return err
 		}
 		switch strings.ToLower(strings.TrimSpace(c.Scheduler.Discovery.Mode)) {

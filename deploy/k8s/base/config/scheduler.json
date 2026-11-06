@@ -24,6 +24,8 @@
       "memory_capacity_source": "allocatable",
       "shape_admission": "on",
       "cross_node_resume": false,
+      "admission_reservation": "on",
+      "admission_reservation_ttl": "150s",
       "admission_layers": [
         {"memory_gb": 8},
         {"memory_gb": 16},

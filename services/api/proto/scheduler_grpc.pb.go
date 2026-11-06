@@ -33,6 +33,7 @@ const (
 	Scheduler_GetNode_FullMethodName            = "/scheduler.v1.Scheduler/GetNode"
 	Scheduler_UnregisterNode_FullMethodName     = "/scheduler.v1.Scheduler/UnregisterNode"
 	Scheduler_ScheduleResume_FullMethodName     = "/scheduler.v1.Scheduler/ScheduleResume"
+	Scheduler_SettleAdmission_FullMethodName    = "/scheduler.v1.Scheduler/SettleAdmission"
 )
 
 // SchedulerClient is the client API for Scheduler service.
@@ -56,6 +57,10 @@ type SchedulerClient interface {
 	// before a paused sandbox resumes on its owner (or on another node when
 	// cross_node_resume is enabled).
 	ScheduleResume(ctx context.Context, in *ScheduleResumeRequest, opts ...grpc.CallOption) (*ScheduleResumeResponse, error)
+	// SettleAdmission releases the reservation an admitted Schedule or
+	// ScheduleResume created, once the gateway knows whether the sandbox was
+	// actually created or resumed. Best-effort and idempotent.
+	SettleAdmission(ctx context.Context, in *SettleAdmissionRequest, opts ...grpc.CallOption) (*SettleAdmissionResponse, error)
 }
 
 type schedulerClient struct {
@@ -206,6 +211,16 @@ func (c *schedulerClient) ScheduleResume(ctx context.Context, in *ScheduleResume
 	return out, nil
 }
 
+func (c *schedulerClient) SettleAdmission(ctx context.Context, in *SettleAdmissionRequest, opts ...grpc.CallOption) (*SettleAdmissionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SettleAdmissionResponse)
+	err := c.cc.Invoke(ctx, Scheduler_SettleAdmission_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SchedulerServer is the server API for Scheduler service.
 // All implementations must embed UnimplementedSchedulerServer
 // for forward compatibility.
@@ -227,6 +242,10 @@ type SchedulerServer interface {
 	// before a paused sandbox resumes on its owner (or on another node when
 	// cross_node_resume is enabled).
 	ScheduleResume(context.Context, *ScheduleResumeRequest) (*ScheduleResumeResponse, error)
+	// SettleAdmission releases the reservation an admitted Schedule or
+	// ScheduleResume created, once the gateway knows whether the sandbox was
+	// actually created or resumed. Best-effort and idempotent.
+	SettleAdmission(context.Context, *SettleAdmissionRequest) (*SettleAdmissionResponse, error)
 	mustEmbedUnimplementedSchedulerServer()
 }
 
@@ -278,6 +297,9 @@ func (UnimplementedSchedulerServer) UnregisterNode(context.Context, *UnregisterN
 }
 func (UnimplementedSchedulerServer) ScheduleResume(context.Context, *ScheduleResumeRequest) (*ScheduleResumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ScheduleResume not implemented")
+}
+func (UnimplementedSchedulerServer) SettleAdmission(context.Context, *SettleAdmissionRequest) (*SettleAdmissionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SettleAdmission not implemented")
 }
 func (UnimplementedSchedulerServer) mustEmbedUnimplementedSchedulerServer() {}
 func (UnimplementedSchedulerServer) testEmbeddedByValue()                   {}
@@ -552,6 +574,24 @@ func _Scheduler_ScheduleResume_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Scheduler_SettleAdmission_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SettleAdmissionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).SettleAdmission(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_SettleAdmission_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).SettleAdmission(ctx, req.(*SettleAdmissionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Scheduler_ServiceDesc is the grpc.ServiceDesc for Scheduler service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -614,6 +654,10 @@ var Scheduler_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ScheduleResume",
 			Handler:    _Scheduler_ScheduleResume_Handler,
+		},
+		{
+			MethodName: "SettleAdmission",
+			Handler:    _Scheduler_SettleAdmission_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

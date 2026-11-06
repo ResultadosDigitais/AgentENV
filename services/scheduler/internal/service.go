@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -25,6 +26,11 @@ type Service struct {
 	artifacts        ArtifactStore
 	resourceLimit    *config.NodeResourceLimit
 	capacityProvider NodeCapacityProvider
+	// admissionMu serializes read-decide-reserve so two decisions cannot both
+	// observe the same free capacity. It is only taken while reservations are
+	// enabled; the ledger keeps its own lock and is always taken inside it.
+	admissionMu  sync.Mutex
+	reservations *reservationLedger
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -71,6 +77,18 @@ func WithNodeCapacityProvider(provider NodeCapacityProvider) ServiceOption {
 	}
 }
 
+// WithAdmissionReservation enables the in-flight reservation ledger: every
+// admitted create and resume reserves its shape on the selected node until the
+// gateway confirms or rejects it, or the TTL elapses. A non-positive ttl
+// leaves the ledger disabled, which restores the pre-reservation behavior.
+func WithAdmissionReservation(ttl time.Duration) ServiceOption {
+	return func(s *Service) {
+		if ttl > 0 {
+			s.reservations = newReservationLedger(ttl, time.Now)
+		}
+	}
+}
+
 type QueryOnlyService struct {
 	schedulerv1.UnimplementedSchedulerServer
 	logger *zap.Logger
@@ -94,15 +112,25 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		recordSchedulerSchedule(s.strategy.Name(), start, err)
 	}()
 
+	// Reading the nodes, projecting what is already reserved, filtering and
+	// selecting happen under one lock so two simultaneous creates cannot both
+	// see the same free capacity. With the ledger disabled the lock is a no-op
+	// and the path is exactly the historical one.
+	s.lockAdmission()
+	defer s.unlockAdmission()
+
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
+		snapshot, observedAt := s.nodes.PeekObservedAt(n.ID)
 		rich = append(rich, RichNode{
-			Node:     n,
-			Snapshot: s.nodes.PeekObserved(n.ID),
+			Node:       n,
+			Snapshot:   snapshot,
+			ObservedAt: observedAt,
 		})
 	}
 	rich = s.annotateCapacity(rich)
+	rich = s.projectReservations(rich)
 
 	eligible := FilterByResourceLimitReported(rich, s.resourceLimit, func(nodeID string, nominal, request bool, detail string) {
 		s.logger.Info("admission shadow divergence",
@@ -131,11 +159,12 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		)
 	})
 
-	// Project the cold-sandbox shape onto each candidate so a node only
+	// Project the incoming create shape onto each candidate so a node only
 	// admits the new sandbox when it fits the same capacity rule the resume
-	// path uses.
-	if cold := req.GetHint().GetNewColdSandbox(); cold != nil && cold.GetMemoryMb() > 0 {
-		eligible = filterByShape(eligible, cold.GetMemoryMb()<<20, cold.GetCpuCount(), s.resourceLimit)
+	// path uses. A create whose shape is unknown still reserves one slot.
+	memoryBytes, cpuCount, hasShape, reserve := reservationShapeFromHint(req.GetHint())
+	if reserve && hasShape {
+		eligible = filterByShape(eligible, memoryBytes, cpuCount, s.resourceLimit)
 	}
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
@@ -162,7 +191,114 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		zap.Int("candidate_nodes", len(rich)),
 		zap.Int("eligible_nodes", len(eligible)),
 	)
-	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
+	reservationID := ""
+	if reserve {
+		reservationID = s.reserve(node.ID, memoryBytes, cpuCount, "")
+	}
+	return &schedulerv1.ScheduleResponse{
+		Node:          node.Node.ToProto(),
+		ReservationId: reservationID,
+	}, nil
+}
+
+// reservationShapeFromHint resolves the shape a create reserves. reserve is
+// false only when the hint does not describe an allocating request (for
+// example a request that does not create a sandbox). hasShape is false when
+// the hint is a create whose template shape the gateway could not read; the
+// decision then reserves a slot only.
+func reservationShapeFromHint(hint *schedulerv1.ScheduleRequestHint) (memoryBytes uint64, cpuCount uint32, hasShape bool, reserve bool) {
+	switch kind := hint.GetKind().(type) {
+	case *schedulerv1.ScheduleRequestHint_NewColdSandbox:
+		cold := kind.NewColdSandbox
+		if cold == nil || cold.GetMemoryMb() == 0 {
+			return 0, 0, false, true
+		}
+		return cold.GetMemoryMb() << 20, cold.GetCpuCount(), true, true
+	case *schedulerv1.ScheduleRequestHint_NewSandbox:
+		sandbox := kind.NewSandbox
+		if sandbox == nil || sandbox.GetMemoryMb() == 0 {
+			return 0, 0, false, true
+		}
+		return sandbox.GetMemoryMb() << 20, sandbox.GetCpuCount(), true, true
+	default:
+		return 0, 0, false, false
+	}
+}
+
+// lockAdmission serializes the decision with the in-flight reservations. It
+// is a no-op when the ledger is disabled.
+func (s *Service) lockAdmission() {
+	if s.reservations != nil {
+		s.admissionMu.Lock()
+	}
+}
+
+func (s *Service) unlockAdmission() {
+	if s.reservations != nil {
+		s.admissionMu.Unlock()
+	}
+}
+
+// reserve records an admitted shape on the node. key is the sandbox ID for a
+// resume (so a repeated resume replaces its own entry) and empty for a create.
+func (s *Service) reserve(nodeID string, memoryBytes uint64, cpuCount uint32, key string) string {
+	if s.reservations == nil {
+		return ""
+	}
+	return s.reservations.Reserve(nodeID, memoryBytes, cpuCount, 1, key)
+}
+
+// settleReservation releases one reservation. It is best-effort and
+// idempotent: an unknown or repeated id changes nothing.
+func (s *Service) settleReservation(id string, outcome string) bool {
+	if s.reservations == nil || id == "" {
+		return false
+	}
+	return s.reservations.Settle(id, outcome)
+}
+
+// projectReservations returns a copy of the candidates with every in-flight
+// reservation added to the fields the admission rule reads. The stored
+// heartbeat snapshot is never mutated; the copy is what the filters see.
+func (s *Service) projectReservations(nodes []RichNode) []RichNode {
+	return s.projectReservationsExcept(nodes, "")
+}
+
+// projectReservationsExcept is projectReservations without the reservation
+// carrying excludeKey, used when the decision is a retry of that same
+// reservation (a repeated resume of one sandbox).
+func (s *Service) projectReservationsExcept(nodes []RichNode, excludeKey string) []RichNode {
+	if s.reservations == nil || len(nodes) == 0 {
+		return nodes
+	}
+	projected := make([]RichNode, len(nodes))
+	for i, node := range nodes {
+		// A confirmed reservation stops projecting as soon as the node reports
+		// a snapshot produced after the confirmation: at that point the
+		// snapshot itself counts the admitted sandbox and holding the
+		// reservation too would double count it.
+		s.reservations.Observe(node.ID, node.ObservedAt)
+		memoryBytes, cpuCount, slots, count := s.reservations.ProjectExcept(node.ID, excludeKey)
+		if count == 0 || node.Snapshot == nil {
+			projected[i] = node
+			continue
+		}
+		snapshot := cloneSnapshot(node.Snapshot)
+		snapshot.AllocatedMemoryBytes += memoryBytes
+		// The reserved bytes are committed to this node even though the guest
+		// has not started using them. Adding them to memory_used as well keeps
+		// memory_used - allocated (the runtime overhead the capacity base
+		// subtracts) unchanged, so the projection cannot inflate the ceiling.
+		snapshot.MemoryUsedBytes += memoryBytes
+		if snapshot.GetRequestedMemoryBytes() > 0 {
+			snapshot.RequestedMemoryBytes += memoryBytes
+		}
+		snapshot.AllocatedCpu += cpuCount
+		snapshot.SandboxCount += slots
+		snapshot.SandboxStartingCount += slots
+		projected[i] = RichNode{Node: node.Node, Snapshot: snapshot, ObservedAt: node.ObservedAt, Capacity: node.Capacity}
+	}
+	return projected
 }
 
 // summarizeScheduleHint renders a compact, log-friendly description of a
@@ -312,11 +448,16 @@ func (s *Service) ListObservedNodes(_ context.Context, req *schedulerv1.ListObse
 	rich := make([]RichNode, 0, len(nodes))
 	for _, node := range nodes {
 		rich = append(rich, RichNode{
-			Node:     Node{ID: node.GetNodeId(), Endpoint: node.GetEndpoint()},
-			Snapshot: node.GetSnapshot(),
+			Node:       Node{ID: node.GetNodeId(), Endpoint: node.GetEndpoint()},
+			Snapshot:   node.GetSnapshot(),
+			ObservedAt: observedAtOf(node.GetSnapshot(), node.GetLastSeenUnixMs()),
 		})
 	}
 	rich = s.annotateCapacity(rich)
+	// The published verdict must reflect what is already in flight, or /nodes
+	// would report a layer as admitted while an admitted create has reserved
+	// the room it needs.
+	rich = s.projectReservations(rich)
 	for i, node := range nodes {
 		node.Admission = s.nodeAdmission(rich[i])
 	}
@@ -340,6 +481,9 @@ func (s *Service) nodeAdmission(n RichNode) *schedulerv1.NodeAdmission {
 	}
 	if n.Capacity != nil {
 		admission.AllocatableMemoryBytes = n.Capacity.AllocatableMemoryBytes
+	}
+	if s.reservations != nil {
+		admission.ReservedMemoryBytes, admission.ReservedCpu, _, _ = s.reservations.Project(n.ID)
 	}
 	for _, verdict := range verdicts {
 		admission.Layers = append(admission.Layers, &schedulerv1.AdmissionVerdict{
@@ -383,8 +527,9 @@ func (s *Service) ScheduleResume(_ context.Context, req *schedulerv1.ScheduleRes
 		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: true}, nil
 	}
 
-	memoryBytes, cpuCount, known := s.pausedShape(owner.ID, sandboxID, req)
-	if !known {
+	plan := s.planResume(sandboxID, owner, req)
+	switch {
+	case !plan.known:
 		// No shape means the projection cannot be evaluated. Defer instead of
 		// over-admitting: fail-closed on an unknown shape.
 		recordResumeAdmission("unknown_shape")
@@ -393,47 +538,117 @@ func (s *Service) ScheduleResume(_ context.Context, req *schedulerv1.ScheduleRes
 			zap.String("node_id", owner.ID),
 		)
 		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: false}, nil
-	}
-
-	ownerRich := s.richNode(owner.ID)
-	admitted, reason := EvaluateShapeAdmission(ownerRich, memoryBytes, cpuCount, s.resourceLimit)
-	if admitted {
+	case plan.admitted && !plan.moved:
 		recordResumeAdmission("owner")
-		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: true}, nil
-	}
-	if !s.resourceLimit.CrossNodeResumeEnabled() {
+		return &schedulerv1.ScheduleResumeResponse{
+			Node:          plan.node.ToProto(),
+			Admitted:      true,
+			ReservationId: plan.reservationID,
+		}, nil
+	case plan.admitted:
+		// The binding moves only after a node was selected; the reservation was
+		// already made on that node under the decision lock, so a failed write
+		// releases it instead of leaving a phantom.
+		if recordErr := s.store.Record(sandboxID, plan.node, time.Now()); recordErr != nil {
+			s.settleReservation(plan.reservationID, ReservationFailed)
+			recordResumeAdmission("error")
+			return nil, status.Error(codes.Unavailable, "binding store unavailable")
+		}
+		recordResumeAdmission("moved")
+		s.logger.Info("scheduler moved a resume to another node",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("from_node_id", owner.ID),
+			zap.String("to_node_id", plan.node.ID),
+			zap.String("reason", plan.reason),
+		)
+		return &schedulerv1.ScheduleResumeResponse{
+			Node:          plan.node.ToProto(),
+			Admitted:      true,
+			ReservationId: plan.reservationID,
+		}, nil
+	default:
 		recordResumeAdmission("deferred")
 		s.logger.Info("scheduler deferred resume that does not fit the owner",
 			zap.String("sandbox_id", sandboxID),
 			zap.String("node_id", owner.ID),
-			zap.String("reason", reason),
+			zap.String("reason", plan.reason),
 		)
-		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: false, Reason: reason}, nil
+		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: false, Reason: plan.reason}, nil
+	}
+}
+
+// resumePlan is the outcome of one resume decision. The reservation, when
+// admitted, is already recorded on the selected node; the caller only writes
+// the binding after the lock is released.
+type resumePlan struct {
+	known         bool
+	admitted      bool
+	moved         bool
+	reason        string
+	node          Node
+	reservationID string
+}
+
+// planResume decides where a paused sandbox resumes and reserves its shape
+// there. The whole read-project-decide-reserve sequence runs under the
+// admission lock, and the reservation of a repeated resume replaces the
+// sandbox's own previous reservation instead of counting it twice.
+func (s *Service) planResume(sandboxID string, owner Node, req *schedulerv1.ScheduleResumeRequest) resumePlan {
+	s.lockAdmission()
+	defer s.unlockAdmission()
+
+	memoryBytes, cpuCount, known := s.pausedShape(owner.ID, sandboxID, req)
+	if !known {
+		return resumePlan{known: false}
 	}
 
-	candidates := s.resumeCandidates(owner.ID, memoryBytes, cpuCount)
+	ownerRich := s.projectReservationsExcept([]RichNode{s.richNode(owner.ID)}, sandboxID)[0]
+	admitted, reason := EvaluateShapeAdmission(ownerRich, memoryBytes, cpuCount, s.resourceLimit)
+	if admitted {
+		return resumePlan{
+			known:         true,
+			admitted:      true,
+			node:          owner,
+			reservationID: s.reserve(owner.ID, memoryBytes, cpuCount, sandboxID),
+		}
+	}
+	if !s.resourceLimit.CrossNodeResumeEnabled() {
+		return resumePlan{known: true, reason: reason, node: owner}
+	}
+
+	candidates := s.resumeCandidates(owner.ID, memoryBytes, cpuCount, sandboxID)
 	selected, selectErr := s.strategy.Select(candidates, nil)
 	if selectErr != nil {
-		recordResumeAdmission("deferred")
-		s.logger.Info("scheduler deferred resume without an alternative node",
-			zap.String("sandbox_id", sandboxID),
-			zap.String("node_id", owner.ID),
-			zap.String("reason", reason),
-		)
-		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: false, Reason: reason}, nil
+		return resumePlan{known: true, reason: reason, node: owner}
 	}
-	if recordErr := s.store.Record(sandboxID, selected.Node, time.Now()); recordErr != nil {
-		recordResumeAdmission("error")
-		return nil, status.Error(codes.Unavailable, "binding store unavailable")
+	return resumePlan{
+		known:         true,
+		admitted:      true,
+		moved:         true,
+		node:          selected.Node,
+		reservationID: s.reserve(selected.ID, memoryBytes, cpuCount, sandboxID),
 	}
-	recordResumeAdmission("moved")
-	s.logger.Info("scheduler moved a resume to another node",
-		zap.String("sandbox_id", sandboxID),
-		zap.String("from_node_id", owner.ID),
-		zap.String("to_node_id", selected.ID),
-		zap.String("reason", reason),
+}
+
+// SettleAdmission releases a reservation once the gateway knows whether the
+// create or resume succeeded. Settlement is best-effort and idempotent: an
+// unknown or repeated reservation is a no-op, never an error.
+func (s *Service) SettleAdmission(_ context.Context, req *schedulerv1.SettleAdmissionRequest) (*schedulerv1.SettleAdmissionResponse, error) {
+	reservationID := strings.TrimSpace(req.GetReservationId())
+	if reservationID == "" {
+		return nil, status.Error(codes.InvalidArgument, "reservation_id is required")
+	}
+	outcome := strings.TrimSpace(req.GetOutcome())
+	if outcome != ReservationConfirmed && outcome != ReservationFailed {
+		return nil, status.Error(codes.InvalidArgument, "outcome must be confirmed or failed")
+	}
+	settled := s.settleReservation(reservationID, outcome)
+	s.logger.Debug("scheduler settled admission reservation",
+		zap.String("reservation_id", reservationID),
+		zap.String("outcome", outcome),
+		zap.Bool("settled", settled),
 	)
-	return &schedulerv1.ScheduleResumeResponse{Node: selected.Node.ToProto(), Admitted: true}, nil
+	return &schedulerv1.SettleAdmissionResponse{}, nil
 }
 
 // pausedShape resolves the persisted shape of a paused sandbox: the owner's
@@ -451,22 +666,26 @@ func (s *Service) pausedShape(nodeID, sandboxID string, req *schedulerv1.Schedul
 // richNode returns the rich view of one discovered node, with its capacity.
 func (s *Service) richNode(nodeID string) RichNode {
 	node, _ := s.nodes.Resolve(nodeID)
-	rich := []RichNode{{Node: node, Snapshot: s.nodes.PeekObserved(nodeID)}}
+	snapshot, observedAt := s.nodes.PeekObservedAt(nodeID)
+	rich := []RichNode{{Node: node, Snapshot: snapshot, ObservedAt: observedAt}}
 	return s.annotateCapacity(rich)[0]
 }
 
 // resumeCandidates returns every node except the owner that admits the paused
-// shape, using the existing scheduling filters.
-func (s *Service) resumeCandidates(ownerID string, memoryBytes uint64, cpuCount uint32) []RichNode {
+// shape, using the existing scheduling filters. In-flight reservations, except
+// the resuming sandbox's own (excludeKey), are projected before filtering.
+func (s *Service) resumeCandidates(ownerID string, memoryBytes uint64, cpuCount uint32, excludeKey string) []RichNode {
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, node := range discovered {
 		if node.ID == ownerID {
 			continue
 		}
-		rich = append(rich, RichNode{Node: node, Snapshot: s.nodes.PeekObserved(node.ID)})
+		snapshot, observedAt := s.nodes.PeekObservedAt(node.ID)
+		rich = append(rich, RichNode{Node: node, Snapshot: snapshot, ObservedAt: observedAt})
 	}
 	rich = s.annotateCapacity(rich)
+	rich = s.projectReservationsExcept(rich, excludeKey)
 	rich = FilterByResourceLimit(rich, s.resourceLimit)
 	return filterByShape(rich, memoryBytes, cpuCount, s.resourceLimit)
 }

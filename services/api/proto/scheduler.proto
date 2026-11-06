@@ -22,6 +22,10 @@ service Scheduler {
   // before a paused sandbox resumes on its owner (or on another node when
   // cross_node_resume is enabled).
   rpc ScheduleResume(ScheduleResumeRequest) returns (ScheduleResumeResponse);
+  // SettleAdmission releases the reservation an admitted Schedule or
+  // ScheduleResume created, once the gateway knows whether the sandbox was
+  // actually created or resumed. Best-effort and idempotent.
+  rpc SettleAdmission(SettleAdmissionRequest) returns (SettleAdmissionResponse);
 }
 
 message Node {
@@ -55,6 +59,10 @@ message NewColdSandboxHint {
 message NewSandboxHint {
   // Sandbox metadata key/value pairs parsed from the request body.
   map<string, string> metadata = 1;
+  // Requested shape when the body carries it; 0 means the template default
+  // applies and the scheduler can only reserve a slot.
+  uint32 cpu_count = 2;
+  uint64 memory_mb = 3;
 }
 
 message ScheduleRequest {
@@ -64,6 +72,9 @@ message ScheduleRequest {
 
 message ScheduleResponse {
   Node node = 1;
+  // Opaque reservation id the gateway settles once the create outcome is
+  // known. Empty when the reservation ledger is disabled.
+  string reservation_id = 2;
 }
 
 message ListNodesRequest {}
@@ -175,6 +186,9 @@ message NodeAdmission {
   // "allocatable" or "total".
   string capacity_source = 4;
   repeated AdmissionVerdict layers = 5;
+  // Shapes admitted and still in flight, already included in the verdicts.
+  uint64 reserved_memory_bytes = 6;
+  uint32 reserved_cpu = 7;
 }
 
 message ObservedNode {
@@ -328,4 +342,16 @@ message ScheduleResumeResponse {
   // Closed admission reason (memory_allocated, memory_used, cpu, starting or
   // disk); empty when admitted.
   string reason = 3;
+  // Opaque reservation id the gateway settles once the resume outcome is
+  // known. Empty when admitted with the reservation ledger disabled.
+  string reservation_id = 4;
 }
+
+message SettleAdmissionRequest {
+  string reservation_id = 1;
+  // Closed set: "confirmed" when the sandbox was created or resumed,
+  // "failed" when the upstream rejected it or the request never completed.
+  string outcome = 2;
+}
+
+message SettleAdmissionResponse {}

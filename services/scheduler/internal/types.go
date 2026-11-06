@@ -1,6 +1,10 @@
 package scheduler
 
-import schedulerv1 "agentenv/services/api/proto"
+import (
+	"time"
+
+	schedulerv1 "agentenv/services/api/proto"
+)
 
 type Node struct {
 	ID       string `json:"node_id"`
@@ -12,6 +16,12 @@ type Node struct {
 type RichNode struct {
 	Node
 	Snapshot *schedulerv1.NodeSnapshot // nil if no heartbeat received yet
+	// ObservedAt is when the node produced the snapshot. It releases a
+	// confirmed reservation only once the node's observed state is newer than
+	// the confirmation, closing the window between the gateway's 2xx and the
+	// heartbeat that counts the new sandbox. Zero when the snapshot has no
+	// known time.
+	ObservedAt time.Time
 	// Capacity carries the node's Kubernetes allocatable memory when a
 	// cluster-scoped node capacity provider is wired. Nil keeps the legacy
 	// memory_total math.

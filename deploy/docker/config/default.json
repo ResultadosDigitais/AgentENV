@@ -19,6 +19,8 @@
     "node_resource_limit": {
       "memory_capacity_source": "total",
       "shape_admission": "on",
+      "admission_reservation": "on",
+      "admission_reservation_ttl": "150s",
       "admission_layers": [
         {"memory_gb": 8},
         {"memory_gb": 16},
