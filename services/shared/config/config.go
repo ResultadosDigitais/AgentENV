@@ -153,17 +153,21 @@ const (
 	DefaultGatewayRequestTimeout = 30 * time.Second
 
 	// AdmissionReservationTTLMargin is how much longer than the gateway
-	// request timeout a reservation is held. It covers the settlement RPC,
-	// the heartbeat that reports the new sandbox, and a cold create whose
-	// image pull runs to the edge of the request timeout.
+	// request timeout a reservation is held. A cold 32 GiB create spends most
+	// of the request timeout pulling its image and booting; the margin covers
+	// that cold start, the settlement RPC and the heartbeat that reports the
+	// new sandbox, so a reservation never expires under a request still in
+	// flight.
 	AdmissionReservationTTLMargin = 60 * time.Second
 
 	// DefaultAdmissionReservationTTL applies when admission_reservation_ttl is
 	// absent. It is derived from the default request timeout plus the margin,
 	// so a slow create is not released while it still runs, and short enough
 	// that a lost gateway response stops consuming node capacity. A deployment
-	// that raises gateway.request_timeout must raise this key with it; the
-	// deploy parity test enforces that for the shipped configs.
+	// that raises gateway.request_timeout must raise this key with it:
+	// ValidateAdmissionReservationTTL refuses a TTL at or below the timeout,
+	// and the deploy parity test enforces the full margin for the shipped
+	// configs.
 	DefaultAdmissionReservationTTL = DefaultGatewayRequestTimeout + AdmissionReservationTTLMargin
 )
 
@@ -262,6 +266,31 @@ func (l *NodeResourceLimit) ResolvedAdmissionReservationTTL() time.Duration {
 		return DefaultAdmissionReservationTTL
 	}
 	return ttl
+}
+
+// ValidateAdmissionReservationTTL refuses a reservation TTL that does not
+// outlive the gateway request timeout. A TTL at or below request_timeout
+// expires while the gateway is still waiting for a cold 32 GiB create to pull
+// its image, so the reservation would stop projecting before the request it
+// protects settles and two creates could once again pass together.
+func (l *NodeResourceLimit) ValidateAdmissionReservationTTL(requestTimeout time.Duration) error {
+	if l == nil || l.AdmissionReservationTTL == nil {
+		return nil
+	}
+	ttl, err := time.ParseDuration(strings.TrimSpace(*l.AdmissionReservationTTL))
+	if err != nil {
+		return fmt.Errorf("scheduler.node_resource_limit.admission_reservation_ttl must be a duration, got %q", *l.AdmissionReservationTTL)
+	}
+	if requestTimeout <= 0 {
+		requestTimeout = DefaultGatewayRequestTimeout
+	}
+	if ttl <= requestTimeout {
+		return fmt.Errorf(
+			"scheduler.node_resource_limit.admission_reservation_ttl (%s) must exceed gateway.request_timeout (%s) so a cold create keeps its reservation until the gateway settles it",
+			ttl, requestTimeout,
+		)
+	}
+	return nil
 }
 
 // ResolvedAdmissionMode returns the configured mode, defaulting to nominal.
@@ -748,6 +777,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")
 		}
 		if err := c.Scheduler.NodeResourceLimit.Validate(); err != nil {
+			return err
+		}
+		if err := c.Scheduler.NodeResourceLimit.ValidateAdmissionReservationTTL(c.Gateway.RequestTimeout); err != nil {
 			return err
 		}
 		switch strings.ToLower(strings.TrimSpace(c.Scheduler.Discovery.Mode)) {

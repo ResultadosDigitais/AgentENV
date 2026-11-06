@@ -82,6 +82,41 @@ func TestNodeResourceLimitAdmissionReservationParsesJSON(t *testing.T) {
 	}
 }
 
+// A TTL at or below the gateway request timeout expires while the request it
+// protects is still in flight, so the config must refuse it.
+func TestNodeResourceLimitValidateAdmissionReservationTTL(t *testing.T) {
+	str := func(v string) *string { return &v }
+	const requestTimeout = 90 * time.Second
+	cases := []struct {
+		name  string
+		limit NodeResourceLimit
+		ok    bool
+	}{
+		{"absent", NodeResourceLimit{}, true},
+		{"below request timeout", NodeResourceLimit{AdmissionReservationTTL: str("89s")}, false},
+		{"at request timeout", NodeResourceLimit{AdmissionReservationTTL: str("90s")}, false},
+		{"just above request timeout", NodeResourceLimit{AdmissionReservationTTL: str("91s")}, true},
+		{"with margin", NodeResourceLimit{AdmissionReservationTTL: str("150s")}, true},
+		{"unparsable", NodeResourceLimit{AdmissionReservationTTL: str("60")}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.limit.ValidateAdmissionReservationTTL(requestTimeout)
+			if (err == nil) != tc.ok {
+				t.Fatalf("ValidateAdmissionReservationTTL() = %v, want ok=%v", err, tc.ok)
+			}
+		})
+	}
+	var nilLimit *NodeResourceLimit
+	if err := nilLimit.ValidateAdmissionReservationTTL(requestTimeout); err != nil {
+		t.Fatalf("nil limit must validate: %v", err)
+	}
+	// A non-positive timeout falls back to the default request timeout.
+	if err := (&NodeResourceLimit{AdmissionReservationTTL: str("29s")}).ValidateAdmissionReservationTTL(0); err == nil {
+		t.Fatal("a TTL at or below the default request timeout must be refused")
+	}
+}
+
 func TestNodeResourceLimitValidateAdmissionReservation(t *testing.T) {
 	str := func(v string) *string { return &v }
 	cases := []struct {

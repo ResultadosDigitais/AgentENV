@@ -573,10 +573,13 @@ func TestReservationProjectionFeedsShadowNominalDecision(t *testing.T) {
 		MemoryTotalBytes:     100 * gib,
 		AllocatedMemoryBytes: 60 * gib,
 		MemoryUsedBytes:      60 * gib,
+		// The request sum stays under the ceiling, so only the allocated
+		// figure can reject the node and the two verdicts genuinely diverge.
+		RequestedMemoryBytes: 10 * gib,
 		CpuCount:             16,
 	}
 	// A shapeless create skips filterByShape, so only the nominal resource
-	// limit can reject the node. The 16 GiB reservation takes it to 76%.
+	// limit can reject the node. The 16 GiB reservation takes allocated to 76%.
 	shapeless := &schedulerv1.ScheduleRequestHint{Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
 		NewSandbox: &schedulerv1.NewSandboxHint{Metadata: map[string]string{"k": "v"}},
 	}}
@@ -584,8 +587,21 @@ func TestReservationProjectionFeedsShadowNominalDecision(t *testing.T) {
 	service := newReservationService(t, limit, true, nil, "node-a")
 	heartbeatSnapshot(t, service, "node-a", observed, nil, nil)
 	service.reservations.Reserve("node-a", 16*gib, 4, 1, "")
+
+	// The projected node is rejected by the effective decision, and the shadow
+	// comparison proves it was the nominal verdict (allocated 76%) doing the
+	// rejecting while the logged request verdict (requested 26%) would admit.
+	// A projection that reached only the observer would leave nominal at 60%.
+	projected := service.projectReservations([]RichNode{service.richNode("node-a")})
+	admitted, events := shadowRun(projected, limit)
+	if len(admitted) != 0 {
+		t.Fatalf("shadow mode must reject the node on the projected nominal verdict, got %d admitted nodes", len(admitted))
+	}
+	if len(events) != 1 || events[0] != (shadowEvent{"node-a", false, true}) {
+		t.Fatalf("shadow divergence = %+v, want node-a nominal=false request=true", events)
+	}
 	if _, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{Hint: shapeless}); status.Code(err) != codes.Unavailable {
-		t.Fatalf("shadow mode must reject the node on the projected nominal verdict, got %v", err)
+		t.Fatalf("shadow mode must refuse the create on the projected nominal verdict, got %v", err)
 	}
 
 	// Negative control: without the reservation the same nominal verdict

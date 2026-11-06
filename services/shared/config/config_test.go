@@ -99,6 +99,34 @@ func TestValidateAcceptsSupportedLogFormats(t *testing.T) {
 	}
 }
 
+// The scheduler refuses to boot with a reservation TTL that does not outlive
+// the gateway request timeout, so a config change that only lowers the TTL
+// cannot silently reintroduce the concurrent overcommit.
+func TestValidateRejectsAdmissionReservationTTLNotOutlivingGatewayRequestTimeout(t *testing.T) {
+	ttl := func(v string) *string { return &v }
+	cases := []struct {
+		name string
+		ttl  string
+		ok   bool
+	}{
+		{"below request timeout", "89s", false},
+		{"at request timeout", "90s", false},
+		{"above request timeout", "91s", true},
+		{"with margin", "150s", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultConfig("scheduler")
+			cfg.Gateway.RequestTimeout = 90 * time.Second
+			cfg.Scheduler.NodeResourceLimit = &NodeResourceLimit{AdmissionReservationTTL: ttl(tc.ttl)}
+			err := cfg.Validate()
+			if (err == nil) != tc.ok {
+				t.Fatalf("Validate() = %v, want ok=%v", err, tc.ok)
+			}
+		})
+	}
+}
+
 func TestLoadParsesGatewayRequestTimeoutDurationString(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")
