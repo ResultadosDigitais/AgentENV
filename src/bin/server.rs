@@ -86,6 +86,10 @@ async fn main() -> anyhow::Result<()> {
     // and inherited fds that pin the RocksDB LOCK of the persisted-sandbox
     // store.
     agentenv::setup::reap_orphaned_runtime_processes(config).await?;
+    // Per-VM memory cgroups; after the reap so stale ones are empty. Runs
+    // before the CPU quota, which nests each VMM's threaded CPU cgroup under
+    // the VM's memory domain.
+    agentenv::sandbox::MemoryContainment::init_global(config.memory_containment.enabled);
     // Per-sandbox CPU quota cgroups; after the reap so stale ones are empty.
     agentenv::sandbox::CpuQuota::init_global(config.resize.enabled && config.resize.cpu_quota);
     let api_key = ApiKey::resolve(config)?;

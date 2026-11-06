@@ -83,6 +83,7 @@
 - [System Architecture](./internals/architecture.md)
 - [Sandbox Network Architecture](./internals/networking.md)
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)
+- [Memory Containment](./internals/memory-containment.md)
 - [Template Builder and Testing](./internals/template-builder-testing.md)
 - [BuildKit Template Builds](./internals/buildkit-template-builds.md)
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)

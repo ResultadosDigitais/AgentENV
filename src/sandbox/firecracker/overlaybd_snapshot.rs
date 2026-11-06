@@ -1455,6 +1455,7 @@ async fn publish_memory_overlaybd_layer(
     output_path: &Path,
     mode: OverlaybdCompactOutput,
     concurrency: usize,
+    drop_page_cache: bool,
 ) -> Result<()> {
     let lower_tmp = output_path.with_extension("commit.tmp");
     let build_result = async {
@@ -1474,6 +1475,9 @@ async fn publish_memory_overlaybd_layer(
                     output_path.display()
                 )
             })?;
+        if drop_page_cache {
+            drop_page_cache_after_write(output_path).await?;
+        }
         Ok(())
     }
     .await;
@@ -1482,6 +1486,26 @@ async fn publish_memory_overlaybd_layer(
         let _ = tokio::fs::remove_file(&lower_tmp).await;
     }
     build_result
+}
+
+/// Sync a sealed memory layer and tell the kernel its page cache can be
+/// dropped, so the bytes the snapshot just wrote stop counting toward the
+/// runtime pod's working set.
+///
+/// `POSIX_FADV_DONTNEED` frees only clean pages, so the sync is what makes the
+/// hint effective; it is also the option's cost, which the node measurement has
+/// to price into pause time.
+async fn drop_page_cache_after_write(path: &Path) -> Result<()> {
+    let file = LocalFile::open_ro(path)
+        .with_context(|| format!("open {} to drop its page cache", path.display()))?;
+    file.sync()
+        .await
+        .with_context(|| format!("sync {}", path.display()))?;
+    // `evict_all` already degrades to a no-op on a platform without
+    // `posix_fadvise`; a real errno failure still propagates.
+    file.evict_all()
+        .await
+        .with_context(|| format!("drop page cache of {}", path.display()))
 }
 
 fn checked_i64_to_u64(value: i64, field: &str) -> Result<u64> {
@@ -1574,6 +1598,7 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     dirty_ranges: &DirtyMemoryRanges,
     output_dir: &Path,
     mode: OverlaybdCompactOutput,
+    drop_page_cache: bool,
 ) -> Result<(PathBuf, u64)> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -1590,6 +1615,7 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
         &data_path,
         mode,
         DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
+        drop_page_cache,
     )
     .await
     .context("compact dirty memory ranges as overlaybd layer")?;
@@ -2973,6 +2999,7 @@ mod tests {
             &output,
             OverlaybdCompactOutput::Raw,
             1,
+            false,
         )
         .await
         .expect_err("copy failure should be returned");
@@ -2981,6 +3008,26 @@ mod tests {
         assert_eq!(
             tokio::fs::read(&output).await.expect("read final"),
             existing
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_page_cache_after_write_keeps_the_layer_readable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("memory.commit");
+        let payload = vec![7u8; 64 * 1024];
+        tokio::fs::write(&path, &payload)
+            .await
+            .expect("write layer");
+
+        drop_page_cache_after_write(&path)
+            .await
+            .expect("drop page cache");
+
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read layer"),
+            payload,
+            "the eviction hint must never change what a read returns"
         );
     }
 }

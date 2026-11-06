@@ -287,6 +287,15 @@ The virtio-balloon device a VM gets when it first boots (cold starts and templat
 | `deflate_on_oom` | boolean | `true` | Let the guest take balloon memory back under memory pressure. `true` makes a memory limit below the VM shape advisory; `false` enforces it, so a guest that outgrows the limit OOM-kills inside it |
 | `stats_polling_interval_s` | integer | `0` | Balloon statistics polling interval in seconds; `0` disables them. Without statistics the resources API reports the balloon target but not how much memory the balloon actually holds |
 
+## `[memory_containment]`
+
+One cgroup v2 domain per microVM. The memory controller only distributes to domain children and a cgroup that holds processes cannot delegate it, so startup moves the runtime's own processes into a leaf before preparing the subtree. If the node cannot provide it, the reason is logged and the runtime keeps the shared-pod behavior. See [Memory containment](../internals/memory-containment.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Give every VMM its own cgroup v2 domain with `memory.max` equal to the VM shape and `memory.high` below it, so node memory pressure throttles or kills one VM instead of evicting the runtime pod |
+| `memory_high_ratio` | number | unset | `memory.high` as a fraction of `memory.max`, strictly between 0 and 1. Required when `enabled` is true; the fraction is measured per node, so there is no default |
+
 ## `[resize]`
 
 Per-sandbox CPU and memory inside the VM shape: `cpuCount`/`memoryMB` on snapshot-based creates and live resize through `PATCH /sandboxes/{sandboxID}/resources`. See [Sandbox Resources](../concepts/sandboxes/resources.md).
@@ -745,6 +754,7 @@ the default path on every startup.
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
 | `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
+| `drop_page_cache_after_write` | bool | `false` | After a memory snapshot layer is sealed, sync it and drop its page cache (`posix_fadvise(DONTNEED)`) so the snapshot write stops counting toward the runtime pod's working set. Adds an fsync to the pause path |
 
 ## `[memory_snapshot.background_download]`
 
