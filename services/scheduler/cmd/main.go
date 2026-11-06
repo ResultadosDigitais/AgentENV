@@ -68,17 +68,25 @@ func main() {
 			registry.Set(nodes, nil)
 		}
 
-		svc := scheduler.NewService(
-			logger,
-			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
-			store,
+		options := []scheduler.ServiceOption{
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
 				cfg.Scheduler.ArtifactLookupNodeLimit,
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
 			scheduler.WithNodeCapacityProvider(capacitySource),
+		}
+		if cfg.Scheduler.NodeResourceLimit.AdmissionReservationEnabled() {
+			options = append(options, scheduler.WithAdmissionReservation(
+				cfg.Scheduler.NodeResourceLimit.ResolvedAdmissionReservationTTL(),
+			))
+		}
+		svc := scheduler.NewService(
+			logger,
+			registry,
+			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			store,
+			options...,
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)

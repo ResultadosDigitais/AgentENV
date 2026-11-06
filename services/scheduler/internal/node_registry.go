@@ -26,6 +26,11 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// PeekObservedAt returns the same snapshot plus when the node produced it
+	// (snapshot.reported_at_unix_ms, falling back to the heartbeat receipt
+	// time). A confirmed admission reservation is held until this time is
+	// after the confirmation.
+	PeekObservedAt(nodeID string) (*schedulerv1.NodeSnapshot, time.Time)
 	// PausedSandboxResources returns the persisted shape of one paused sandbox
 	// as reported by its owner's latest heartbeat.
 	PausedSandboxResources(nodeID string, sandboxID string) (cpuCount uint32, memoryBytes uint64, ok bool)
@@ -337,17 +342,38 @@ func (r *AtomicNodeRegistry) GetObserved(nodeID string, clusterID string, now ti
 }
 
 func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapshot {
+	snapshot, _ := r.PeekObservedAt(nodeID)
+	return snapshot
+}
+
+// PeekObservedAt returns the snapshot together with the time the node produced
+// it. The node's own reported_at_unix_ms is authoritative when present; the
+// heartbeat receipt time is the fallback for nodes that do not report it.
+func (r *AtomicNodeRegistry) PeekObservedAt(nodeID string) (*schedulerv1.NodeSnapshot, time.Time) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	record, ok := r.observed[nodeID]
 	if !ok || record.node == nil {
-		return nil
+		return nil, time.Time{}
 	}
 	snapshot := record.node.GetSnapshot()
 	if snapshot == nil {
-		return nil
+		return nil, time.Time{}
 	}
-	return cloneSnapshot(snapshot)
+	return cloneSnapshot(snapshot), observedAtOf(snapshot, record.node.GetLastSeenUnixMs())
+}
+
+// observedAtOf resolves when a snapshot was produced, preferring the node's
+// own report time and falling back to the time the scheduler received the
+// heartbeat. A zero return means the snapshot has no usable time.
+func observedAtOf(snapshot *schedulerv1.NodeSnapshot, lastSeenUnixMs int64) time.Time {
+	if ms := snapshot.GetReportedAtUnixMs(); ms > 0 {
+		return time.UnixMilli(ms)
+	}
+	if lastSeenUnixMs > 0 {
+		return time.UnixMilli(lastSeenUnixMs)
+	}
+	return time.Time{}
 }
 
 // pausedSandboxesFromHeartbeat indexes the heartbeat's paused shapes by

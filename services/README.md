@@ -99,6 +99,8 @@ General config notes:
 - `scheduler.binding_ttl` must be a duration string such as `"30s"` in JSON config files.
 - `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy.
 - `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
+- `scheduler.node_resource_limit.admission_reservation` (`"on"`/`"off"`, default `"on"`) reserves the shape of every admitted create and resume until the gateway settles it, so simultaneous decisions cannot both see the same free capacity. A failed settle releases it immediately; a confirmed one is held until the node reports a snapshot produced after the confirmation, so the gap before the next heartbeat cannot admit another create into the same space.
+- `scheduler.node_resource_limit.admission_reservation_ttl` (duration, default `"90s"`) is the backstop that bounds how long a reservation keeps occupying node capacity. Set it to `gateway.request_timeout` plus 60s: the shipped configs use `"150s"` over the 90s gateway timeout, which covers the settlement RPC and a cold create with an image pull.
 - `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts either `host:port` or a Redis URL such as `redis://[:password@]host:6379/db`.
 - `--query-only` starts a read-only scheduler that supports only `LookupNode`; it requires `scheduler.redis_addr` and does not need node discovery config.
 - `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.

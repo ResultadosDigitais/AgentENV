@@ -134,6 +134,8 @@ func parseNewColdSandboxHint(body []byte) *schedulerv1.NewColdSandboxHint {
 // newSandboxBody mirrors the subset of NewSandbox (src/api/openapi.yml) that is
 // relevant for scheduling.
 type newSandboxBody struct {
+	CPUCount uint32            `json:"cpuCount"`
+	MemoryMB uint64            `json:"memoryMB"`
 	Metadata map[string]string `json:"metadata"`
 }
 
@@ -149,6 +151,8 @@ func parseNewSandboxHint(body []byte) *schedulerv1.NewSandboxHint {
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return hint
 	}
+	hint.CpuCount = parsed.CPUCount
+	hint.MemoryMb = parsed.MemoryMB
 	hint.Metadata = parsed.Metadata
 	return hint
 }

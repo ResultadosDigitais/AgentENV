@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -253,6 +254,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
 	var scheduledShape *sandboxShape
+	// reservationID is the scheduler reservation made by the admission
+	// decision. It is settled once the upstream outcome is known so the node
+	// stops counting the in-flight shape.
+	reservationID := ""
 
 	if hasSandbox && resumeRequest {
 		resumeReq := &schedulerv1.ScheduleResumeRequest{
@@ -275,6 +280,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node = resp.GetNode()
+		reservationID = resp.GetReservationId()
 	} else if hasSandbox {
 		rpcStart := time.Now()
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
@@ -308,6 +314,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				CPUCount:    cold.GetCpuCount(),
 				MemoryBytes: cold.GetMemoryMb() << 20,
 			}
+		} else if sandbox := hint.GetNewSandbox(); sandbox != nil && sandbox.GetMemoryMb() > 0 {
+			scheduledShape = &sandboxShape{
+				CPUCount:    sandbox.GetCpuCount(),
+				MemoryBytes: sandbox.GetMemoryMb() << 20,
+			}
 		}
 		rpcStart := time.Now()
 		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
@@ -319,6 +330,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node = resp.GetNode()
+		reservationID = resp.GetReservationId()
 	}
 
 	s.logger.Debug("gateway routed request",
@@ -334,6 +346,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
 	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
 	if err != nil {
+		s.settleAdmission(r.Context(), reservationID, reservationOutcomeFailed)
 		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
 		return
 	}
@@ -360,6 +373,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
 			shape:            scheduledShape,
+			reservationID:    reservationID,
 		},
 	)
 }
@@ -390,6 +404,9 @@ type proxyRequestOptions struct {
 	// under the sandbox ID the upstream returns so a later resume can project
 	// it before the heartbeat reports paused resources.
 	shape *sandboxShape
+	// reservationID is the scheduler reservation the admission decision made;
+	// it is settled with the upstream outcome.
+	reservationID string
 }
 
 func (s *Server) proxyRequest(
@@ -400,8 +417,16 @@ func (s *Server) proxyRequest(
 	node *schedulerv1.Node,
 	options proxyRequestOptions,
 ) {
+	// ReverseProxy calls ErrorHandler after a ModifyResponse error, so the
+	// reservation is settled at most once per request with the first outcome.
+	var settleOnce sync.Once
+	settle := func(outcome string) {
+		settleOnce.Do(func() { s.settleAdmission(originalCtx, options.reservationID, outcome) })
+	}
+
 	upstreamURL, err := url.Parse(target)
 	if err != nil {
+		settle(reservationOutcomeFailed)
 		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
 		return
 	}
@@ -432,12 +457,19 @@ func (s *Server) proxyRequest(
 					resp.Header.Set(headerNodeID, nodeID)
 				}
 			}
+			// Settle with the status before anything that can fail: a 2xx
+			// upstream means the sandbox exists even if recording its binding
+			// fails afterwards.
+			settle(reservationOutcomeForStatus(resp.StatusCode))
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
 			}
 			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.Method, proxyReq.URL.Path, options.shape)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
+			// The reservation must not survive a request that never reached the
+			// upstream.
+			settle(reservationOutcomeFailed)
 			if errors.Is(err, context.Canceled) {
 				logLevel := zap.WarnLevel
 				if isStreamInputProxyRequest(proxyReq) {

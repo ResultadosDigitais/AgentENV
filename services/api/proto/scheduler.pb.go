@@ -359,7 +359,11 @@ func (x *NewColdSandboxHint) GetMetadata() map[string]string {
 type NewSandboxHint struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sandbox metadata key/value pairs parsed from the request body.
-	Metadata      map[string]string `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Requested shape when the body carries it; 0 means the template default
+	// applies and the scheduler can only reserve a slot.
+	CpuCount      uint32 `protobuf:"varint,2,opt,name=cpu_count,json=cpuCount,proto3" json:"cpu_count,omitempty"`
+	MemoryMb      uint64 `protobuf:"varint,3,opt,name=memory_mb,json=memoryMb,proto3" json:"memory_mb,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -399,6 +403,20 @@ func (x *NewSandboxHint) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *NewSandboxHint) GetCpuCount() uint32 {
+	if x != nil {
+		return x.CpuCount
+	}
+	return 0
+}
+
+func (x *NewSandboxHint) GetMemoryMb() uint64 {
+	if x != nil {
+		return x.MemoryMb
+	}
+	return 0
 }
 
 type ScheduleRequest struct {
@@ -446,8 +464,11 @@ func (x *ScheduleRequest) GetHint() *ScheduleRequestHint {
 }
 
 type ScheduleResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Node          *Node                  `protobuf:"bytes,1,opt,name=node,proto3" json:"node,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Node  *Node                  `protobuf:"bytes,1,opt,name=node,proto3" json:"node,omitempty"`
+	// Opaque reservation id the gateway settles once the create outcome is
+	// known. Empty when the reservation ledger is disabled.
+	ReservationId string `protobuf:"bytes,2,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -487,6 +508,13 @@ func (x *ScheduleResponse) GetNode() *Node {
 		return x.Node
 	}
 	return nil
+}
+
+func (x *ScheduleResponse) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
 }
 
 type ListNodesRequest struct {
@@ -1206,8 +1234,11 @@ type NodeAdmission struct {
 	// "allocatable" or "total".
 	CapacitySource string              `protobuf:"bytes,4,opt,name=capacity_source,json=capacitySource,proto3" json:"capacity_source,omitempty"`
 	Layers         []*AdmissionVerdict `protobuf:"bytes,5,rep,name=layers,proto3" json:"layers,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Shapes admitted and still in flight, already included in the verdicts.
+	ReservedMemoryBytes uint64 `protobuf:"varint,6,opt,name=reserved_memory_bytes,json=reservedMemoryBytes,proto3" json:"reserved_memory_bytes,omitempty"`
+	ReservedCpu         uint32 `protobuf:"varint,7,opt,name=reserved_cpu,json=reservedCpu,proto3" json:"reserved_cpu,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *NodeAdmission) Reset() {
@@ -1273,6 +1304,20 @@ func (x *NodeAdmission) GetLayers() []*AdmissionVerdict {
 		return x.Layers
 	}
 	return nil
+}
+
+func (x *NodeAdmission) GetReservedMemoryBytes() uint64 {
+	if x != nil {
+		return x.ReservedMemoryBytes
+	}
+	return 0
+}
+
+func (x *NodeAdmission) GetReservedCpu() uint32 {
+	if x != nil {
+		return x.ReservedCpu
+	}
+	return 0
 }
 
 type ObservedNode struct {
@@ -2619,7 +2664,10 @@ type ScheduleResumeResponse struct {
 	Admitted bool                   `protobuf:"varint,2,opt,name=admitted,proto3" json:"admitted,omitempty"`
 	// Closed admission reason (memory_allocated, memory_used, cpu, starting or
 	// disk); empty when admitted.
-	Reason        string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	Reason string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	// Opaque reservation id the gateway settles once the resume outcome is
+	// known. Empty when admitted with the reservation ledger disabled.
+	ReservationId string `protobuf:"bytes,4,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2675,6 +2723,103 @@ func (x *ScheduleResumeResponse) GetReason() string {
 	return ""
 }
 
+func (x *ScheduleResumeResponse) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
+}
+
+type SettleAdmissionRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ReservationId string                 `protobuf:"bytes,1,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
+	// Closed set: "confirmed" when the sandbox was created or resumed,
+	// "failed" when the upstream rejected it or the request never completed.
+	Outcome       string `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SettleAdmissionRequest) Reset() {
+	*x = SettleAdmissionRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SettleAdmissionRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SettleAdmissionRequest) ProtoMessage() {}
+
+func (x *SettleAdmissionRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SettleAdmissionRequest.ProtoReflect.Descriptor instead.
+func (*SettleAdmissionRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *SettleAdmissionRequest) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
+}
+
+func (x *SettleAdmissionRequest) GetOutcome() string {
+	if x != nil {
+		return x.Outcome
+	}
+	return ""
+}
+
+type SettleAdmissionResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SettleAdmissionResponse) Reset() {
+	*x = SettleAdmissionResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SettleAdmissionResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SettleAdmissionResponse) ProtoMessage() {}
+
+func (x *SettleAdmissionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SettleAdmissionResponse.ProtoReflect.Descriptor instead.
+func (*SettleAdmissionResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{43}
+}
+
 var File_api_proto_scheduler_proto protoreflect.FileDescriptor
 
 const file_api_proto_scheduler_proto_rawDesc = "" +
@@ -2695,16 +2840,19 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x95\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcf\x01\n" +
 	"\x0eNewSandboxHint\x12F\n" +
-	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x12\x1b\n" +
+	"\tcpu_count\x18\x02 \x01(\rR\bcpuCount\x12\x1b\n" +
+	"\tmemory_mb\x18\x03 \x01(\x04R\bmemoryMb\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"N\n" +
 	"\x0fScheduleRequest\x125\n" +
-	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hintJ\x04\b\x01\x10\x02\":\n" +
+	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hintJ\x04\b\x01\x10\x02\"a\n" +
 	"\x10ScheduleResponse\x12&\n" +
-	"\x04node\x18\x01 \x01(\v2\x12.scheduler.v1.NodeR\x04node\"\x12\n" +
+	"\x04node\x18\x01 \x01(\v2\x12.scheduler.v1.NodeR\x04node\x12%\n" +
+	"\x0ereservation_id\x18\x02 \x01(\tR\rreservationId\"\x12\n" +
 	"\x10ListNodesRequest\"=\n" +
 	"\x11ListNodesResponse\x12(\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x12.scheduler.v1.NodeR\x05nodes\"2\n" +
@@ -2761,13 +2909,15 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x10AdmissionVerdict\x12\x1b\n" +
 	"\tmemory_gb\x18\x01 \x01(\x04R\bmemoryGb\x12\x1a\n" +
 	"\badmitted\x18\x02 \x01(\bR\badmitted\x12\x16\n" +
-	"\x06reason\x18\x03 \x01(\tR\x06reason\"\x94\x02\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\"\xeb\x02\n" +
 	"\rNodeAdmission\x128\n" +
 	"\x18allocatable_memory_bytes\x18\x01 \x01(\x04R\x16allocatableMemoryBytes\x124\n" +
 	"\x16runtime_overhead_bytes\x18\x02 \x01(\x04R\x14runtimeOverheadBytes\x122\n" +
 	"\x15capacity_memory_bytes\x18\x03 \x01(\x04R\x13capacityMemoryBytes\x12'\n" +
 	"\x0fcapacity_source\x18\x04 \x01(\tR\x0ecapacitySource\x126\n" +
-	"\x06layers\x18\x05 \x03(\v2\x1e.scheduler.v1.AdmissionVerdictR\x06layers\"\xa0\x03\n" +
+	"\x06layers\x18\x05 \x03(\v2\x1e.scheduler.v1.AdmissionVerdictR\x06layers\x122\n" +
+	"\x15reserved_memory_bytes\x18\x06 \x01(\x04R\x13reservedMemoryBytes\x12!\n" +
+	"\freserved_cpu\x18\a \x01(\rR\vreservedCpu\"\xa0\x03\n" +
 	"\fObservedNode\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x1d\n" +
@@ -2870,11 +3020,16 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"cluster_id\x18\x02 \x01(\tR\tclusterId\x12\x1b\n" +
 	"\tcpu_count\x18\x03 \x01(\rR\bcpuCount\x12!\n" +
-	"\fmemory_bytes\x18\x04 \x01(\x04R\vmemoryBytes\"t\n" +
+	"\fmemory_bytes\x18\x04 \x01(\x04R\vmemoryBytes\"\x9b\x01\n" +
 	"\x16ScheduleResumeResponse\x12&\n" +
 	"\x04node\x18\x01 \x01(\v2\x12.scheduler.v1.NodeR\x04node\x12\x1a\n" +
 	"\badmitted\x18\x02 \x01(\bR\badmitted\x12\x16\n" +
-	"\x06reason\x18\x03 \x01(\tR\x06reason*\x92\x01\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12%\n" +
+	"\x0ereservation_id\x18\x04 \x01(\tR\rreservationId\"Y\n" +
+	"\x16SettleAdmissionRequest\x12%\n" +
+	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x12\x18\n" +
+	"\aoutcome\x18\x02 \x01(\tR\aoutcome\"\x19\n" +
+	"\x17SettleAdmissionResponse*\x92\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x1b\n" +
 	"\x17NODE_STATUS_UNSPECIFIED\x10\x00\x12\x15\n" +
@@ -2888,7 +3043,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x19SANDBOX_EVENT_TYPE_DELETE\x10\x02\x12\x1c\n" +
 	"\x18SANDBOX_EVENT_TYPE_PAUSE\x10\x03\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_RESUME\x10\x04\x12\x1b\n" +
-	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x052\x80\n" +
+	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x052\xe0\n" +
 	"\n" +
 	"\tScheduler\x12I\n" +
 	"\bSchedule\x12\x1d.scheduler.v1.ScheduleRequest\x1a\x1e.scheduler.v1.ScheduleResponse\x12L\n" +
@@ -2905,7 +3060,8 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x11LookupP2pArtifact\x12&.scheduler.v1.LookupP2pArtifactRequest\x1a'.scheduler.v1.LookupP2pArtifactResponse\x12F\n" +
 	"\aGetNode\x12\x1c.scheduler.v1.GetNodeRequest\x1a\x1d.scheduler.v1.GetNodeResponse\x12[\n" +
 	"\x0eUnregisterNode\x12#.scheduler.v1.UnregisterNodeRequest\x1a$.scheduler.v1.UnregisterNodeResponse\x12[\n" +
-	"\x0eScheduleResume\x12#.scheduler.v1.ScheduleResumeRequest\x1a$.scheduler.v1.ScheduleResumeResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
+	"\x0eScheduleResume\x12#.scheduler.v1.ScheduleResumeRequest\x1a$.scheduler.v1.ScheduleResumeResponse\x12^\n" +
+	"\x0fSettleAdmission\x12$.scheduler.v1.SettleAdmissionRequest\x1a%.scheduler.v1.SettleAdmissionResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
 
 var (
 	file_api_proto_scheduler_proto_rawDescOnce sync.Once
@@ -2920,7 +3076,7 @@ func file_api_proto_scheduler_proto_rawDescGZIP() []byte {
 }
 
 var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
+var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 46)
 var file_api_proto_scheduler_proto_goTypes = []any{
 	(NodeStatus)(0),                    // 0: scheduler.v1.NodeStatus
 	(SandboxEventType)(0),              // 1: scheduler.v1.SandboxEventType
@@ -2966,14 +3122,16 @@ var file_api_proto_scheduler_proto_goTypes = []any{
 	(*UnregisterNodeResponse)(nil),     // 41: scheduler.v1.UnregisterNodeResponse
 	(*ScheduleResumeRequest)(nil),      // 42: scheduler.v1.ScheduleResumeRequest
 	(*ScheduleResumeResponse)(nil),     // 43: scheduler.v1.ScheduleResumeResponse
-	nil,                                // 44: scheduler.v1.NewColdSandboxHint.MetadataEntry
-	nil,                                // 45: scheduler.v1.NewSandboxHint.MetadataEntry
+	(*SettleAdmissionRequest)(nil),     // 44: scheduler.v1.SettleAdmissionRequest
+	(*SettleAdmissionResponse)(nil),    // 45: scheduler.v1.SettleAdmissionResponse
+	nil,                                // 46: scheduler.v1.NewColdSandboxHint.MetadataEntry
+	nil,                                // 47: scheduler.v1.NewSandboxHint.MetadataEntry
 }
 var file_api_proto_scheduler_proto_depIdxs = []int32{
 	4,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
 	5,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
-	44, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
-	45, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
+	46, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
+	47, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
 	3,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
 	2,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
 	2,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
@@ -3011,22 +3169,24 @@ var file_api_proto_scheduler_proto_depIdxs = []int32{
 	38, // 38: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
 	40, // 39: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
 	42, // 40: scheduler.v1.Scheduler.ScheduleResume:input_type -> scheduler.v1.ScheduleResumeRequest
-	7,  // 41: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
-	9,  // 42: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
-	11, // 43: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
-	13, // 44: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
-	23, // 45: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
-	26, // 46: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
-	28, // 47: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
-	31, // 48: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
-	33, // 49: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
-	35, // 50: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
-	37, // 51: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
-	39, // 52: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
-	41, // 53: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
-	43, // 54: scheduler.v1.Scheduler.ScheduleResume:output_type -> scheduler.v1.ScheduleResumeResponse
-	41, // [41:55] is the sub-list for method output_type
-	27, // [27:41] is the sub-list for method input_type
+	44, // 41: scheduler.v1.Scheduler.SettleAdmission:input_type -> scheduler.v1.SettleAdmissionRequest
+	7,  // 42: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
+	9,  // 43: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
+	11, // 44: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
+	13, // 45: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
+	23, // 46: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
+	26, // 47: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
+	28, // 48: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
+	31, // 49: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
+	33, // 50: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
+	35, // 51: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
+	37, // 52: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
+	39, // 53: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
+	41, // 54: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
+	43, // 55: scheduler.v1.Scheduler.ScheduleResume:output_type -> scheduler.v1.ScheduleResumeResponse
+	45, // 56: scheduler.v1.Scheduler.SettleAdmission:output_type -> scheduler.v1.SettleAdmissionResponse
+	42, // [42:57] is the sub-list for method output_type
+	27, // [27:42] is the sub-list for method input_type
 	27, // [27:27] is the sub-list for extension type_name
 	27, // [27:27] is the sub-list for extension extendee
 	0,  // [0:27] is the sub-list for field type_name
@@ -3047,7 +3207,7 @@ func file_api_proto_scheduler_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_scheduler_proto_rawDesc), len(file_api_proto_scheduler_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   44,
+			NumMessages:   46,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

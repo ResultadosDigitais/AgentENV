@@ -15,6 +15,13 @@ import (
 	"go.uber.org/zap"
 )
 
+// Settlement outcomes accepted by SettleAdmission. This is the closed set
+// documented in scheduler.proto; the scheduler rejects anything else.
+const (
+	reservationOutcomeConfirmed = "confirmed"
+	reservationOutcomeFailed    = "failed"
+)
+
 func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath string, shape *sandboxShape) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
@@ -131,4 +138,48 @@ func recordAssignmentTimeout(requestTimeout time.Duration) time.Duration {
 		return requestTimeout
 	}
 	return maxRecordAssignmentTimeout
+}
+
+// settleAdmission releases the scheduler reservation an admitted create or
+// resume created. It is best-effort: a failed settlement only means the
+// reservation expires by its TTL, never that the proxied request fails. The
+// call gets its own timeout detached from the request context, so a client
+// that disconnects still lets the scheduler free the capacity.
+func (s *Server) settleAdmission(ctx context.Context, reservationID string, outcome string) {
+	if reservationID == "" {
+		return
+	}
+	settleCtx, cancelSettle := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		recordAssignmentTimeout(s.requestTimeout),
+	)
+	defer cancelSettle()
+
+	rpcStart := time.Now()
+	_, err := s.scheduler.SettleAdmission(settleCtx, &schedulerv1.SettleAdmissionRequest{
+		ReservationId: reservationID,
+		Outcome:       outcome,
+	})
+	recordGatewaySchedulerRPC("SettleAdmission", rpcStart, err)
+	if err != nil {
+		s.logger.Warn("settle admission reservation failed",
+			zap.String("reservation_id", reservationID),
+			zap.String("outcome", outcome),
+			zap.Error(err),
+		)
+		return
+	}
+	s.logger.Debug("gateway settled admission reservation",
+		zap.String("reservation_id", reservationID),
+		zap.String("outcome", outcome),
+	)
+}
+
+// reservationOutcomeForStatus maps the upstream status to the settlement
+// outcome: only a 2xx means the sandbox was created or resumed.
+func reservationOutcomeForStatus(statusCode int) string {
+	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+		return reservationOutcomeConfirmed
+	}
+	return reservationOutcomeFailed
 }

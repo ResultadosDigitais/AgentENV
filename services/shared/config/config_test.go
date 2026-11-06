@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -602,4 +603,94 @@ func TestLoadRejectsIncompleteKubernetesSchedulerDiscoveryConfig(t *testing.T) {
 	if _, err := Load(path, "scheduler"); err == nil {
 		t.Fatal("expected load to fail for incomplete kubernetes discovery config")
 	}
+}
+
+type deploySchedulerReservationConfig struct {
+	Scheduler struct {
+		NodeResourceLimit struct {
+			AdmissionReservationTTL string `json:"admission_reservation_ttl"`
+		} `json:"node_resource_limit"`
+	} `json:"scheduler"`
+}
+
+type deployGatewayTimeoutConfig struct {
+	Gateway struct {
+		RequestTimeout string `json:"request_timeout"`
+	} `json:"gateway"`
+}
+
+// The reservation TTL and the gateway request timeout live in separate config
+// files, so the tie is enforced here instead of left to a comment: a create
+// that runs to the gateway timeout must not lose its reservation before it
+// settles. A deployment that raises request_timeout must raise the TTL too.
+func TestDeployAdmissionReservationTTLOutlivesGatewayRequestTimeout(t *testing.T) {
+	deploy := filepath.Join("..", "..", "..", "deploy")
+	cases := []struct {
+		name          string
+		schedulerPath string
+		gatewayPath   string
+	}{
+		{
+			name:          "kubernetes",
+			schedulerPath: filepath.Join(deploy, "k8s", "base", "config", "scheduler.json"),
+			gatewayPath:   filepath.Join(deploy, "k8s", "base", "config", "gateway.json"),
+		},
+		{
+			name:          "docker",
+			schedulerPath: filepath.Join(deploy, "docker", "config", "default.json"),
+			gatewayPath:   filepath.Join(deploy, "docker", "config", "default.json"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ttl := readDeploySchedulerReservationTTL(t, tc.schedulerPath)
+			requestTimeout := readDeployGatewayRequestTimeout(t, tc.gatewayPath)
+			if want := AdmissionReservationTTLFor(requestTimeout); ttl < want {
+				t.Fatalf("admission_reservation_ttl = %s, want at least %s (gateway request_timeout %s + margin %s)",
+					ttl, want, requestTimeout, AdmissionReservationTTLMargin)
+			}
+		})
+	}
+}
+
+func readDeploySchedulerReservationTTL(t *testing.T, path string) time.Duration {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var cfg deploySchedulerReservationConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	value := cfg.Scheduler.NodeResourceLimit.AdmissionReservationTTL
+	if value == "" {
+		t.Fatalf("%s has no scheduler.node_resource_limit.admission_reservation_ttl", path)
+	}
+	ttl, err := time.ParseDuration(value)
+	if err != nil {
+		t.Fatalf("%s admission_reservation_ttl %q: %v", path, value, err)
+	}
+	return ttl
+}
+
+func readDeployGatewayRequestTimeout(t *testing.T, path string) time.Duration {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var cfg deployGatewayTimeoutConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	value := cfg.Gateway.RequestTimeout
+	if value == "" {
+		t.Fatalf("%s has no gateway.request_timeout", path)
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		t.Fatalf("%s gateway.request_timeout %q: %v", path, value, err)
+	}
+	return timeout
 }
