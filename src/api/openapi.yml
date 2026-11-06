@@ -1854,7 +1854,21 @@ components:
         code:
           type: integer
           format: int32
-          description: Error code
+          description: HTTP status code of the response
+        errorCode:
+          type: string
+          description: |
+            Stable, machine-readable code for the failure when the endpoint
+            refuses an operation on purpose, so a caller can classify it without
+            parsing the message. A pause refused because the paused-artifact
+            chain still exceeds a bound after compaction reports
+            `ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED` or
+            `CHAIN_BYTES_CEILING_EXCEEDED`; a compaction the node cannot finish
+            for lack of transient disk reports
+            `COMPACTION_HEADROOM_INSUFFICIENT`. All three are recoverable: the
+            sandbox stays Running and the pause can be retried after the bound
+            or the node capacity changes. Absent on failures that have no such
+            stable code.
         message:
           type: string
           description: Error
@@ -2429,7 +2443,17 @@ paths:
         "204":
           description: The sandbox was paused successfully and can be resumed
         "409":
-          $ref: "#/components/responses/409"
+          description: |
+            The sandbox cannot be paused from its current state, or the pause was
+            refused recoverably to protect the node: the paused-artifact chain is
+            still above its limit after compaction, or the compaction needs more
+            transient disk than the node has. A capacity refusal carries a stable
+            `errorCode` and leaves the sandbox Running, so the pause can be
+            retried once the limit or the node capacity changes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           $ref: "#/components/responses/404"
         "401":

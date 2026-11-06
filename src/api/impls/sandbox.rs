@@ -19,7 +19,7 @@ use crate::orchestrator::{
 };
 use crate::prometheus::SandboxStageTimer;
 use crate::sandbox::custom_extension::HookStatusError;
-use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
+use crate::sandbox::{normalize_mount_path, pause_refusal_code, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
@@ -58,6 +58,26 @@ fn hook_client_error_message(err: &OrchestratorError) -> Option<String> {
     hook_status_error(err)
         .filter(|hook_err| hook_err.is_client_error())
         .map(ToString::to_string)
+}
+
+/// The typed, recoverable pause refusal carried by an orchestrator error.
+///
+/// A pause the node declines on purpose — the paused-artifact chain is still
+/// above a bound after compaction, or the compaction lacks transient disk — is
+/// a capacity conflict, not a server failure: the sandbox stays Running and the
+/// caller may retry. Returning `409` with the stable code lets the platform
+/// classify it without parsing the message, and the platform-side mapping is
+/// deliberately out of this change.
+fn pause_refusal_error(err: &OrchestratorError) -> Option<models::Error> {
+    let OrchestratorError::SandboxOperationFailed { source, .. } = err else {
+        return None;
+    };
+    let error_code = pause_refusal_code(source)?;
+    Some(ApiImpl::error_with_code(
+        409,
+        error_code,
+        format!("sandbox pause refused: {source:#}"),
+    ))
 }
 
 fn default_sandbox_timeout() -> Duration {
@@ -1970,9 +1990,14 @@ impl Sandboxes<()> for ApiImpl {
                     format!("sandbox cannot be paused from {} state", state),
                 )),
             ),
-            Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
-                err.into(),
-            )),
+            Err(err) => match pause_refusal_error(&err) {
+                Some(refusal) => {
+                    Ok(SandboxesSandboxIdPausePostResponse::Status409_Conflict(refusal))
+                }
+                None => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
+                    err.into(),
+                )),
+            },
         }
     }
 
@@ -2376,6 +2401,47 @@ mod tests {
         assert!(hook_err.is_server_error());
         // A 5xx hook failure must not be classified as a client error.
         assert!(hook_client_error_message(&err).is_none());
+    }
+
+    /// A recoverable pause refusal is a capacity conflict with a stable code,
+    /// never a bare 500: the platform maps on `errorCode` instead of parsing
+    /// the message.
+    #[test]
+    fn pause_refusal_maps_to_409_with_the_stable_code() {
+        for limit in [
+            crate::sandbox::PausedChainLimit::ChainBytesCeiling,
+            crate::sandbox::PausedChainLimit::RootfsDiskMultiple,
+        ] {
+            let error = OrchestratorError::SandboxOperationFailed {
+                sandbox_id: SandboxId::new(),
+                operation: SandboxOperation::Pause,
+                source: crate::sandbox::paused_chain_limit_error(limit, 100, 50)
+                    .context("snapshot overlaybd runtime state to persistent dir"),
+            };
+            let refusal = pause_refusal_error(&error).expect("a chain refusal must map to a 409");
+            assert_eq!(refusal.code, 409);
+            assert_eq!(refusal.error_code.as_deref(), Some(limit.as_str()));
+            assert!(
+                refusal.message.contains(limit.as_str()),
+                "the message keeps the named code: {}",
+                refusal.message
+            );
+            let OrchestratorError::SandboxOperationFailed { source, .. } = &error else {
+                panic!("the test constructs a pause failure");
+            };
+            assert!(
+                crate::sandbox::pause_refusal_code(source).is_some(),
+                "the code must survive the context wrapping"
+            );
+        }
+
+        // Any other orchestrator failure keeps the existing 500 mapping.
+        let other = OrchestratorError::SandboxOperationFailed {
+            sandbox_id: SandboxId::new(),
+            operation: SandboxOperation::Pause,
+            source: anyhow::anyhow!("boom"),
+        };
+        assert!(pause_refusal_error(&other).is_none());
     }
 
     #[test]

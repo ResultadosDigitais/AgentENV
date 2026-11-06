@@ -251,6 +251,12 @@ auto_resume_min_sandbox_timeout_secs = 300
 # unreferenced files from stale generations. 0 disables both. PROVISIONAL:
 # 51539607552 (48 GiB) comes from the OPSAI-5494 staging measurement.
 chain_bytes_ceiling = 51539607552
+# Multiple of the guest rootfs disk that bounds the whole deduplicated rootfs
+# chain (stable prefix plus runtime-owned generations). A pause over it compacts
+# the runtime-owned suffix and refuses recoverably only when the whole chain is
+# still above it. 0 disables the bound. 2 is the floor for a fully allocated
+# disk; the p-1 measurement confirms it.
+rootfs_chain_disk_multiple = 2
 # Periodic sweep of persisted-sandboxes/artifacts/ reclaiming a directory no
 # record and no cluster list names any more: "off", "report" (list and count
 # only) or "enforce" (move to artifacts/.trash/, delete after a second grace).

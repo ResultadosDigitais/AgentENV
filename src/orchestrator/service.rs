@@ -15,7 +15,7 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
-    is_chain_bytes_ceiling_exceeded, CustomExtensionClient, CustomExtensionParams, EnvdAccessToken,
+    is_paused_chain_limit_exceeded, CustomExtensionClient, CustomExtensionParams, EnvdAccessToken,
     EnvdApi, FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState,
     ResourceLimitPlan, ResourceLimitStatus, RuntimeArtifactSet, SandboxAccessTokenGenerator,
     SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec,
@@ -1635,16 +1635,16 @@ where
                             &[SandboxState::Pausing],
                         )
                         .await;
-                    // The chain-ceiling refusal is measured in the backend, but
+                    // The paused-chain refusal is measured in the backend, but
                     // the paused-sandbox count that decides the 48 GiB question
                     // lives only here, where the metadata store is. One log line
                     // per refusal carries it beside the named code, so the
                     // seven-day measurement reads a single query:
-                    //   message =~ "CHAIN_BYTES_CEILING_EXCEEDED"
-                    // joined on the same `observed_bytes` / `ceiling_bytes`
+                    //   message =~ "CHAIN_BYTES_CEILING_EXCEEDED|ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED"
+                    // joined on the same `observed_bytes` / `limit_bytes`
                     // fields the backend line emits. The id is a field, never a
                     // metric label.
-                    if is_chain_bytes_ceiling_exceeded(err.inner()) {
+                    if is_paused_chain_limit_exceeded(err.inner()) {
                         let paused_sandboxes = self
                             .metrics_snapshot()
                             .await

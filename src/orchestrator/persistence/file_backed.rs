@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -290,10 +290,16 @@ impl FileBackedSandboxPersister {
     /// Each pause writes a new generation whose files are hardlinks of the
     /// previous ones, so freeing an old generation's directory releases nothing
     /// while a newer generation still links its files. What does accumulate is
-    /// the *unshared* part of every generation, and that is exactly what a link
-    /// count of 1 identifies: a file with more than one link is still reachable
-    /// from a newer generation, and may also be held open by a resumed VM or a
-    /// fork child. `artifact_root` itself is never touched.
+    /// the part no retained generation reaches: a file whose every link lives in
+    /// the swept (stale) generation set. Counting a link count of 1 was only the
+    /// single-generation case of that rule; an inode hardlinked between two
+    /// stale generations and no longer referenced by the newest one stayed
+    /// forever because its link count was 2. The first pass therefore counts the
+    /// entries per `(dev, ino)` across the swept set, and a file is deleted only
+    /// when its `nlink` equals that observed count. A larger `nlink` means
+    /// another link lives outside the set — in the newest generation, a fork
+    /// child's directory or a live runtime — so the file is kept. `artifact_root`
+    /// itself is never touched, and neither is a non-regular file.
     async fn sweep_stale_generations(
         &self,
         artifact_root: &Path,
@@ -314,7 +320,7 @@ impl FileBackedSandboxPersister {
                 ));
             }
         };
-        let mut reclaimed_bytes = 0u64;
+        let mut stale_generations = Vec::new();
         while let Some(entry) = entries.next_entry().await.map_err(|source| {
             SandboxPersistenceError::io("scan paused sandbox generations", &sandbox_root, source)
         })? {
@@ -329,11 +335,25 @@ impl FileBackedSandboxPersister {
                     source,
                 )
             })?;
-            if !file_type.is_dir() {
-                continue;
+            if file_type.is_dir() {
+                stale_generations.push(generation);
             }
-            reclaimed_bytes =
-                reclaimed_bytes.saturating_add(Self::sweep_unlinked_files(&generation).await?);
+        }
+        if stale_generations.is_empty() {
+            return Ok(());
+        }
+
+        // First pass: how many links each inode has inside the swept set.
+        let mut links_in_swept_set = HashMap::new();
+        for generation in &stale_generations {
+            Self::count_links_in_directory(generation, &mut links_in_swept_set).await?;
+        }
+
+        let mut reclaimed_bytes = 0u64;
+        for generation in &stale_generations {
+            reclaimed_bytes = reclaimed_bytes.saturating_add(
+                Self::sweep_unlinked_files(generation, &mut links_in_swept_set).await?,
+            );
         }
         if reclaimed_bytes > 0 {
             metrics::counter!("agentenv_paused_sandbox_chain_reclaimed_bytes_total")
@@ -348,11 +368,56 @@ impl FileBackedSandboxPersister {
         Ok(())
     }
 
-    /// Delete regular files under `generation` whose link count is exactly 1,
-    /// then remove every directory the deletions left empty, deepest first, up
-    /// to and including `generation` itself. Returns freed bytes.
-    async fn sweep_unlinked_files(generation: &Path) -> PersistenceResult<u64> {
-        let (reclaimed, emptied) = Self::sweep_directory(generation).await?;
+    /// Count the regular-file entries per `(dev, ino)` under one stale
+    /// generation, so the sweep can tell an inode whose every link is in the
+    /// swept set from one another generation or runtime still reaches.
+    async fn count_links_in_directory(
+        directory: &Path,
+        counts: &mut HashMap<(u64, u64), u64>,
+    ) -> PersistenceResult<()> {
+        let mut entries = match fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "scan stale paused sandbox generation",
+                    directory,
+                    source,
+                ));
+            }
+        };
+        while let Some(entry) = entries.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan stale paused sandbox generation", directory, source)
+        })? {
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "inspect stale paused sandbox artifact",
+                        &path,
+                        source,
+                    ));
+                }
+            };
+            if metadata.is_dir() {
+                Box::pin(Self::count_links_in_directory(&path, counts)).await?;
+            } else if metadata.is_file() {
+                *counts.entry((metadata.dev(), metadata.ino())).or_insert(0) += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete regular files under `generation` whose every link lives in the
+    /// swept set, then remove every directory the deletions left empty, deepest
+    /// first, up to and including `generation` itself. Returns freed bytes.
+    async fn sweep_unlinked_files(
+        generation: &Path,
+        links_in_swept_set: &mut HashMap<(u64, u64), u64>,
+    ) -> PersistenceResult<u64> {
+        let (reclaimed, emptied) = Self::sweep_directory(generation, links_in_swept_set).await?;
         if emptied {
             Self::remove_emptied_directory(generation).await?;
         }
@@ -363,7 +428,10 @@ impl FileBackedSandboxPersister {
     /// directory itself, so a parent is only reported empty after its children
     /// have been removed. Returns freed bytes and whether `directory` ended up
     /// empty (which the caller turns into a removal).
-    async fn sweep_directory(directory: &Path) -> PersistenceResult<(u64, bool)> {
+    async fn sweep_directory(
+        directory: &Path,
+        links_in_swept_set: &mut HashMap<(u64, u64), u64>,
+    ) -> PersistenceResult<(u64, bool)> {
         let mut entries = match fs::read_dir(directory).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, true)),
@@ -394,7 +462,7 @@ impl FileBackedSandboxPersister {
             };
             if metadata.is_dir() {
                 let (child_reclaimed, child_emptied) =
-                    Box::pin(Self::sweep_directory(&path)).await?;
+                    Box::pin(Self::sweep_directory(&path, links_in_swept_set)).await?;
                 reclaimed = reclaimed.saturating_add(child_reclaimed);
                 if child_emptied {
                     Self::remove_emptied_directory(&path).await?;
@@ -403,17 +471,38 @@ impl FileBackedSandboxPersister {
                 }
                 continue;
             }
-            // Only regular files with a single link are unreferenced. A
-            // symlink, socket or device may be something a live runtime still
-            // points at, so it is left alone as well.
-            if !metadata.is_file() || metadata.nlink() != 1 {
+            // Only regular files whose every link lives in the swept set are
+            // unreferenced. A symlink, socket or device may be something a live
+            // runtime still points at, so it is left alone as well.
+            if !metadata.is_file() {
+                emptied = false;
+                continue;
+            }
+            let inode = (metadata.dev(), metadata.ino());
+            let links_seen = links_in_swept_set.get(&inode).copied().unwrap_or(0);
+            if metadata.nlink() != links_seen {
                 emptied = false;
                 continue;
             }
             let allocated = metadata.blocks().saturating_mul(ALLOCATION_BLOCK_SIZE);
             match fs::remove_file(&path).await {
-                Ok(()) => reclaimed = reclaimed.saturating_add(allocated),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(()) => {
+                    reclaimed = reclaimed.saturating_add(allocated);
+                    // The removal already dropped `nlink` for the sibling links
+                    // this sweep is about to visit; decrement the observed count
+                    // in lockstep so the next stale link is still recognized as
+                    // fully inside the swept set. Without this a second stale
+                    // link would see `nlink == 1` against `links_seen == 2` and
+                    // the inode would never be freed.
+                    if let Some(seen) = links_in_swept_set.get_mut(&inode) {
+                        *seen = seen.saturating_sub(1);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(seen) = links_in_swept_set.get_mut(&inode) {
+                        *seen = seen.saturating_sub(1);
+                    }
+                }
                 Err(source) => {
                     return Err(SandboxPersistenceError::io(
                         "remove unreferenced stale paused sandbox artifact",
@@ -1424,6 +1513,136 @@ mod tests {
                     stale.display()
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Two stale generations that share one inode and that the newest generation
+    /// no longer references are reclaimed together.
+    ///
+    /// Under the old `nlink == 1` rule neither link was ever deleted: each one
+    /// saw the other and neither generation's directory could ever empty. With
+    /// the observed-link count both are inside the swept set, so the inode is
+    /// freed and both directories go.
+    #[tokio::test]
+    async fn persist_paused_reclaims_an_inode_shared_only_by_stale_generations(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+
+        let first = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate first generation");
+        std::fs::create_dir_all(&first)?;
+        let shared = first.join("shared.commit");
+        std::fs::write(&shared, vec![0xEFu8; 4096])?;
+        std::fs::write(first.join("private.commit"), b"first")?;
+        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+        persister
+            .persist_paused(&metadata, Some(&first), paused_state.as_ref())
+            .await?;
+
+        let second = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate second generation");
+        std::fs::create_dir_all(&second)?;
+        std::fs::hard_link(&shared, second.join("shared.commit"))?;
+        std::fs::write(second.join("private.commit"), b"second")?;
+        persister
+            .persist_paused(&metadata, Some(&second), paused_state.as_ref())
+            .await?;
+        assert!(
+            first.exists() && first.join("shared.commit").exists(),
+            "while one stale generation still shares the inode the sweep must keep it"
+        );
+
+        // The newest generation does not link the shared inode, so both stale
+        // links are now reachable only from the swept set.
+        let newest = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate newest generation");
+        std::fs::create_dir_all(&newest)?;
+        std::fs::write(newest.join("private.commit"), b"newest")?;
+        persister
+            .persist_paused(&metadata, Some(&newest), paused_state.as_ref())
+            .await?;
+
+        assert!(
+            !first.exists(),
+            "a stale generation whose only stale-shared inode was freed must be removed: {}",
+            first.display()
+        );
+        assert!(
+            !second.exists(),
+            "the sibling stale generation must be removed with it: {}",
+            second.display()
+        );
+        assert!(newest.exists());
+        assert!(newest.join("private.commit").exists());
+        Ok(())
+    }
+
+    /// A file the newest generation links must survive even when all its other
+    /// links are in stale generations: its `nlink` is larger than the count the
+    /// sweep observed, because one link lives outside the swept set.
+    #[tokio::test]
+    async fn persist_paused_sweep_keeps_a_file_the_newest_generation_links() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+
+        let first = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate first generation");
+        std::fs::create_dir_all(&first)?;
+        let kept = first.join("kept.commit");
+        std::fs::write(&kept, vec![0xCDu8; 4096])?;
+        persister
+            .persist_paused(&metadata, Some(&first), paused_state.as_ref())
+            .await?;
+
+        let second = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate second generation");
+        std::fs::create_dir_all(&second)?;
+        std::fs::hard_link(&kept, second.join("kept.commit"))?;
+        std::fs::write(second.join("private.commit"), b"second")?;
+        persister
+            .persist_paused(&metadata, Some(&second), paused_state.as_ref())
+            .await?;
+
+        let newest = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate newest generation");
+        std::fs::create_dir_all(&newest)?;
+        std::fs::hard_link(&kept, newest.join("kept.commit"))?;
+        std::fs::write(newest.join("private.commit"), b"newest")?;
+        persister
+            .persist_paused(&metadata, Some(&newest), paused_state.as_ref())
+            .await?;
+
+        assert!(
+            newest.join("kept.commit").exists(),
+            "the newest generation's link must survive"
+        );
+        assert!(
+            std::fs::metadata(newest.join("kept.commit"))?.nlink() > 2,
+            "the surviving inode must still be reachable from more places than the swept set"
+        );
+        for stale in [&first, &second] {
+            assert!(
+                !stale.join("private.commit").exists(),
+                "the sweep must still reclaim private files from {}",
+                stale.display()
+            );
         }
         Ok(())
     }

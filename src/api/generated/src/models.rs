@@ -2175,9 +2175,15 @@ impl std::ops::DerefMut for EnvdVersion {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct Error {
-    /// Error code
+    /// HTTP status code of the response
     #[serde(rename = "code")]
     pub code: i32,
+
+    /// Stable, machine-readable code for the failure when the endpoint refuses an operation on purpose, so a caller can classify it without parsing the message. A pause refused because the paused-artifact chain still exceeds a bound after compaction reports `ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED` or `CHAIN_BYTES_CEILING_EXCEEDED`; a compaction the node cannot finish for lack of transient disk reports `COMPACTION_HEADROOM_INSUFFICIENT`. All three are recoverable: the sandbox stays Running and the pause can be retried after the bound or the node capacity changes. Absent on failures that have no such stable code.
+    #[serde(rename = "errorCode")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 
     /// Error
     #[serde(rename = "message")]
@@ -2188,7 +2194,11 @@ pub struct Error {
 impl Error {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new(code: i32, message: String) -> Error {
-        Error { code, message }
+        Error {
+            code,
+            error_code: None,
+            message,
+        }
     }
 }
 
@@ -2200,6 +2210,9 @@ impl std::fmt::Display for Error {
         let params: Vec<Option<String>> = vec![
             Some("code".to_string()),
             Some(self.code.to_string()),
+            self.error_code
+                .as_ref()
+                .map(|error_code| ["errorCode".to_string(), error_code.to_string()].join(",")),
             Some("message".to_string()),
             Some(self.message.to_string()),
         ];
@@ -2224,6 +2237,7 @@ impl std::str::FromStr for Error {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub code: Vec<i32>,
+            pub error_code: Vec<String>,
             pub message: Vec<String>,
         }
 
@@ -2251,6 +2265,10 @@ impl std::str::FromStr for Error {
                         <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
+                    "errorCode" => intermediate_rep.error_code.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
                     "message" => intermediate_rep.message.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
@@ -2273,6 +2291,7 @@ impl std::str::FromStr for Error {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "code missing in Error".to_string())?,
+            error_code: intermediate_rep.error_code.into_iter().next(),
             message: intermediate_rep
                 .message
                 .into_iter()
