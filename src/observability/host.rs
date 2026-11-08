@@ -28,6 +28,10 @@ pub struct HostMetrics {
     pub cpu_percent: u32,
     pub cpu_count: u32,
     pub memory_used_bytes: u64,
+    /// Working set of the runtime cgroup: memory.current minus inactive_file,
+    /// the figure kubelet reports. `None` when memory.stat cannot be read or
+    /// the node has no cgroup memory limit; never zero for "unknown".
+    pub memory_working_set_bytes: Option<u64>,
     pub memory_total_bytes: u64,
     pub disks: Vec<DiskMetric>,
 }
@@ -55,6 +59,14 @@ struct CpuSample {
 struct CgroupMemoryLimit {
     limit_bytes: u64,
     used_bytes: Option<u64>,
+    inactive_file_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemoryReading {
+    total_bytes: u64,
+    used_bytes: u64,
+    working_set_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -62,6 +74,7 @@ struct CgroupFilePaths {
     cpu_max: Vec<PathBuf>,
     memory_max: Vec<PathBuf>,
     memory_current: Vec<PathBuf>,
+    memory_stat: Vec<PathBuf>,
 }
 
 impl HostMetricsCollector {
@@ -116,27 +129,42 @@ impl HostMetricsCollector {
             .unwrap_or(host_cpu_count);
 
         let (host_memory_total_bytes, host_memory_used_bytes) = Self::read_memory_bytes()?;
-        let (memory_total_bytes, memory_used_bytes) = self
-            .read_cgroup_memory_limit()
-            .filter(|limit| limit.limit_bytes <= host_memory_total_bytes)
-            .map(|limit| {
-                (
-                    limit.limit_bytes,
-                    limit
-                        .used_bytes
-                        .unwrap_or(host_memory_used_bytes)
-                        .min(limit.limit_bytes),
-                )
-            })
-            .unwrap_or((host_memory_total_bytes, host_memory_used_bytes));
+        let memory = self.read_memory(host_memory_total_bytes, host_memory_used_bytes);
 
         Ok(HostMetrics {
             cpu_percent,
             cpu_count,
-            memory_used_bytes,
-            memory_total_bytes,
+            memory_used_bytes: memory.used_bytes,
+            memory_working_set_bytes: memory.working_set_bytes,
+            memory_total_bytes: memory.total_bytes,
             disks: Self::read_disk_metrics()?,
         })
+    }
+
+    /// Resolves the memory figures against the runtime cgroup limit when one
+    /// applies, otherwise against the host totals. The raw used figure is
+    /// memory.current; the working set subtracts inactive_file from it and is
+    /// only published when both memory.current and memory.stat are readable.
+    fn read_memory(&self, host_total_bytes: u64, host_used_bytes: u64) -> MemoryReading {
+        self.read_cgroup_memory_limit()
+            .filter(|limit| limit.limit_bytes <= host_total_bytes)
+            .map(|limit| MemoryReading {
+                total_bytes: limit.limit_bytes,
+                used_bytes: limit
+                    .used_bytes
+                    .unwrap_or(host_used_bytes)
+                    .min(limit.limit_bytes),
+                working_set_bytes: limit.used_bytes.zip(limit.inactive_file_bytes).map(
+                    |(current, inactive_file)| {
+                        current.saturating_sub(inactive_file).min(limit.limit_bytes)
+                    },
+                ),
+            })
+            .unwrap_or(MemoryReading {
+                total_bytes: host_total_bytes,
+                used_bytes: host_used_bytes,
+                working_set_bytes: None,
+            })
     }
 
     fn read_cpu_sample() -> Result<CpuSample> {
@@ -228,8 +256,26 @@ impl HostMetricsCollector {
                         .read_first(&self.cgroup_files.memory_current)
                         .as_deref()
                         .and_then(Self::parse_cgroup_memory_usage),
+                    inactive_file_bytes: self
+                        .cgroup_files
+                        .read_first(&self.cgroup_files.memory_stat)
+                        .as_deref()
+                        .and_then(Self::parse_memory_stat_inactive_file),
                 })
             })
+    }
+
+    /// Reads the reclaimable inactive page cache from a cgroup memory.stat.
+    /// cgroup v1 reports the hierarchical figure as `total_inactive_file`,
+    /// which kubelet prefers; cgroup v2 reports `inactive_file`.
+    fn parse_memory_stat_inactive_file(content: &str) -> Option<u64> {
+        let value_of = |wanted: &str| {
+            content.lines().find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == wanted).then(|| value.trim().parse::<u64>().ok())?
+            })
+        };
+        value_of("total_inactive_file").or_else(|| value_of("inactive_file"))
     }
 
     fn parse_cgroup_memory_limit(content: &str) -> Option<u64> {
@@ -305,6 +351,7 @@ impl CgroupFilePaths {
             cpu_max: cgroup_file_candidates(content, cgroup_root.as_ref(), "cpu.max"),
             memory_max: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.max"),
             memory_current: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.current"),
+            memory_stat: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.stat"),
         }
     }
 
@@ -484,6 +531,121 @@ mod tests {
                 "/sys/fs/cgroup/kubepods.slice/pod-a/container-a/memory.current"
             )]
         );
+    }
+
+    fn cgroup_fixture(max: &str, current: &str, stat: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pod = dir.path().join("pod-a");
+        std::fs::create_dir_all(&pod).expect("cgroup dir");
+        std::fs::write(pod.join("memory.max"), max).expect("memory.max");
+        std::fs::write(pod.join("memory.current"), current).expect("memory.current");
+        if let Some(stat) = stat {
+            std::fs::write(pod.join("memory.stat"), stat).expect("memory.stat");
+        }
+        dir
+    }
+
+    fn collector_for(dir: &tempfile::TempDir) -> HostMetricsCollector {
+        HostMetricsCollector {
+            previous_cpu: Default::default(),
+            cgroup_files: std::sync::Arc::new(CgroupFilePaths::from_proc_self_cgroup(
+                "0::/pod-a\n",
+                dir.path(),
+            )),
+        }
+    }
+
+    #[test]
+    fn cgroup_file_paths_detects_memory_stat_next_to_memory_current() {
+        let paths = CgroupFilePaths::from_proc_self_cgroup(
+            "0::/kubepods.slice/pod-a/container-a\n",
+            "/sys/fs/cgroup",
+        );
+
+        assert_eq!(
+            paths.memory_stat,
+            vec![std::path::PathBuf::from(
+                "/sys/fs/cgroup/kubepods.slice/pod-a/container-a/memory.stat"
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_memory_stat_inactive_file_reads_v2_key() {
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_inactive_file(
+                "anon 150000\nfile 100000\nactive_file 50000\ninactive_file 50000\n"
+            ),
+            Some(50000)
+        );
+    }
+
+    #[test]
+    fn parse_memory_stat_inactive_file_prefers_v1_hierarchical_key() {
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_inactive_file(
+                "cache 90000\ninactive_file 10000\ntotal_inactive_file 40000\n"
+            ),
+            Some(40000)
+        );
+    }
+
+    #[test]
+    fn parse_memory_stat_inactive_file_is_absent_without_the_key() {
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_inactive_file("anon 150000\nfile 100000\n"),
+            None
+        );
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_inactive_file("inactive_file lots\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn cgroup_memory_publishes_working_set_and_keeps_raw_used() {
+        let dir = cgroup_fixture(
+            "1000000\n",
+            "250000\n",
+            Some("anon 150000\nfile 100000\nactive_file 50000\ninactive_file 50000\n"),
+        );
+
+        let memory = collector_for(&dir).read_memory(u64::MAX, 0);
+
+        assert_eq!(memory.total_bytes, 1000000);
+        assert_eq!(memory.used_bytes, 250000);
+        assert_eq!(memory.working_set_bytes, Some(200000));
+    }
+
+    #[test]
+    fn cgroup_memory_working_set_saturates_at_zero() {
+        let dir = cgroup_fixture("1000000\n", "40000\n", Some("inactive_file 50000\n"));
+
+        let memory = collector_for(&dir).read_memory(u64::MAX, 0);
+
+        assert_eq!(memory.used_bytes, 40000);
+        assert_eq!(memory.working_set_bytes, Some(0));
+    }
+
+    #[test]
+    fn cgroup_memory_without_readable_stat_leaves_working_set_absent() {
+        let dir = cgroup_fixture("1000000\n", "250000\n", None);
+
+        let memory = collector_for(&dir).read_memory(u64::MAX, 0);
+
+        assert_eq!(memory.used_bytes, 250000);
+        assert_eq!(memory.working_set_bytes, None);
+    }
+
+    #[test]
+    fn host_memory_without_cgroup_limit_leaves_working_set_absent() {
+        let dir = cgroup_fixture("max\n", "250000\n", Some("inactive_file 50000\n"));
+
+        let memory = collector_for(&dir).read_memory(8000000, 3000000);
+
+        assert_eq!(memory.total_bytes, 8000000);
+        assert_eq!(memory.used_bytes, 3000000);
+        assert_eq!(memory.working_set_bytes, None);
     }
 
     #[test]

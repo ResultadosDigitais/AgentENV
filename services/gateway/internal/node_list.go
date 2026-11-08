@@ -44,6 +44,7 @@ type nodeListMetrics struct {
 	CPUCount                   uint32                `json:"cpuCount"`
 	MemoryUsedBytes            uint64                `json:"memoryUsedBytes"`
 	MemoryTotalBytes           uint64                `json:"memoryTotalBytes"`
+	MemoryWorkingSetBytes      *uint64               `json:"memoryWorkingSetBytes,omitempty"`
 	Disks                      []nodeListDiskMetrics `json:"disks"`
 	PausedAllocatedCPU         uint32                `json:"pausedAllocatedCPU"`
 	PausedAllocatedMemoryBytes uint64                `json:"pausedAllocatedMemoryBytes"`
@@ -187,6 +188,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 				CPUCount:                   snapshot.GetCpuCount(),
 				MemoryUsedBytes:            snapshot.GetMemoryUsedBytes(),
 				MemoryTotalBytes:           snapshot.GetMemoryTotalBytes(),
+				MemoryWorkingSetBytes:      snapshot.MemoryWorkingSetBytes,
 				Disks:                      disks,
 				PausedAllocatedCPU:         snapshot.GetPausedAllocatedCpu(),
 				PausedAllocatedMemoryBytes: snapshot.GetPausedAllocatedMemoryBytes(),

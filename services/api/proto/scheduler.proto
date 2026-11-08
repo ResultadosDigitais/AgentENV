@@ -161,6 +161,13 @@ message NodeSnapshot {
   // "requested == 0 && allocated > 0" identifies a non-reporting node and the
   // scheduler falls back to allocated_memory_bytes (see filter.go).
   uint64 requested_memory_bytes = 17;
+  // Memory working set of the runtime cgroup: memory.current minus
+  // inactive_file, the figure kubelet reports, so reclaimable page cache does
+  // not count as used. memory_used_bytes keeps the raw memory.current.
+  // Absent when the node cannot read memory.stat or predates the field; the
+  // scheduler then falls back to memory_used_bytes. Never reported as zero
+  // for "unknown".
+  optional uint64 memory_working_set_bytes = 18;
 }
 
 message P2pEndpoint {

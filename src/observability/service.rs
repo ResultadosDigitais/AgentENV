@@ -87,6 +87,7 @@ impl ObservabilityService {
                 cpu_percent: host.cpu_percent,
                 cpu_count: host.cpu_count,
                 memory_used_bytes: host.memory_used_bytes,
+                memory_working_set_bytes: host.memory_working_set_bytes,
                 memory_total_bytes: host.memory_total_bytes,
                 disks: host.disks,
                 paused_allocated_cpu: runtime.paused_allocated_cpu,

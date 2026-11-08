@@ -101,6 +101,13 @@ type NodeResourceLimit struct {
 	// gating that projects the paused sandbox shape. Default "on"; "off" is
 	// the kill switch that restores the pre-OPSAI-6200 routing.
 	ShapeAdmission *string `json:"shape_admission"`
+	// MemoryUsedMeter selects the node memory figure max_memory_used_percent
+	// compares: "raw" (default) is memory_used_bytes, the cgroup
+	// memory.current including page cache; "working_set" is
+	// memory_working_set_bytes (memory.current minus inactive_file, the
+	// figure kubelet uses). A node that does not report the working set is
+	// evaluated on the raw figure and the fallback is logged.
+	MemoryUsedMeter *string `json:"memory_used_meter"`
 	// CrossNodeResume allows a paused sandbox rejected on its owner to resume
 	// on another admitted node. Off by default: moving a resume before the
 	// paused artifacts are cluster-readable loses the sandbox.
@@ -143,6 +150,10 @@ const (
 	// NodeResourceLimit.MemoryCapacitySource.
 	MemoryCapacitySourceAllocatable = "allocatable"
 	MemoryCapacitySourceTotal       = "total"
+
+	// Memory used meters accepted by NodeResourceLimit.MemoryUsedMeter.
+	MemoryUsedMeterRaw        = "raw"
+	MemoryUsedMeterWorkingSet = "working_set"
 
 	// Shape admission modes accepted by NodeResourceLimit.ShapeAdmission.
 	ShapeAdmissionOn  = "on"
@@ -197,6 +208,19 @@ func (l *NodeResourceLimit) ResolvedMemoryCapacitySource() string {
 	default:
 		return MemoryCapacitySourceAllocatable
 	}
+}
+
+// ResolvedMemoryUsedMeter returns the configured memory used meter,
+// defaulting to raw. Unknown values resolve to raw so a typo keeps the
+// historical figure; Validate rejects them at startup.
+func (l *NodeResourceLimit) ResolvedMemoryUsedMeter() string {
+	if l == nil || l.MemoryUsedMeter == nil {
+		return MemoryUsedMeterRaw
+	}
+	if strings.ToLower(strings.TrimSpace(*l.MemoryUsedMeter)) == MemoryUsedMeterWorkingSet {
+		return MemoryUsedMeterWorkingSet
+	}
+	return MemoryUsedMeterRaw
 }
 
 // ResolvedShapeAdmission returns "on" or "off", defaulting to "on".
@@ -349,6 +373,13 @@ func (l *NodeResourceLimit) Validate() error {
 		case MemoryCapacitySourceAllocatable, MemoryCapacitySourceTotal:
 		default:
 			return fmt.Errorf("scheduler.node_resource_limit.memory_capacity_source must be one of allocatable, total, got %q", *l.MemoryCapacitySource)
+		}
+	}
+	if l.MemoryUsedMeter != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.MemoryUsedMeter)) {
+		case MemoryUsedMeterRaw, MemoryUsedMeterWorkingSet:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.memory_used_meter must be one of raw, working_set, got %q", *l.MemoryUsedMeter)
 		}
 	}
 	if l.ShapeAdmission != nil {

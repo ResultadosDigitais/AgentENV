@@ -49,7 +49,8 @@ impl From<DiskMetric> for models::DiskMetrics {
 
 impl From<NodeMetricsSnapshot> for models::NodeMetrics {
     fn from(metrics: NodeMetricsSnapshot) -> Self {
-        models::NodeMetrics::new(
+        let memory_working_set_bytes = metrics.memory_working_set_bytes;
+        let mut node_metrics = models::NodeMetrics::new(
             metrics.allocated_cpu,
             metrics.cpu_percent,
             metrics.cpu_count,
@@ -63,7 +64,9 @@ impl From<NodeMetricsSnapshot> for models::NodeMetrics {
                 .collect(),
             metrics.paused_allocated_cpu,
             metrics.paused_allocated_memory_bytes,
-        )
+        );
+        node_metrics.memory_working_set_bytes = memory_working_set_bytes;
+        node_metrics
     }
 }
 
@@ -337,5 +340,46 @@ impl From<ManagedLayerCollectReport> for models::ManagedLayerCollectReport {
                     .collect()
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics_with_working_set(working_set: Option<u64>) -> NodeMetricsSnapshot {
+        NodeMetricsSnapshot {
+            allocated_cpu: 0,
+            allocated_memory_bytes: 0,
+            requested_memory_bytes: 0,
+            cpu_percent: 0,
+            cpu_count: 4,
+            memory_used_bytes: 250000,
+            memory_working_set_bytes: working_set,
+            memory_total_bytes: 1000000,
+            disks: Vec::new(),
+            paused_allocated_cpu: 0,
+            paused_allocated_memory_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn node_metrics_publishes_working_set_next_to_raw_used() {
+        let json = serde_json::to_value(models::NodeMetrics::from(metrics_with_working_set(Some(
+            200000,
+        ))))
+        .expect("serialize NodeMetrics");
+
+        assert_eq!(json["memoryUsedBytes"], 250000);
+        assert_eq!(json["memoryWorkingSetBytes"], 200000);
+    }
+
+    #[test]
+    fn node_metrics_omits_unknown_working_set() {
+        let json = serde_json::to_value(models::NodeMetrics::from(metrics_with_working_set(None)))
+            .expect("serialize NodeMetrics");
+
+        assert_eq!(json["memoryUsedBytes"], 250000);
+        assert!(json.get("memoryWorkingSetBytes").is_none());
     }
 }
