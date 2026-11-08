@@ -6537,9 +6537,14 @@ pub struct NodeMetrics {
     #[serde(rename = "allocatedMemoryBytes")]
     pub allocated_memory_bytes: u64,
 
-    /// Node memory used in bytes
+    /// Node memory used in bytes. With a cgroup memory limit this is the raw memory.current, which includes page cache
     #[serde(rename = "memoryUsedBytes")]
     pub memory_used_bytes: u64,
+
+    /// Memory working set of the runtime cgroup in bytes (memory.current minus inactive_file, the figure kubelet reports). Omitted when the node cannot read memory.stat or has no cgroup memory limit
+    #[serde(rename = "memoryWorkingSetBytes")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_working_set_bytes: Option<u64>,
 
     /// Total node memory in bytes
     #[serde(rename = "memoryTotalBytes")]
@@ -6578,6 +6583,7 @@ impl NodeMetrics {
             cpu_count,
             allocated_memory_bytes,
             memory_used_bytes,
+            memory_working_set_bytes: None,
             memory_total_bytes,
             disks,
             paused_allocated_cpu,
@@ -6602,6 +6608,15 @@ impl std::fmt::Display for NodeMetrics {
             Some(self.allocated_memory_bytes.to_string()),
             Some("memoryUsedBytes".to_string()),
             Some(self.memory_used_bytes.to_string()),
+            self.memory_working_set_bytes
+                .as_ref()
+                .map(|memory_working_set_bytes| {
+                    [
+                        "memoryWorkingSetBytes".to_string(),
+                        memory_working_set_bytes.to_string(),
+                    ]
+                    .join(",")
+                }),
             Some("memoryTotalBytes".to_string()),
             Some(self.memory_total_bytes.to_string()),
             // Skipping disks in query parameter serialization
@@ -6635,6 +6650,7 @@ impl std::str::FromStr for NodeMetrics {
             pub cpu_count: Vec<u32>,
             pub allocated_memory_bytes: Vec<u64>,
             pub memory_used_bytes: Vec<u64>,
+            pub memory_working_set_bytes: Vec<u64>,
             pub memory_total_bytes: Vec<u64>,
             pub disks: Vec<Vec<models::DiskMetrics>>,
             pub paused_allocated_cpu: Vec<u32>,
@@ -6678,6 +6694,10 @@ impl std::str::FromStr for NodeMetrics {
                     ),
                     #[allow(clippy::redundant_clone)]
                     "memoryUsedBytes" => intermediate_rep.memory_used_bytes.push(
+                        <u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryWorkingSetBytes" => intermediate_rep.memory_working_set_bytes.push(
                         <u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -6739,6 +6759,7 @@ impl std::str::FromStr for NodeMetrics {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "memoryUsedBytes missing in NodeMetrics".to_string())?,
+            memory_working_set_bytes: intermediate_rep.memory_working_set_bytes.into_iter().next(),
             memory_total_bytes: intermediate_rep
                 .memory_total_bytes
                 .into_iter()

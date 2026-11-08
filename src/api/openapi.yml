@@ -1593,7 +1593,11 @@ components:
         memoryUsedBytes:
           type: integer
           format: uint64
-          description: Node memory used in bytes
+          description: Node memory used in bytes. With a cgroup memory limit this is the raw memory.current, which includes page cache
+        memoryWorkingSetBytes:
+          type: integer
+          format: uint64
+          description: Memory working set of the runtime cgroup in bytes (memory.current minus inactive_file, the figure kubelet reports). Omitted when the node cannot read memory.stat or has no cgroup memory limit
         memoryTotalBytes:
           type: integer
           format: uint64
