@@ -32,6 +32,9 @@ pub struct NodeMetricsSnapshot {
     pub cpu_percent: u32,
     pub cpu_count: u32,
     pub memory_used_bytes: u64,
+    /// Runtime cgroup working set (memory.current minus inactive_file); see
+    /// `HostMetrics::memory_working_set_bytes`.
+    pub memory_working_set_bytes: Option<u64>,
     pub memory_total_bytes: u64,
     pub disks: Vec<DiskMetric>,
     /// CPU reservation of all paused sandboxes on the node, summed.

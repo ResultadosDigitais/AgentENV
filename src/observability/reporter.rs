@@ -401,6 +401,7 @@ impl ObservabilityReporter {
                 cpu_percent: snapshot.metrics.cpu_percent,
                 cpu_count: snapshot.metrics.cpu_count,
                 memory_used_bytes: snapshot.metrics.memory_used_bytes,
+                memory_working_set_bytes: snapshot.metrics.memory_working_set_bytes,
                 memory_total_bytes: snapshot.metrics.memory_total_bytes,
                 disks: snapshot
                     .metrics
@@ -635,6 +636,7 @@ mod tests {
                 cpu_percent: 0,
                 cpu_count: 8,
                 memory_used_bytes: 0,
+                memory_working_set_bytes: None,
                 memory_total_bytes: 128 * 1024 * 1024 * 1024,
                 disks: Vec::new(),
                 paused_allocated_cpu: 4,
@@ -685,6 +687,7 @@ mod tests {
                 cpu_percent: 0,
                 cpu_count: 0,
                 memory_used_bytes: 0,
+                memory_working_set_bytes: None,
                 memory_total_bytes: 0,
                 disks: Vec::new(),
                 paused_allocated_cpu: 0,
@@ -699,5 +702,63 @@ mod tests {
 
         let req = ObservabilityReporter::build_heartbeat_request(snapshot, 0, None);
         assert!(req.paused_sandboxes.is_empty());
+    }
+
+    fn snapshot_with_memory(working_set: Option<u64>) -> crate::observability::NodeSnapshot {
+        crate::observability::NodeSnapshot {
+            version: String::new(),
+            commit: String::new(),
+            node_id: "node-a".to_string(),
+            service_instance_id: "svc-a".to_string(),
+            cluster_id: uuid::Uuid::new_v4(),
+            machine_info: crate::observability::MachineInfo {
+                cpu_family: String::new(),
+                cpu_model: String::new(),
+                cpu_model_name: String::new(),
+                cpu_architecture: String::new(),
+                cpu_config_json: None,
+            },
+            sandbox_count: 0,
+            sandbox_ids: Vec::new(),
+            metrics: crate::observability::NodeMetricsSnapshot {
+                allocated_cpu: 0,
+                allocated_memory_bytes: 0,
+                requested_memory_bytes: 0,
+                cpu_percent: 0,
+                cpu_count: 0,
+                memory_used_bytes: 250000,
+                memory_working_set_bytes: working_set,
+                memory_total_bytes: 1000000,
+                disks: Vec::new(),
+                paused_allocated_cpu: 0,
+                paused_allocated_memory_bytes: 0,
+            },
+            create_successes: 0,
+            create_fails: 0,
+            sandbox_starting_count: 0,
+            paused_sandbox_count: 0,
+            paused_sandboxes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_carries_working_set_next_to_raw_used() {
+        let req = ObservabilityReporter::build_heartbeat_request(
+            snapshot_with_memory(Some(200000)),
+            0,
+            None,
+        );
+        let snapshot = req.snapshot.expect("snapshot");
+        assert_eq!(snapshot.memory_used_bytes, 250000);
+        assert_eq!(snapshot.memory_working_set_bytes, Some(200000));
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_leaves_unknown_working_set_absent() {
+        let req =
+            ObservabilityReporter::build_heartbeat_request(snapshot_with_memory(None), 0, None);
+        let snapshot = req.snapshot.expect("snapshot");
+        assert_eq!(snapshot.memory_used_bytes, 250000);
+        assert_eq!(snapshot.memory_working_set_bytes, None);
     }
 }
