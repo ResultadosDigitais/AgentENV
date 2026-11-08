@@ -22,14 +22,30 @@ type RejectionObserver func(nodeID string, violation LimitViolation)
 // in the outcome counter. It must not block.
 type DiskSkipObserver func(nodeID string, violation LimitViolation)
 
+// MeterFallbackObserver receives a node evaluated on the raw memory figure
+// although memory_used_meter is working_set, because its heartbeat does not
+// carry memory_working_set_bytes. It must not block.
+type MeterFallbackObserver func(nodeID string)
+
+// ResourceLimitObservers groups the optional observers of the resource limit
+// filter. Every field may be nil.
+type ResourceLimitObservers struct {
+	Shadow        AdmissionObserver
+	Reject        RejectionObserver
+	SkipDisk      DiskSkipObserver
+	MeterFallback MeterFallbackObserver
+}
+
 // LimitViolation names the node_resource_limit key that rejected a node, with
 // the observed value, the configured threshold and any extra context. Limit is
 // the JSON key of the limit, so the scheduler log reads like the config.
+// Meter is the memory used meter that produced the node's memory figure.
 type LimitViolation struct {
 	Limit     string
 	Observed  string
 	Threshold string
 	Detail    string
+	Meter     string
 }
 
 // Node resource limit keys, used as the named reason in the rejection log.
@@ -220,11 +236,29 @@ func memoryAllocatedCheck(s *schedulerv1.NodeSnapshot, limit *config.NodeResourc
 	return observed, *limit.MaxMemoryAllocatedPercent, observed > *limit.MaxMemoryAllocatedPercent
 }
 
+// memoryUsedBytes returns the figure max_memory_used_percent compares and the
+// meter that produced it. The working set is read only when the meter asks
+// for it and the node reports it; otherwise the raw memory_used applies.
+func memoryUsedBytes(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (uint64, string) {
+	if limit.ResolvedMemoryUsedMeter() == config.MemoryUsedMeterWorkingSet && s.MemoryWorkingSetBytes != nil {
+		return s.GetMemoryWorkingSetBytes(), config.MemoryUsedMeterWorkingSet
+	}
+	return s.GetMemoryUsedBytes(), config.MemoryUsedMeterRaw
+}
+
+// memoryMeterFellBack reports a node evaluated on the raw figure although the
+// working_set meter is configured.
+func memoryMeterFellBack(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) bool {
+	_, meter := memoryUsedBytes(s, limit)
+	return meter != limit.ResolvedMemoryUsedMeter()
+}
+
 func memoryUsedCheck(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit, base uint64) (uint32, uint32, bool) {
 	if limit.MaxMemoryUsedPercent == nil || base == 0 {
 		return 0, 0, false
 	}
-	observed := percentOf(s.GetMemoryUsedBytes(), base)
+	used, _ := memoryUsedBytes(s, limit)
+	observed := percentOf(used, base)
 	return observed, *limit.MaxMemoryUsedPercent, observed > *limit.MaxMemoryUsedPercent
 }
 
@@ -275,6 +309,16 @@ func FilterByResourceLimitRejected(nodes []RichNode, limit *config.NodeResourceL
 // optional observer invoked for a node the disk limit admitted because its
 // heartbeat does not carry the target mount.
 func FilterByResourceLimitReported(nodes []RichNode, limit *config.NodeResourceLimit, observe AdmissionObserver, reject RejectionObserver, skipDisk DiskSkipObserver) []RichNode {
+	return FilterByResourceLimitObservedBy(nodes, limit, ResourceLimitObservers{
+		Shadow:   observe,
+		Reject:   reject,
+		SkipDisk: skipDisk,
+	})
+}
+
+// FilterByResourceLimitObservedBy is the resource limit filter with every
+// optional observer, including the memory meter fallback.
+func FilterByResourceLimitObservedBy(nodes []RichNode, limit *config.NodeResourceLimit, observers ResourceLimitObservers) []RichNode {
 	if limit == nil {
 		return nodes
 	}
@@ -287,17 +331,21 @@ func FilterByResourceLimitReported(nodes []RichNode, limit *config.NodeResourceL
 			continue
 		}
 		if limit.ResolvedAdmissionMode() == config.AdmissionModeShadow {
-			observeShadowAdmission(n, limit, observe)
+			observeShadowAdmission(n, limit, observers.Shadow)
+		}
+		if observers.MeterFallback != nil && memoryMeterFellBack(n.Snapshot, limit) {
+			observers.MeterFallback(n.ID)
 		}
 		violation, violated := limitViolated(n, limit)
 		if violated {
-			if reject != nil {
-				reject(n.ID, violation)
+			_, violation.Meter = memoryUsedBytes(n.Snapshot, limit)
+			if observers.Reject != nil {
+				observers.Reject(n.ID, violation)
 			}
 			continue
 		}
-		if skipped, ok := diskLimitSkipped(n.Snapshot, limit); ok && skipDisk != nil {
-			skipDisk(n.ID, skipped)
+		if skipped, ok := diskLimitSkipped(n.Snapshot, limit); ok && observers.SkipDisk != nil {
+			observers.SkipDisk(n.ID, skipped)
 		}
 		result = append(result, n)
 	}

@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type Service struct {
@@ -132,31 +133,43 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	rich = s.annotateCapacity(rich)
 	rich = s.projectReservations(rich)
 
-	eligible := FilterByResourceLimitReported(rich, s.resourceLimit, func(nodeID string, nominal, request bool, detail string) {
-		s.logger.Info("admission shadow divergence",
-			zap.String("node_id", nodeID),
-			zap.Bool("nominal_admits", nominal),
-			zap.Bool("request_admits", request),
-			zap.String("detail", detail),
-		)
-	}, func(nodeID string, violation LimitViolation) {
-		fields := []zap.Field{
-			zap.String("node_id", nodeID),
-			zap.String("limit", violation.Limit),
-			zap.String("observed", violation.Observed),
-			zap.String("threshold", violation.Threshold),
-		}
-		if violation.Detail != "" {
-			fields = append(fields, zap.String("detail", violation.Detail))
-		}
-		s.logger.Info("scheduler rejected node by resource limit", fields...)
-	}, func(nodeID string, violation LimitViolation) {
-		s.logger.Info("scheduler skipped disk limit for node",
-			zap.String("node_id", nodeID),
-			zap.String("limit", violation.Limit),
-			zap.String("threshold", violation.Threshold),
-			zap.String("detail", violation.Detail),
-		)
+	eligible := FilterByResourceLimitObservedBy(rich, s.resourceLimit, ResourceLimitObservers{
+		Shadow: func(nodeID string, nominal, request bool, detail string) {
+			s.logger.Info("admission shadow divergence",
+				zap.String("node_id", nodeID),
+				zap.Bool("nominal_admits", nominal),
+				zap.Bool("request_admits", request),
+				zap.String("detail", detail),
+			)
+		},
+		Reject: func(nodeID string, violation LimitViolation) {
+			fields := []zap.Field{
+				zap.String("node_id", nodeID),
+				zap.String("limit", violation.Limit),
+				zap.String("observed", violation.Observed),
+				zap.String("threshold", violation.Threshold),
+				zap.String("meter", violation.Meter),
+			}
+			if violation.Detail != "" {
+				fields = append(fields, zap.String("detail", violation.Detail))
+			}
+			s.logger.Info("scheduler rejected node by resource limit", fields...)
+		},
+		SkipDisk: func(nodeID string, violation LimitViolation) {
+			s.logger.Info("scheduler skipped disk limit for node",
+				zap.String("node_id", nodeID),
+				zap.String("limit", violation.Limit),
+				zap.String("threshold", violation.Threshold),
+				zap.String("detail", violation.Detail),
+			)
+		},
+		MeterFallback: func(nodeID string) {
+			s.logger.Info("scheduler memory meter fell back to raw",
+				zap.String("node_id", nodeID),
+				zap.String("configured_meter", config.MemoryUsedMeterWorkingSet),
+				zap.String("reason", "memory_working_set_bytes_absent"),
+			)
+		},
 	})
 
 	// Project the incoming create shape onto each candidate so a node only
@@ -290,6 +303,12 @@ func (s *Service) projectReservationsExcept(nodes []RichNode, excludeKey string)
 		// memory_used - allocated (the runtime overhead the capacity base
 		// subtracts) unchanged, so the projection cannot inflate the ceiling.
 		snapshot.MemoryUsedBytes += memoryBytes
+		// The working set is projected the same way, but only when the node
+		// reports it: an absent field must stay absent so the meter falls
+		// back to the raw figure instead of reading the reservation alone.
+		if snapshot.MemoryWorkingSetBytes != nil {
+			snapshot.MemoryWorkingSetBytes = proto.Uint64(snapshot.GetMemoryWorkingSetBytes() + memoryBytes)
+		}
 		if snapshot.GetRequestedMemoryBytes() > 0 {
 			snapshot.RequestedMemoryBytes += memoryBytes
 		}
