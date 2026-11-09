@@ -139,6 +139,81 @@ func TestLoadRejectsInvalidAdmissionLayers(t *testing.T) {
 	}
 }
 
+// OPSAI-6650: shape_admission gained a third mode. "on" decides by the shape
+// rule, "off" restores the pre-OPSAI-6200 routing and "shadow" evaluates the
+// rule and records a verdict while deciding exactly like "off".
+func TestResolvedShapeAdmissionSupportsShadow(t *testing.T) {
+	str := func(v string) *string { return &v }
+	cases := []struct {
+		name     string
+		value    *string
+		want     string
+		enabled  bool
+		shadow   bool
+		observed bool
+	}{
+		{"absent defaults on", nil, ShapeAdmissionOn, true, false, true},
+		{"on", str("on"), ShapeAdmissionOn, true, false, true},
+		{"off", str("off"), ShapeAdmissionOff, false, false, false},
+		{"shadow", str("shadow"), ShapeAdmissionShadow, false, true, true},
+		{"shadow with spaces and case", str("  SHADOW "), ShapeAdmissionShadow, false, true, true},
+		{"unknown fails safe to on", str("sometimes"), ShapeAdmissionOn, true, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			limit := &NodeResourceLimit{ShapeAdmission: tc.value}
+			if got := limit.ResolvedShapeAdmission(); got != tc.want {
+				t.Fatalf("resolved = %q, want %q", got, tc.want)
+			}
+			if got := limit.ShapeAdmissionEnabled(); got != tc.enabled {
+				t.Fatalf("enabled = %v, want %v", got, tc.enabled)
+			}
+			if got := limit.ShapeAdmissionShadow(); got != tc.shadow {
+				t.Fatalf("shadow = %v, want %v", got, tc.shadow)
+			}
+			if got := limit.ShapeAdmissionObserved(); got != tc.observed {
+				t.Fatalf("observed = %v, want %v", got, tc.observed)
+			}
+		})
+	}
+	var nilLimit *NodeResourceLimit
+	if nilLimit.ShapeAdmissionShadow() || !nilLimit.ShapeAdmissionObserved() {
+		t.Fatal("nil limit must resolve to on and observe the shape rule")
+	}
+}
+
+func TestAdmissionLayersValidateAcceptsShadow(t *testing.T) {
+	str := func(v string) *string { return &v }
+	for _, value := range []string{"on", "off", "shadow", " SHADOW "} {
+		if err := (&NodeResourceLimit{ShapeAdmission: str(value)}).Validate(); err != nil {
+			t.Fatalf("shape_admission %q rejected: %v", value, err)
+		}
+	}
+	if err := (&NodeResourceLimit{ShapeAdmission: str("sometimes")}).Validate(); err == nil {
+		t.Fatal("unknown shape_admission must be rejected at startup")
+	}
+}
+
+// The versioned deployments must keep loading after the third mode exists.
+func TestVersionedDeployConfigsLoadShapeAdmission(t *testing.T) {
+	for _, path := range []string{
+		filepath.Join("..", "..", "..", "deploy", "k8s", "base", "config", "scheduler.json"),
+		filepath.Join("..", "..", "..", "deploy", "docker", "config", "default.json"),
+	} {
+		cfg, err := LoadScheduler(path, false)
+		if err != nil {
+			t.Fatalf("load %s failed: %v", path, err)
+		}
+		limit := cfg.Scheduler.NodeResourceLimit
+		if limit == nil {
+			t.Fatalf("%s must configure node_resource_limit", path)
+		}
+		if got := limit.ResolvedShapeAdmission(); got != ShapeAdmissionOn {
+			t.Fatalf("%s shape_admission resolved to %q, want on", path, got)
+		}
+	}
+}
+
 // The Docker Compose deployment the e2e runs must publish the same admission
 // verdict as the Kubernetes one. Without node_resource_limit the scheduler has
 // no rule to evaluate and /nodes omits the admission object entirely.
