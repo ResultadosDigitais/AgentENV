@@ -175,9 +175,54 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	// Project the incoming create shape onto each candidate so a node only
 	// admits the new sandbox when it fits the same capacity rule the resume
 	// path uses. A create whose shape is unknown still reserves one slot.
-	memoryBytes, cpuCount, hasShape, reserve := reservationShapeFromHint(req.GetHint())
-	if reserve && hasShape {
-		eligible = filterByShape(eligible, memoryBytes, cpuCount, s.resourceLimit)
+	hint := req.GetHint()
+	bodyMemory, bodyCPU, bodyHasShape, reserve := reservationShapeFromHint(hint)
+	shape, shapeErr := templateShapeFromHint(hint)
+	if shapeErr != nil {
+		// An enum value this binary does not know is treated as a failed
+		// lookup: never admitted blind when the shape rule decides.
+		s.logger.Warn("scheduler ignored unknown template shape status",
+			zap.String("template_id", shape.templateID),
+			zap.Error(shapeErr),
+		)
+		shape.status = schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_LOOKUP_FAILED
+	}
+	mode := s.resourceLimit.ResolvedShapeAdmission()
+
+	// A create whose template shape could not be read must not be admitted
+	// blind once the shape rule decides and a memory ceiling exists.
+	if reserve && !bodyHasShape && mode == config.ShapeAdmissionOn &&
+		memoryLimitConfigured(s.resourceLimit) && shape.lookupFailed() {
+		recordShapeAdmission(shapeKindCreate, shapeOutcomeUnknownShape, shapeReasonUnknownTemplateShape)
+		s.logger.Warn("scheduler refused create with unknown template shape",
+			zap.String("kind", shapeKindCreate),
+			zap.String("template_id", shape.templateID),
+			zap.String("reason", shapeReasonUnknownTemplateShape),
+		)
+		return &schedulerv1.ScheduleResponse{
+			RefusalReason: schedulerv1.ScheduleRefusalReason_SCHEDULE_REFUSAL_REASON_UNKNOWN_TEMPLATE_SHAPE,
+		}, nil
+	}
+
+	reserveMemory, reserveCPU := bodyMemory, bodyCPU
+	switch {
+	case bodyHasShape:
+		// The body shape projects exactly as before in every mode; shadow
+		// also records the verdict.
+		eligible = s.projectCreateShape(eligible, bodyMemory, bodyCPU, shape)
+	case reserve && mode == config.ShapeAdmissionOn && shape.resolved():
+		reserveMemory, reserveCPU = shape.memoryBytes, shape.cpuCount
+		eligible = s.projectCreateShape(eligible, shape.memoryBytes, shape.cpuCount, shape)
+	case reserve && mode == config.ShapeAdmissionShadow:
+		switch shape.status {
+		case schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_RESOLVED:
+			// Record the verdict per node without changing the decision.
+			s.projectCreateShape(eligible, shape.memoryBytes, shape.cpuCount, shape)
+		case schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_NOT_FOUND:
+			// The template does not exist; the upstream create decides.
+		default:
+			s.recordUnknownCreateShape(shape)
+		}
 	}
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
@@ -206,7 +251,7 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	)
 	reservationID := ""
 	if reserve {
-		reservationID = s.reserve(node.ID, memoryBytes, cpuCount, "")
+		reservationID = s.reserve(node.ID, reserveMemory, reserveCPU, "")
 	}
 	return &schedulerv1.ScheduleResponse{
 		Node:          node.Node.ToProto(),
@@ -236,6 +281,184 @@ func reservationShapeFromHint(hint *schedulerv1.ScheduleRequestHint) (memoryByte
 	default:
 		return 0, 0, false, false
 	}
+}
+
+// templateShape is the template shape the gateway resolved before scheduling a
+// create. status distinguishes a genuine shape from a missing or unreadable
+// template so the scheduler never admits blind when the rule decides.
+type templateShape struct {
+	memoryBytes uint64
+	cpuCount    uint32
+	templateID  string
+	status      schedulerv1.TemplateShapeStatus
+}
+
+// templateShapeFromHint interprets NewSandboxHint.template_shape_status with an
+// exhaustive switch. An unknown enum value is a typed error the caller logs and
+// treats as a failed lookup, never as an admission.
+func templateShapeFromHint(hint *schedulerv1.ScheduleRequestHint) (templateShape, error) {
+	sandbox := hint.GetNewSandbox()
+	if sandbox == nil {
+		return templateShape{status: schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_UNSPECIFIED}, nil
+	}
+	shape := templateShape{
+		memoryBytes: sandbox.GetResolvedMemoryMb() << 20,
+		cpuCount:    sandbox.GetResolvedCpuCount(),
+		templateID:  sandbox.GetTemplateId(),
+		status:      sandbox.GetTemplateShapeStatus(),
+	}
+	switch shape.status {
+	case schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_UNSPECIFIED,
+		schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_RESOLVED,
+		schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_NOT_FOUND,
+		schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_LOOKUP_FAILED,
+		schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_UNAVAILABLE:
+		return shape, nil
+	default:
+		return shape, fmt.Errorf("unknown template_shape_status %d", int32(shape.status))
+	}
+}
+
+// resolved reports whether the hint carries a usable template shape.
+func (s templateShape) resolved() bool {
+	return s.status == schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_RESOLVED && s.memoryBytes > 0
+}
+
+// lookupFailed reports whether the template read failed in a way that leaves
+// the shape unknown.
+func (s templateShape) lookupFailed() bool {
+	switch s.status {
+	case schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_LOOKUP_FAILED,
+		schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_UNAVAILABLE:
+		return true
+	default:
+		return false
+	}
+}
+
+// memoryLimitConfigured reports whether a memory allocation ceiling exists, so
+// the shape rule has something to enforce.
+func memoryLimitConfigured(limit *config.NodeResourceLimit) bool {
+	return limit != nil && limit.MaxMemoryAllocatedPercent != nil
+}
+
+// projectCreateShape applies the shape rule to the candidates. In "on" and
+// "off" it drops the nodes that do not admit the shape; in "shadow" it records
+// a verdict per node and returns every candidate, because shadow must not
+// change the decision.
+func (s *Service) projectCreateShape(nodes []RichNode, memoryBytes uint64, cpuCount uint32, shape templateShape) []RichNode {
+	shadow := s.resourceLimit != nil && s.resourceLimit.ShapeAdmissionShadow()
+	admitted := make([]RichNode, 0, len(nodes))
+	for _, node := range nodes {
+		ok, reason := EvaluateShapeAdmission(node, memoryBytes, cpuCount, s.resourceLimit)
+		if ok {
+			admitted = append(admitted, node)
+		}
+		if shadow {
+			outcome := shapeOutcomeWouldReject
+			if ok {
+				outcome = shapeOutcomeAdmit
+			}
+			s.recordCreateShapeVerdict(outcome, reason, shape, memoryBytes, node)
+		}
+	}
+	if shadow {
+		if len(nodes) > 0 && len(admitted) == 0 {
+			recordShapeAdmission(shapeKindCreate, shapeOutcomeWouldRejectAll, shapeReasonNone)
+		}
+		return nodes
+	}
+	return admitted
+}
+
+// recordCreateShapeVerdict counts and logs one create shape verdict.
+func (s *Service) recordCreateShapeVerdict(outcome, reason string, shape templateShape, memoryBytes uint64, node RichNode) {
+	recordShapeAdmission(shapeKindCreate, outcome, reason)
+	s.logger.Info("scheduler shape admission verdict",
+		zap.String("kind", shapeKindCreate),
+		zap.String("node_id", node.Node.ID),
+		zap.String("template_id", shape.templateID),
+		zap.Uint64("shape_bytes", memoryBytes),
+		zap.Uint64("allocated_bytes", node.Snapshot.GetAllocatedMemoryBytes()),
+		zap.String("reason", reasonOrNone(reason)),
+		zap.String("limit", limitMaxMemoryAllocatedPercent),
+		zap.Uint32("threshold", thresholdPercent(s.resourceLimit)),
+		zap.String("outcome", outcome),
+	)
+}
+
+// recordUnknownCreateShape counts a create whose shape could not be resolved.
+func (s *Service) recordUnknownCreateShape(shape templateShape) {
+	recordShapeAdmission(shapeKindCreate, shapeOutcomeUnknownShape, shapeReasonUnknownShape)
+	s.logger.Info("scheduler create has no known shape",
+		zap.String("kind", shapeKindCreate),
+		zap.String("template_id", shape.templateID),
+		zap.String("reason", shapeReasonUnknownShape),
+	)
+}
+
+func reasonOrNone(reason string) string {
+	if reason == "" {
+		return shapeReasonNone
+	}
+	return reason
+}
+
+func thresholdPercent(limit *config.NodeResourceLimit) uint32 {
+	if limit == nil || limit.MaxMemoryAllocatedPercent == nil {
+		return 0
+	}
+	return *limit.MaxMemoryAllocatedPercent
+}
+
+// observeResumeShadow evaluates the resume rule and records the verdict while
+// leaving the decision untouched.
+func (s *Service) observeResumeShadow(sandboxID string, owner Node, req *schedulerv1.ScheduleResumeRequest) {
+	s.lockAdmission()
+	defer s.unlockAdmission()
+
+	memoryBytes, cpuCount, known := s.pausedShape(owner.ID, sandboxID, req)
+	if !known {
+		recordShapeAdmission(shapeKindResume, shapeOutcomeUnknownShape, shapeReasonUnknownShape)
+		s.logger.Warn("scheduler shadow deferred resume with unknown paused shape",
+			zap.String("kind", shapeKindResume),
+			zap.String("sandbox_id", sandboxID),
+			zap.String("node_id", owner.ID),
+			zap.String("reason", shapeReasonUnknownShape),
+		)
+		return
+	}
+
+	ownerRich := s.projectReservationsExcept([]RichNode{s.richNode(owner.ID)}, sandboxID)[0]
+	admitted, reason := EvaluateShapeAdmission(ownerRich, memoryBytes, cpuCount, s.resourceLimit)
+	if admitted {
+		recordShapeAdmission(shapeKindResume, shapeOutcomeAdmit, shapeReasonNone)
+		s.logResumeShadow(shapeOutcomeAdmit, reason, sandboxID, owner.ID, memoryBytes, ownerRich)
+		return
+	}
+	if s.resourceLimit.CrossNodeResumeEnabled() {
+		if candidates := s.resumeCandidates(owner.ID, memoryBytes, cpuCount, sandboxID); len(candidates) > 0 {
+			recordShapeAdmission(shapeKindResume, shapeOutcomeWouldMove, reason)
+			s.logResumeShadow(shapeOutcomeWouldMove, reason, sandboxID, owner.ID, memoryBytes, ownerRich)
+			return
+		}
+	}
+	recordShapeAdmission(shapeKindResume, shapeOutcomeWouldDefer, reason)
+	s.logResumeShadow(shapeOutcomeWouldDefer, reason, sandboxID, owner.ID, memoryBytes, ownerRich)
+}
+
+func (s *Service) logResumeShadow(outcome, reason, sandboxID, nodeID string, memoryBytes uint64, ownerRich RichNode) {
+	s.logger.Info("scheduler shape admission verdict",
+		zap.String("kind", shapeKindResume),
+		zap.String("outcome", outcome),
+		zap.String("sandbox_id", sandboxID),
+		zap.String("node_id", nodeID),
+		zap.Uint64("shape_bytes", memoryBytes),
+		zap.Uint64("allocated_bytes", ownerRich.Snapshot.GetAllocatedMemoryBytes()),
+		zap.String("reason", reasonOrNone(reason)),
+		zap.String("limit", limitMaxMemoryAllocatedPercent),
+		zap.Uint32("threshold", thresholdPercent(s.resourceLimit)),
+	)
 }
 
 // lockAdmission serializes the decision with the in-flight reservations. It
@@ -488,7 +711,7 @@ func (s *Service) ListObservedNodes(_ context.Context, req *schedulerv1.ListObse
 // nodeAdmission publishes the per-layer verdict for one observed node, along
 // with the capacity facts it was computed over.
 func (s *Service) nodeAdmission(n RichNode) *schedulerv1.NodeAdmission {
-	if n.Snapshot == nil || s.resourceLimit == nil || !s.resourceLimit.ShapeAdmissionEnabled() {
+	if n.Snapshot == nil || s.resourceLimit == nil || !s.resourceLimit.ShapeAdmissionObserved() {
 		return nil
 	}
 	verdicts := EvaluateNodeAdmission(n, s.resourceLimit)
@@ -541,8 +764,17 @@ func (s *Service) ScheduleResume(_ context.Context, req *schedulerv1.ScheduleRes
 		return nil, status.Error(codes.NotFound, "sandbox assignment not found")
 	}
 
-	if s.resourceLimit == nil || !s.resourceLimit.ShapeAdmissionEnabled() {
+	if s.resourceLimit == nil || !s.resourceLimit.ShapeAdmissionObserved() {
 		recordResumeAdmission("disabled")
+		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: true}, nil
+	}
+
+	if s.resourceLimit.ShapeAdmissionShadow() {
+		// Shadow evaluates the rule and records the verdict but keeps today's
+		// decision: the owner is admitted with no reservation and no binding
+		// change.
+		s.observeResumeShadow(sandboxID, owner, req)
+		recordResumeAdmission("shadow")
 		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: true}, nil
 	}
 
