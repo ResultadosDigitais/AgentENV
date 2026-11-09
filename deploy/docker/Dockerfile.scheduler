@@ -9,12 +9,20 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/schedul
 
 FROM alpine:3.21 AS grpc-health-probe
 ARG TARGETARCH
+# v0.4.46, SHA-256 measured from the pinned upstream release. The download
+# fails closed: a divergent digest aborts the build before the binary ships.
 RUN apk add --no-cache curl \
 	&& case "${TARGETARCH}" in \
-		amd64|arm64) ARCH="${TARGETARCH}" ;; \
+		amd64) ARCH="amd64"; SHA256="da81f8e285c7fc6002ed2dc33725494b9451abc6506352b789003903b6753af2" ;; \
+		arm64) ARCH="arm64"; SHA256="cf6cd02d52d3f06c2a7bedeaf25e0b33a48ae3ae9fcaeca52d0db7f38d00a792" ;; \
 		*) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
 	esac \
 	&& curl -fL "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.46/grpc_health_probe-linux-${ARCH}" -o /grpc_health_probe \
+	&& ACTUAL="$(sha256sum /grpc_health_probe | cut -d' ' -f1)" \
+	&& if [ "${ACTUAL}" != "${SHA256}" ]; then \
+		echo "sha256 mismatch for grpc_health_probe-linux-${ARCH}: expected ${SHA256}, got ${ACTUAL}" >&2; \
+		exit 1; \
+	fi \
 	&& chmod +x /grpc_health_probe
 
 FROM gcr.io/distroless/static-debian12
