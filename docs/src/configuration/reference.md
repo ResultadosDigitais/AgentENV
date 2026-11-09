@@ -32,6 +32,14 @@ Packaged runtime dependency versions and download URLs live in
 installed. User configuration should contain runtime behavior and explicit
 local path overrides, not the default dependency catalog.
 
+The `firecracker` and `kernel` catalog entries also carry a `sha256` pin per
+target architecture. Setup hashes the artifact while downloading it and fails
+closed when the digest differs: the temporary file is removed and nothing is
+installed. A `version` override selects different bytes and therefore disables
+the bundled pin; a `url` override alone keeps it, so a mirror must serve the
+same release. An entry without a pin for the current architecture also fails
+closed instead of downloading unverified.
+
 ## `[firecracker]`
 
 Firecracker VM binary and boot configuration.
