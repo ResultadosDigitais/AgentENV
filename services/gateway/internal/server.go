@@ -69,6 +69,7 @@ type Server struct {
 	debugMode           bool
 	sandboxProxyDomains []string
 	sandboxShapes       *sandboxShapeCache
+	templateShapes      *templateShapeCache
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
@@ -97,6 +98,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 		sandboxShapes:       newSandboxShapeCache(),
+		templateShapes:      newTemplateShapeCache(nil),
 	}, nil
 }
 
@@ -314,10 +316,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				CPUCount:    cold.GetCpuCount(),
 				MemoryBytes: cold.GetMemoryMb() << 20,
 			}
-		} else if sandbox := hint.GetNewSandbox(); sandbox != nil && sandbox.GetMemoryMb() > 0 {
-			scheduledShape = &sandboxShape{
-				CPUCount:    sandbox.GetCpuCount(),
-				MemoryBytes: sandbox.GetMemoryMb() << 20,
+		} else if sandbox := hint.GetNewSandbox(); sandbox != nil {
+			switch {
+			case sandbox.GetMemoryMb() > 0:
+				scheduledShape = &sandboxShape{
+					CPUCount:    sandbox.GetCpuCount(),
+					MemoryBytes: sandbox.GetMemoryMb() << 20,
+				}
+			case strings.TrimSpace(sandbox.GetTemplateId()) != "":
+				// The body carries no shape: resolve it from the template on a
+				// READY node before deciding. The forwarded body is untouched;
+				// the resolved shape travels in the hint only.
+				shape, status := s.resolveTemplateShape(routingCtx, strings.TrimSpace(sandbox.GetTemplateId()))
+				sandbox.ResolvedMemoryMb = shape.MemoryBytes >> 20
+				sandbox.ResolvedCpuCount = shape.CPUCount
+				sandbox.TemplateShapeStatus = status
+				if status == schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_RESOLVED && shape.MemoryBytes > 0 {
+					scheduledShape = &sandboxShape{CPUCount: shape.CPUCount, MemoryBytes: shape.MemoryBytes}
+				}
 			}
 		}
 		rpcStart := time.Now()
@@ -327,6 +343,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
 		if err != nil {
 			s.writeSchedulerError(w, err)
+			return
+		}
+		if reason := resp.GetRefusalReason(); reason != schedulerv1.ScheduleRefusalReason_SCHEDULE_REFUSAL_REASON_UNSPECIFIED {
+			if reason == schedulerv1.ScheduleRefusalReason_SCHEDULE_REFUSAL_REASON_UNKNOWN_TEMPLATE_SHAPE {
+				writeCapacityDeferred(w, "unknown_template_shape")
+				return
+			}
+			// An enum value this binary does not know: fail closed.
+			http.Error(w, "scheduler refused the create", http.StatusBadGateway)
 			return
 		}
 		node = resp.GetNode()
