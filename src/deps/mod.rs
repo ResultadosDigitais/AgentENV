@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,6 +37,39 @@ struct SetupDependencyManifest {
 struct ManifestDownload {
     version: String,
     url: String,
+    /// SHA-256 pin per target architecture (`x86_64`, `aarch64`).
+    #[serde(default)]
+    sha256: BTreeMap<String, String>,
+}
+
+impl ManifestDownload {
+    /// Pin for `arch`; a catalog entry covered by this card never downloads
+    /// without one, so an incomplete manifest fails closed before any network
+    /// request instead of silently trusting the upstream artifact.
+    fn pinned_sha256(&self, arch: &str, asset: &str) -> Result<&str> {
+        self.sha256.get(arch).map(String::as_str).with_context(|| {
+            format!(
+                "{asset} release '{}' has no sha256 pin for architecture '{arch}'",
+                self.version
+            )
+        })
+    }
+
+    /// Pin that applies to this download. A version override selects different
+    /// bytes, so the bundled pin no longer describes the artifact; a URL
+    /// override alone keeps the pin because it must still serve the same
+    /// release (a mirror or the versioned reserve).
+    fn applicable_sha256<'a>(
+        &'a self,
+        version_override: Option<&str>,
+        arch: &str,
+        asset: &str,
+    ) -> Result<Option<&'a str>> {
+        if version_override.is_some_and(|version| version != self.version) {
+            return Ok(None);
+        }
+        self.pinned_sha256(arch, asset).map(Some)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,7 +181,12 @@ async fn ensure_firecracker(
     let fc_tgz_path = fc_dir.join(format!("firecracker-{fc_version}-{arch}.tgz"));
     let cth_path = fc_dir.join("cpu-template-helper");
     let fc_url = resolve_url(fc_url_template, &[("version", fc_version), ("arch", arch)]);
-    download_file(&fc_url, &fc_tgz_path).await?;
+    let fc_sha256 = mode_manifest.applicable_sha256(
+        config.firecracker.version.as_deref(),
+        arch,
+        "firecracker",
+    )?;
+    download_file_with_sha256(&fc_url, &fc_tgz_path, fc_sha256).await?;
     extract_firecracker(&fc_tgz_path, &fc_path, &cth_path)?;
     // The tarball is only needed during extraction; drop it so it does not
     // bloat container image layers built via `--setup-only`.
@@ -181,7 +220,9 @@ async fn ensure_kernel(
         kernel_url_template,
         &[("version", kernel_version), ("arch", arch)],
     );
-    download_file(&kernel_url, &kernel_path).await
+    let kernel_sha256 =
+        mode_manifest.applicable_sha256(config.kernel.version.as_deref(), arch, "kernel")?;
+    download_file_with_sha256(&kernel_url, &kernel_path, kernel_sha256).await
 }
 
 fn ensure_tools(config: &AppConfig) -> Result<()> {
@@ -541,6 +582,22 @@ fn validate_explicit_file(config_key: &str, path: &Path, executable: bool) -> Re
 }
 
 pub(super) async fn download_file(url: &str, dest: &Path) -> Result<()> {
+    download_file_with_sha256(url, dest, None).await
+}
+
+/// Downloads `url` into `dest`, optionally verifying the bytes against
+/// `expected_sha256` before the temporary file becomes visible.
+///
+/// The digest is computed while streaming, so a mismatch (or a transport
+/// error) removes the temporary file and leaves no artifact installed. The
+/// destination is renamed only after the verification succeeds.
+pub(super) async fn download_file_with_sha256(
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<()> {
+    let expected_sha256 = expected_sha256.map(normalize_sha256).transpose()?;
+
     if file_exists_nonempty(dest) {
         debug!(path = %dest.display(), "already present, skipping download");
         return Ok(());
@@ -558,14 +615,65 @@ pub(super) async fn download_file(url: &str, dest: &Path) -> Result<()> {
         bail!("HTTP {} for {}", status, url);
     }
 
-    let bytes = response.bytes().await.context("reading response body")?;
-
     let tmp_path = dest.with_extension("tmp");
-    tokio::fs::write(&tmp_path, &bytes).await?;
-    tokio::fs::rename(&tmp_path, dest)
-        .await
-        .context("moving downloaded file to destination")?;
+    let actual_sha256 = match write_response_with_sha256(response, &tmp_path).await {
+        Ok(actual) => actual,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(error);
+        }
+    };
+
+    if let Some(expected) = expected_sha256.as_deref() {
+        if !actual_sha256.eq_ignore_ascii_case(expected) {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            bail!("sha256 mismatch for {url}: expected {expected}, got {actual_sha256}");
+        }
+        debug!(url = url, sha256 = %actual_sha256, "download digest verified");
+    }
+
+    if let Err(error) = tokio::fs::rename(&tmp_path, dest).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(error).with_context(|| format!("move downloaded file to {}", dest.display()));
+    }
     Ok(())
+}
+
+/// Streams the response body into `path` while hashing it, returning the
+/// lowercase hexadecimal SHA-256 digest of the written bytes.
+async fn write_response_with_sha256(
+    mut response: reqwest::Response,
+    path: &Path,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .with_context(|| format!("create {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = response.chunk().await.context("reading response body")? {
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    file.flush()
+        .await
+        .with_context(|| format!("flush {}", path.display()))?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Accepts a raw hexadecimal digest or an OCI-style `sha256:<hex>` pin and
+/// returns lowercase hexadecimal, rejecting a malformed pin before any
+/// download starts.
+fn normalize_sha256(pin: &str) -> Result<String> {
+    let pin = pin.trim();
+    let digest = pin.strip_prefix("sha256:").unwrap_or(pin);
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid sha256 pin '{pin}'");
+    }
+    Ok(digest.to_ascii_lowercase())
 }
 
 async fn download_executable_file(url: &str, dest: &Path) -> Result<()> {
@@ -965,10 +1073,11 @@ fn detect_docker_credential_config() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bundled_manifest, ensure_firecracker, ensure_kernel, ensure_legacy_tools_drive,
-        ensure_tools, file_exists_nonempty, overlaybd_credential_fields,
-        overlaybd_runtime_gcs_config, overlaybd_runtime_oss_config, validate_explicit_file,
-        version_output_mentions_exact_token, write_generated_overlaybd_global_configs,
+        bundled_manifest, download_file_with_sha256, ensure_firecracker, ensure_kernel,
+        ensure_legacy_tools_drive, ensure_tools, file_exists_nonempty, normalize_sha256,
+        overlaybd_credential_fields, overlaybd_runtime_gcs_config, overlaybd_runtime_oss_config,
+        validate_explicit_file, version_output_mentions_exact_token,
+        write_generated_overlaybd_global_configs,
     };
     use overlaybd::config::{load_global_config, DownloadConfig};
 
@@ -1144,6 +1253,134 @@ mod tests {
             "VCSTag:     v0.11.55\n",
             "v0.11.5"
         ));
+    }
+
+    #[test]
+    fn catalog_pins_sha256_for_every_supported_firecracker_and_kernel_architecture() {
+        let manifest = bundled_manifest();
+        for (asset, entry) in [
+            ("firecracker.kvm", &manifest.firecracker.kvm),
+            ("kernel.kvm", &manifest.kernel.kvm),
+        ] {
+            for arch in ["x86_64", "aarch64"] {
+                let pin = entry
+                    .pinned_sha256(arch, asset)
+                    .unwrap_or_else(|error| panic!("{asset} {arch}: {error}"));
+                assert_eq!(
+                    normalize_sha256(pin).expect("pin is a sha256 digest"),
+                    pin,
+                    "{asset} {arch} pin must be lowercase hexadecimal"
+                );
+            }
+        }
+        for (asset, entry) in [
+            ("firecracker.pvm", &manifest.firecracker.pvm),
+            ("kernel.pvm", &manifest.kernel.pvm),
+        ] {
+            let pin = entry
+                .pinned_sha256("x86_64", asset)
+                .unwrap_or_else(|error| panic!("{asset} x86_64: {error}"));
+            normalize_sha256(pin).expect("pin is a sha256 digest");
+            assert!(
+                entry.pinned_sha256("aarch64", asset).is_err(),
+                "{asset} ships no aarch64 asset and must not invent a pin"
+            );
+        }
+    }
+
+    #[test]
+    fn version_override_drops_the_bundled_pin_and_url_override_keeps_it() {
+        let manifest = bundled_manifest();
+        let entry = &manifest.firecracker.kvm;
+
+        let default_pin = entry
+            .applicable_sha256(None, "x86_64", "firecracker")
+            .expect("default source keeps the pin");
+        assert_eq!(default_pin, Some(entry.sha256["x86_64"].as_str()));
+        assert_eq!(
+            entry
+                .applicable_sha256(Some(entry.version.as_str()), "x86_64", "firecracker")
+                .expect("same version keeps the pin"),
+            default_pin
+        );
+        assert_eq!(
+            entry
+                .applicable_sha256(Some("another-release"), "x86_64", "firecracker")
+                .expect("different version has no bundled pin"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn download_installs_the_artifact_only_after_the_sha256_matches() {
+        let (url, server) = serve_bytes(b"pinned artifact bytes").await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dest = temp.path().join("asset");
+        let expected = crate::digest::sha256_hex(b"pinned artifact bytes");
+
+        download_file_with_sha256(&url, &dest, Some(&expected))
+            .await
+            .expect("matching digest installs the artifact");
+        server.abort();
+
+        assert_eq!(
+            std::fs::read(&dest).expect("read installed artifact"),
+            b"pinned artifact bytes"
+        );
+        assert!(!dest.with_extension("tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn download_with_divergent_sha256_fails_closed_without_installing_anything() {
+        let (url, server) = serve_bytes(b"tampered artifact bytes").await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dest = temp.path().join("asset");
+
+        let error = download_file_with_sha256(
+            &url,
+            &dest,
+            Some(&crate::digest::sha256_hex(b"expected artifact bytes")),
+        )
+        .await
+        .expect_err("a divergent digest must fail");
+        server.abort();
+
+        assert!(
+            error.to_string().contains("sha256 mismatch"),
+            "unexpected error: {error}"
+        );
+        assert!(!dest.exists(), "no artifact may be installed");
+        assert!(
+            !dest.with_extension("tmp").exists(),
+            "no temporary file may survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_rejects_a_malformed_pin_before_any_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dest = temp.path().join("asset");
+
+        let error = download_file_with_sha256("http://127.0.0.1:9/never", &dest, Some("not-a-pin"))
+            .await
+            .expect_err("a malformed pin must fail closed");
+
+        assert!(
+            error.to_string().contains("invalid sha256 pin"),
+            "unexpected error: {error}"
+        );
+        assert!(!dest.exists());
+    }
+
+    /// Starts a one-shot HTTP server that serves `body` for any request path.
+    async fn serve_bytes(body: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().fallback(move || async move { body });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        (format!("http://{address}/asset"), server)
     }
 
     #[tokio::test]
