@@ -207,17 +207,17 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	reserveMemory, reserveCPU := bodyMemory, bodyCPU
 	switch {
 	case bodyHasShape:
-		// The body shape projects exactly as before in every mode; shadow
-		// also records the verdict.
-		eligible = s.projectCreateShape(eligible, bodyMemory, bodyCPU, shape)
+		// The body shape filters exactly as before in every mode; shadow only
+		// records the verdict on top of the same decision.
+		eligible = s.projectCreateShape(eligible, bodyMemory, bodyCPU, shape, true)
 	case reserve && mode == config.ShapeAdmissionOn && shape.resolved():
 		reserveMemory, reserveCPU = shape.memoryBytes, shape.cpuCount
-		eligible = s.projectCreateShape(eligible, shape.memoryBytes, shape.cpuCount, shape)
+		eligible = s.projectCreateShape(eligible, shape.memoryBytes, shape.cpuCount, shape, true)
 	case reserve && mode == config.ShapeAdmissionShadow:
 		switch shape.status {
 		case schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_RESOLVED:
 			// Record the verdict per node without changing the decision.
-			s.projectCreateShape(eligible, shape.memoryBytes, shape.cpuCount, shape)
+			s.projectCreateShape(eligible, shape.memoryBytes, shape.cpuCount, shape, false)
 		case schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_NOT_FOUND:
 			// The template does not exist; the upstream create decides.
 		default:
@@ -342,11 +342,14 @@ func memoryLimitConfigured(limit *config.NodeResourceLimit) bool {
 	return limit != nil && limit.MaxMemoryAllocatedPercent != nil
 }
 
-// projectCreateShape applies the shape rule to the candidates. In "on" and
-// "off" it drops the nodes that do not admit the shape; in "shadow" it records
-// a verdict per node and returns every candidate, because shadow must not
-// change the decision.
-func (s *Service) projectCreateShape(nodes []RichNode, memoryBytes uint64, cpuCount uint32, shape templateShape) []RichNode {
+// projectCreateShape applies the shape rule to the candidates. enforce drops
+// the nodes that do not admit the shape; with it false every candidate is
+// returned unchanged, because shadow must not change the decision. When shadow
+// is active it also records a verdict per node. The body shape is always
+// enforced, in every mode, exactly as before the shape rule existed; the
+// resolved template shape is enforced only in "on" and merely observed in
+// "shadow".
+func (s *Service) projectCreateShape(nodes []RichNode, memoryBytes uint64, cpuCount uint32, shape templateShape, enforce bool) []RichNode {
 	shadow := s.resourceLimit != nil && s.resourceLimit.ShapeAdmissionShadow()
 	admitted := make([]RichNode, 0, len(nodes))
 	for _, node := range nodes {
@@ -362,10 +365,10 @@ func (s *Service) projectCreateShape(nodes []RichNode, memoryBytes uint64, cpuCo
 			s.recordCreateShapeVerdict(outcome, reason, shape, memoryBytes, node)
 		}
 	}
-	if shadow {
-		if len(nodes) > 0 && len(admitted) == 0 {
-			recordShapeAdmission(shapeKindCreate, shapeOutcomeWouldRejectAll, shapeReasonNone)
-		}
+	if shadow && len(nodes) > 0 && len(admitted) == 0 {
+		recordShapeAdmission(shapeKindCreate, shapeOutcomeWouldRejectAll, shapeReasonNone)
+	}
+	if !enforce {
 		return nodes
 	}
 	return admitted

@@ -10,6 +10,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // shapeAdmissionCount reads the shape admission counter straight from
@@ -35,6 +37,12 @@ func resolvedHint(memoryGiB uint64, cpuCount uint32) *schedulerv1.ScheduleReques
 			TemplateShapeStatus: schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_RESOLVED,
 			TemplateId:          "tmpl-32g",
 		},
+	}}
+}
+
+func bodyShapeHint(memoryGiB uint64, cpuCount uint32) *schedulerv1.ScheduleRequestHint {
+	return &schedulerv1.ScheduleRequestHint{Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
+		NewSandbox: &schedulerv1.NewSandboxHint{MemoryMb: memoryGiB << 10, CpuCount: cpuCount},
 	}}
 }
 
@@ -66,6 +74,85 @@ func TestShapeAdmissionA100OOMCase(t *testing.T) {
 		if admitted := err == nil; admitted != wantAdmitted {
 			t.Fatalf("create %d admitted = %v (err=%v), want %v", i+1, admitted, err, wantAdmitted)
 		}
+	}
+}
+
+// A create whose body carries memoryMB is filtered by the shape rule in every
+// mode, exactly as it was before the shape rule existed. Shadow only records
+// the verdict: it must never return a node that off would reject.
+func TestShapeAdmissionBodyShapeFiltersInEveryMode(t *testing.T) {
+	for _, mode := range []string{
+		config.ShapeAdmissionOn,
+		config.ShapeAdmissionShadow,
+		config.ShapeAdmissionOff,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			limit := &config.NodeResourceLimit{
+				MaxMemoryAllocatedPercent: uint32Ptr(100),
+				MemoryCapacitySource:      strPtr(config.MemoryCapacitySourceTotal),
+				ShapeAdmission:            strPtr(mode),
+			}
+			service := newReservationService(t, limit, true, nil, "525v")
+			total := uint64(1126) * gib / 10
+			// Three 32 GiB VMs of the OOM case are already allocated; the fourth
+			// body-shaped create needs 128 GiB and does not fit the pod.
+			heartbeatSnapshot(t, service, "525v", &schedulerv1.NodeSnapshot{
+				MemoryTotalBytes:     total,
+				AllocatedMemoryBytes: 96 * gib,
+				MemoryUsedBytes:      96 * gib,
+				CpuCount:             32,
+			}, nil, nil)
+
+			beforeWouldReject := shapeAdmissionCount(t, shapeKindCreate, shapeOutcomeWouldReject, ReasonMemoryAllocated)
+			beforeWouldRejectAll := shapeAdmissionCount(t, shapeKindCreate, shapeOutcomeWouldRejectAll, shapeReasonNone)
+			_, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{Hint: bodyShapeHint(32, 8)})
+			if err == nil {
+				t.Fatalf("body-shaped create that does not fit was admitted in %q mode", mode)
+			}
+			if status.Code(err) != codes.Unavailable {
+				t.Fatalf("schedule error = %v, want Unavailable", err)
+			}
+			if mode != config.ShapeAdmissionShadow {
+				return
+			}
+			if got := shapeAdmissionCount(t, shapeKindCreate, shapeOutcomeWouldReject, ReasonMemoryAllocated); got <= beforeWouldReject {
+				t.Fatalf("would_reject not recorded (before=%v after=%v)", beforeWouldReject, got)
+			}
+			if got := shapeAdmissionCount(t, shapeKindCreate, shapeOutcomeWouldRejectAll, shapeReasonNone); got <= beforeWouldRejectAll {
+				t.Fatalf("would_reject_all not recorded (before=%v after=%v)", beforeWouldRejectAll, got)
+			}
+		})
+	}
+}
+
+// The resolved template shape path is the mirror image of the body shape: in
+// shadow it must keep the off decision (the create is admitted) while recording
+// that every candidate would have been rejected.
+func TestShapeAdmissionShadowResolvedTemplateKeepsDecision(t *testing.T) {
+	limit := &config.NodeResourceLimit{
+		MaxMemoryAllocatedPercent: uint32Ptr(100),
+		MemoryCapacitySource:      strPtr(config.MemoryCapacitySourceTotal),
+		ShapeAdmission:            strPtr(config.ShapeAdmissionShadow),
+	}
+	service := newReservationService(t, limit, true, nil, "525v")
+	total := uint64(1126) * gib / 10
+	heartbeatSnapshot(t, service, "525v", &schedulerv1.NodeSnapshot{
+		MemoryTotalBytes:     total,
+		AllocatedMemoryBytes: 96 * gib,
+		MemoryUsedBytes:      96 * gib,
+		CpuCount:             32,
+	}, nil, nil)
+
+	beforeWouldRejectAll := shapeAdmissionCount(t, shapeKindCreate, shapeOutcomeWouldRejectAll, shapeReasonNone)
+	resp, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{Hint: resolvedHint(32, 8)})
+	if err != nil {
+		t.Fatalf("shadow must admit the create like off, got error %v", err)
+	}
+	if resp.GetNode().GetNodeId() != "525v" {
+		t.Fatalf("shadow must keep the off decision, got node %q", resp.GetNode().GetNodeId())
+	}
+	if got := shapeAdmissionCount(t, shapeKindCreate, shapeOutcomeWouldRejectAll, shapeReasonNone); got <= beforeWouldRejectAll {
+		t.Fatalf("would_reject_all not recorded (before=%v after=%v)", beforeWouldRejectAll, got)
 	}
 }
 
