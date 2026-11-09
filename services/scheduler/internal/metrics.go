@@ -86,7 +86,39 @@ var (
 		},
 		[]string{"outcome"},
 	)
+	schedulerShapeAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_shape_admission_total",
+			Help: "Shape admission verdicts by kind (create, resume), outcome (admit, would_reject, would_reject_all, would_defer, would_move, unknown_shape) and reason.",
+		},
+		[]string{"kind", "outcome", "reason"},
+	)
 )
+
+// Shape admission kinds, outcomes and reasons. The closed sets keep the
+// metric label cardinality bounded and make every consumer switch exhaustive.
+const (
+	shapeKindCreate = "create"
+	shapeKindResume = "resume"
+
+	shapeOutcomeAdmit          = "admit"
+	shapeOutcomeWouldReject    = "would_reject"
+	shapeOutcomeWouldRejectAll = "would_reject_all"
+	shapeOutcomeWouldDefer     = "would_defer"
+	shapeOutcomeWouldMove      = "would_move"
+	shapeOutcomeUnknownShape   = "unknown_shape"
+
+	shapeReasonNone                 = "none"
+	shapeReasonUnknownShape         = "unknown_shape"
+	shapeReasonUnknownTemplateShape = "unknown_template_shape"
+)
+
+func recordShapeAdmission(kind, outcome, reason string) {
+	if reason == "" {
+		reason = shapeReasonNone
+	}
+	schedulerShapeAdmission.WithLabelValues(kind, outcome, reason).Inc()
+}
 
 func recordAdmissionReservation(outcome string) {
 	schedulerAdmissionReservation.WithLabelValues(outcome).Inc()

@@ -97,9 +97,12 @@ type NodeResourceLimit struct {
 	// status.allocatable.memory minus the runtime overhead; "total" is the
 	// kill switch that restores the historical memory_total math.
 	MemoryCapacitySource *string `json:"memory_capacity_source"`
-	// ShapeAdmission enables the published per-layer verdict and the resume
-	// gating that projects the paused sandbox shape. Default "on"; "off" is
-	// the kill switch that restores the pre-OPSAI-6200 routing.
+	// ShapeAdmission selects how the shape rule is applied. "on" (default)
+	// decides create and resume admission by the rule and publishes the
+	// per-layer verdict; "shadow" evaluates the rule and publishes the verdict
+	// and the shadow outcomes while deciding exactly like "off"; "off" is the
+	// kill switch that restores the pre-OPSAI-6200 routing and publishes
+	// nothing.
 	ShapeAdmission *string `json:"shape_admission"`
 	// MemoryUsedMeter selects the node memory figure max_memory_used_percent
 	// compares: "raw" (default) is memory_used_bytes, the cgroup
@@ -156,8 +159,13 @@ const (
 	MemoryUsedMeterWorkingSet = "working_set"
 
 	// Shape admission modes accepted by NodeResourceLimit.ShapeAdmission.
-	ShapeAdmissionOn  = "on"
-	ShapeAdmissionOff = "off"
+	// "on" decides by the shape rule, "off" restores the pre-OPSAI-6200 routing
+	// and "shadow" evaluates the rule and records a verdict while deciding
+	// exactly like "off", so the rule can be measured for 24 h before it
+	// starts rejecting.
+	ShapeAdmissionOn     = "on"
+	ShapeAdmissionOff    = "off"
+	ShapeAdmissionShadow = "shadow"
 
 	// DefaultGatewayRequestTimeout is the gateway request timeout applied when
 	// gateway.request_timeout is absent.
@@ -223,21 +231,46 @@ func (l *NodeResourceLimit) ResolvedMemoryUsedMeter() string {
 	return MemoryUsedMeterRaw
 }
 
-// ResolvedShapeAdmission returns "on" or "off", defaulting to "on".
+// ResolvedShapeAdmission returns "on", "off" or "shadow", defaulting to "on".
+// Unknown values resolve to "on" so a typo cannot silently disable the rule;
+// Validate rejects them at startup.
 func (l *NodeResourceLimit) ResolvedShapeAdmission() string {
 	if l == nil || l.ShapeAdmission == nil {
 		return ShapeAdmissionOn
 	}
-	if strings.ToLower(strings.TrimSpace(*l.ShapeAdmission)) == ShapeAdmissionOff {
+	switch strings.ToLower(strings.TrimSpace(*l.ShapeAdmission)) {
+	case ShapeAdmissionOff:
 		return ShapeAdmissionOff
+	case ShapeAdmissionShadow:
+		return ShapeAdmissionShadow
+	default:
+		return ShapeAdmissionOn
 	}
-	return ShapeAdmissionOn
 }
 
-// ShapeAdmissionEnabled reports whether the per-layer verdict and resume
-// projection are active.
+// ShapeAdmissionEnabled reports whether the shape rule decides admission
+// (create projection and resume gating). It is false in shadow mode, which
+// only observes the rule.
 func (l *NodeResourceLimit) ShapeAdmissionEnabled() bool {
 	return l.ResolvedShapeAdmission() == ShapeAdmissionOn
+}
+
+// ShapeAdmissionShadow reports whether the shape rule is evaluated only to
+// record a verdict while the decision keeps the "off" behavior.
+func (l *NodeResourceLimit) ShapeAdmissionShadow() bool {
+	return l.ResolvedShapeAdmission() == ShapeAdmissionShadow
+}
+
+// ShapeAdmissionObserved reports whether the shape rule is evaluated at all,
+// publishing the per-layer verdict and recording shadow outcomes. It is true
+// in "on" and "shadow", false in "off".
+func (l *NodeResourceLimit) ShapeAdmissionObserved() bool {
+	switch l.ResolvedShapeAdmission() {
+	case ShapeAdmissionOn, ShapeAdmissionShadow:
+		return true
+	default:
+		return false
+	}
 }
 
 // ResolvedAdmissionLayers returns the configured layers, or the 8/16/32/64 GiB
@@ -384,9 +417,9 @@ func (l *NodeResourceLimit) Validate() error {
 	}
 	if l.ShapeAdmission != nil {
 		switch strings.ToLower(strings.TrimSpace(*l.ShapeAdmission)) {
-		case ShapeAdmissionOn, ShapeAdmissionOff:
+		case ShapeAdmissionOn, ShapeAdmissionOff, ShapeAdmissionShadow:
 		default:
-			return fmt.Errorf("scheduler.node_resource_limit.shape_admission must be one of on, off, got %q", *l.ShapeAdmission)
+			return fmt.Errorf("scheduler.node_resource_limit.shape_admission must be one of on, off, shadow, got %q", *l.ShapeAdmission)
 		}
 	}
 	if l.AdmissionReservation != nil {

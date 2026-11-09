@@ -143,7 +143,7 @@ All fields are optional. Omitting a field (or setting the whole block to `null`)
 | `max_disk_used_percent` | uint32 | Maximum used percentage of the filesystem at `disk_mount_point` (0–100). Always effective: unlike the memory limits it does not take part in `admission_mode` |
 | `disk_mount_point` | string | Mount point of the heartbeat disk metric the disk limit reads, matched exactly. Default `/workspace`; only used when `max_disk_used_percent` is set |
 | `memory_capacity_source` | string | `allocatable` (default) computes the admission ceiling over the Kubernetes node's `status.allocatable.memory` minus the runtime overhead; `total` is the kill switch that restores the `memory_total` math |
-| `shape_admission` | string | `on` (default) publishes the per-layer verdict and gates resume with the same rule; `off` is the kill switch |
+| `shape_admission` | string | `on` (default) decides create and resume admission by the shape rule and publishes the per-layer verdict; `shadow` evaluates the rule and publishes the verdict and the shadow outcomes while deciding like `off`; `off` is the kill switch that restores the pre-OPSAI-6200 routing and publishes nothing |
 | `cross_node_resume` | bool | Allow a paused sandbox rejected on its owner to resume on another admitted node. Off by default: only enable it once the paused artifacts are readable from another node |
 | `admission_layers` | array | VM shapes published per node: `{"memory_gb": 8, "cpu_count": 4}`. Default the 8, 16, 32 and 64 GiB layers; `cpu_count` is optional |
 
@@ -193,6 +193,20 @@ The admission ceiling is one rule. With `memory_capacity_source: allocatable` th
 ```
 
 `reason` is a closed set — `memory_allocated`, `memory_used`, `cpu`, `starting`, `disk` — and is omitted when the layer is admitted. The same capacity check gates a paused-sandbox resume: `POST /sandboxes/{id}/resume` asks the scheduler whether the paused shape fits its owner. When it does not and `cross_node_resume` is off, the gateway returns `503` with `Retry-After: 5` and `{"code":"sandbox_capacity_deferred","reason":"..."}`; with cross-node resume on it moves the sandbox to an admitted node and records the new binding before proxying. When neither the heartbeat nor the gateway's recorded template shape is known, the resume is deferred without a reason instead of over-admitting the node.
+
+### Shape admission and template resolution
+
+`shape_admission` has three modes:
+
+- `on` (default): every create and resume is projected with the same capacity rule and the per-layer verdict is published. A create whose body carries no `memoryMB` uses the template shape; a template the gateway cannot read is refused with `refusal_reason: UNKNOWN_TEMPLATE_SHAPE` when `max_memory_allocated_percent` is configured, never admitted blind.
+- `shadow`: evaluates the rule for create and resume and records each verdict without changing the decision, so the rule can be measured for 24 h before it rejects. Creates keep today's reservation (body shape or slot); resumes return the owner with no reservation and no binding change.
+- `off`: ignores the template shape and restores the pre-OPSAI-6200 routing.
+
+Before scheduling a create that carries only `templateID`, the gateway picks a READY node from `ListObservedNodes` and reads `GET /templates/{id}` with its API key (`builds[0].cpuCount` and `builds[0].memoryMB`). The result travels in `NewSandboxHint` (`resolved_memory_mb`, `resolved_cpu_count`, `template_shape_status`, `template_id`); the forwarded create body is untouched. The shape is cached in memory by the exact `templateID` for 5 minutes and the lookup times out after 1 s; a failed read never blocks the create and is reported as `lookup_failed`, `not_found` or `unavailable`. `refusal_reason: UNKNOWN_TEMPLATE_SHAPE` becomes `503` with `Retry-After: 5` and the same reason.
+
+Shape decisions are counted in `agentenv_scheduler_shape_admission_total{kind,outcome,reason}`: `kind` is `create` or `resume`; `outcome` is one of `admit`, `would_reject`, `would_reject_all`, `would_defer`, `would_move`, `unknown_shape`; `reason` is the capacity reason (`memory_allocated`, `memory_used`, `cpu`, `starting`, `disk`), `none`, `unknown_shape` or `unknown_template_shape`. The gateway reports the template read in `agentenv_gateway_template_shape_total{outcome}` (`resolved`, `cache_hit`, `not_found`, `lookup_failed`, `unavailable`, `no_node`) and its latency in `agentenv_gateway_template_shape_lookup_seconds{outcome}`.
+
+Deploy the scheduler with `shape_admission: shadow` first and the gateway after it, so the gateway only sends the new hint fields once the scheduler can read them. Roll back the gateway first, then the scheduler; `off` is the final kill switch and needs no gateway change.
 
 ### Memory admission modes
 
