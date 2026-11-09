@@ -55,6 +55,17 @@ message NewColdSandboxHint {
   map<string, string> metadata = 4;
 }
 
+// TemplateShapeStatus reports whether the gateway could resolve the shape of a
+// template before scheduling a create. Zero means the gateway did not report
+// it (an older gateway, or a create whose body already carries its shape).
+enum TemplateShapeStatus {
+  TEMPLATE_SHAPE_STATUS_UNSPECIFIED = 0;
+  TEMPLATE_SHAPE_STATUS_RESOLVED = 1;
+  TEMPLATE_SHAPE_STATUS_NOT_FOUND = 2;
+  TEMPLATE_SHAPE_STATUS_LOOKUP_FAILED = 3;
+  TEMPLATE_SHAPE_STATUS_UNAVAILABLE = 4;
+}
+
 // NewSandboxHint describes a POST /sandboxes request.
 message NewSandboxHint {
   // Sandbox metadata key/value pairs parsed from the request body.
@@ -63,6 +74,13 @@ message NewSandboxHint {
   // applies and the scheduler can only reserve a slot.
   uint32 cpu_count = 2;
   uint64 memory_mb = 3;
+  // Shape of the template resolved by the gateway before scheduling, used
+  // when the body does not carry memory_mb. Zero when unresolved.
+  uint64 resolved_memory_mb = 4;
+  uint32 resolved_cpu_count = 5;
+  TemplateShapeStatus template_shape_status = 6;
+  // Template identifier the shape was resolved from; empty when absent.
+  string template_id = 7;
 }
 
 message ScheduleRequest {
@@ -70,11 +88,24 @@ message ScheduleRequest {
   ScheduleRequestHint hint = 2;
 }
 
+// ScheduleRefusalReason is the closed set of reasons a Schedule call refused
+// to pick a node for a request that is otherwise syntactically valid. Zero
+// means admitted.
+enum ScheduleRefusalReason {
+  SCHEDULE_REFUSAL_REASON_UNSPECIFIED = 0;
+  // The create targets a template whose shape the gateway could not read and
+  // the shape rule would have to admit it blind. Retryable.
+  SCHEDULE_REFUSAL_REASON_UNKNOWN_TEMPLATE_SHAPE = 1;
+}
+
 message ScheduleResponse {
   Node node = 1;
   // Opaque reservation id the gateway settles once the create outcome is
   // known. Empty when the reservation ledger is disabled.
   string reservation_id = 2;
+  // Closed refusal reason; UNSPECIFIED means a node was selected. The gateway
+  // maps UNKNOWN_TEMPLATE_SHAPE to a retryable 503.
+  ScheduleRefusalReason refusal_reason = 3;
 }
 
 message ListNodesRequest {}
