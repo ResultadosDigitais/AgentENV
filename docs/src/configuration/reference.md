@@ -40,6 +40,19 @@ the bundled pin; a `url` override alone keeps it, so a mirror must serve the
 same release. An entry without a pin for the current architecture also fails
 closed instead of downloading unverified.
 
+The scheduler image does not download build-time dependencies from GitHub
+releases. `deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml` stages
+`grpc_health_probe`, the pinned `firecracker` release tarball and the kernel
+once, verifies every file against `config/build_deps.lock.toml`, and publishes
+the `us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps`
+image. `deploy/docker/Dockerfile.scheduler` copies the probe from that image by
+digest and re-checks its `sha256` inside the build. To renew a pin, update the
+entry in both `config/build_deps.lock.toml` and `config/deps_manifest.toml`, run
+the Cloud Build command in that config's header, and commit the digest it
+prints. The `docker-compose` e2e still resolves these assets through this
+catalog at setup time; moving it to the reserve image is a follow-up that needs
+Workload Identity Federation for the GitHub runner.
+
 ## `[firecracker]`
 
 Firecracker VM binary and boot configuration.

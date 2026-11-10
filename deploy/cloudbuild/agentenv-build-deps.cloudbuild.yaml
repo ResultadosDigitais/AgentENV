@@ -1,0 +1,63 @@
+# Builds the build-time dependency reserve image (OPSAI-6696).
+#
+# This is the only place in the repository allowed to download from GitHub
+# releases. deploy/docker/Dockerfile.scheduler consumes the published image by
+# digest, so a GitHub outage cannot break its build.
+#
+# Owner action (account of the substrate pipeline; the sandbox cannot reach
+# GCP). Run from the repository root:
+#   gcloud builds submit --project rd-sre-stg-01 --config deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml --substitutions _TAG=v0.4.46-1.15.1-patch-v1 .
+#   gcloud artifacts docker images describe us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps:v0.4.46-1.15.1-patch-v1 --format=get(image_summary.digest)
+# Commit the printed digest as image_digest in config/build_deps.lock.toml and
+# as BUILD_DEPS_DIGEST in deploy/docker/Dockerfile.scheduler.
+
+substitutions:
+  _TAG: v0.4.46-1.15.1-patch-v1
+  _IMAGE: us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps
+
+options:
+  machineType: E2_HIGHCPU_8
+
+steps:
+  - id: stage
+    name: debian:bookworm-slim
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          ca-certificates curl
+        rm -rf /var/lib/apt/lists/*
+        bash scripts/deps/stage_build_deps.sh --lock config/build_deps.lock.toml \
+          --dest deploy/cloudbuild/build-deps
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        docker build \
+          --platform linux/amd64 \
+          -f deploy/cloudbuild/Dockerfile.build-deps \
+          -t "${_IMAGE}:${_TAG}" \
+          deploy/cloudbuild/build-deps
+  - id: publish
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        docker push "${_IMAGE}:${_TAG}"
+        docker inspect --format '{{index .RepoDigests 0}}' "${_IMAGE}:${_TAG}"
+  - id: report
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        gcloud artifacts docker images describe "${_IMAGE}:${_TAG}" \
+          --format=get(image_summary.digest) | tee deploy/cloudbuild/build-deps/digest.txt
+        sha256sum deploy/cloudbuild/build-deps/grpc_health_probe \
+          deploy/cloudbuild/build-deps/firecracker \
+          deploy/cloudbuild/build-deps/vmlinux

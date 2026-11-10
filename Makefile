@@ -64,6 +64,8 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all test-buildkit test-buildkit-users \
+	verify-build-deps verify-build-deps-guard verify-build-deps-staging \
+	verify-build-deps-cloudbuild verify-build-deps-pins \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
@@ -161,6 +163,24 @@ install-ublk: build-ublk
 	$(AENV_INSTALL_SUDO) mkdir -p "$$(dirname "$(UVM_UBLK_DAEMON_INSTALL_PATH)")"
 	$(AENV_INSTALL_SUDO) cp "$(TARGET_PROFILE_DIR)/uvm-ublk-daemon" "$(UVM_UBLK_DAEMON_INSTALL_PATH)"
 	$(AENV_INSTALL_SUDO) chmod 0755 "$(UVM_UBLK_DAEMON_INSTALL_PATH)"
+
+# Offline gates for the build-time dependency reserve (OPSAI-6696): no network
+# and no GCP access required.
+verify-build-deps: verify-build-deps-guard verify-build-deps-staging verify-build-deps-cloudbuild
+
+verify-build-deps-guard:
+	bash $(TEST_SCRIPTS_DIR)/verify-no-github-release-downloads.sh
+
+verify-build-deps-staging:
+	bash $(TEST_SCRIPTS_DIR)/verify-build-deps-staging.sh
+
+verify-build-deps-cloudbuild:
+	bash $(TEST_SCRIPTS_DIR)/verify-build-deps-cloudbuild.sh
+
+# Requires the published reserve digest (config/build_deps.lock.toml
+# image_digest); the check fails closed while it is still the zero placeholder.
+verify-build-deps-pins:
+	bash $(TEST_SCRIPTS_DIR)/verify-build-deps-pins.sh
 
 test-envd:
 	bash $(TEST_SCRIPTS_DIR)/test_envd.sh
