@@ -1,3 +1,10 @@
+# Global build args: a FROM line can only read args declared before the first
+# FROM. The reserve image is published by
+# deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml and pinned by
+# config/build_deps.lock.toml; the digest makes the bytes immutable.
+ARG BUILD_DEPS_IMAGE=us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps
+ARG BUILD_DEPS_DIGEST=sha256:8f2131306de394ab21b5ff9b2a519251dddee0718a28ed0587c64f3774fbcbdd
+
 FROM golang:1.25-bookworm AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
@@ -7,27 +14,31 @@ RUN go mod download
 COPY services/ .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/scheduler ./scheduler/cmd
 
-FROM alpine:3.21 AS grpc-health-probe
-ARG TARGETARCH
-# v0.4.46, SHA-256 measured from the pinned upstream release. The download
-# fails closed: a divergent digest aborts the build before the binary ships.
-RUN apk add --no-cache curl \
-	&& case "${TARGETARCH}" in \
-		amd64) ARCH="amd64"; SHA256="da81f8e285c7fc6002ed2dc33725494b9451abc6506352b789003903b6753af2" ;; \
-		arm64) ARCH="arm64"; SHA256="cf6cd02d52d3f06c2a7bedeaf25e0b33a48ae3ae9fcaeca52d0db7f38d00a792" ;; \
-		*) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-	esac \
-	&& curl -fL "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.46/grpc_health_probe-linux-${ARCH}" -o /grpc_health_probe \
-	&& ACTUAL="$(sha256sum /grpc_health_probe | cut -d' ' -f1)" \
-	&& if [ "${ACTUAL}" != "${SHA256}" ]; then \
-		echo "sha256 mismatch for grpc_health_probe-linux-${ARCH}: expected ${SHA256}, got ${ACTUAL}" >&2; \
+# Build-time dependencies come from the reserve image, never from GitHub
+# releases: the 2026-11-09 incident returned HTTP 504 from
+# github.com/<owner>/<repo>/releases and broke this build. The reserve is
+# linux/amd64 only.
+FROM ${BUILD_DEPS_IMAGE}@${BUILD_DEPS_DIGEST} AS reserve
+
+# Re-check the pinned digest of the probe inside the build: a divergent byte
+# fails closed before the binary ships.
+FROM alpine:3.21 AS reserve-verify
+# hadolint DL4006: the sha256 pipeline must fail when either side fails.
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+ARG GRPC_HEALTH_PROBE_SHA256=da81f8e285c7fc6002ed2dc33725494b9451abc6506352b789003903b6753af2
+COPY --from=reserve /grpc_health_probe /grpc_health_probe
+RUN ACTUAL="$(sha256sum /grpc_health_probe | cut -d' ' -f1)" \
+	&& if [ "${ACTUAL}" != "${GRPC_HEALTH_PROBE_SHA256}" ]; then \
+		echo "sha256 mismatch for grpc_health_probe: expected ${GRPC_HEALTH_PROBE_SHA256}, got ${ACTUAL}" >&2; \
 		exit 1; \
 	fi \
 	&& chmod +x /grpc_health_probe
 
-FROM gcr.io/distroless/static-debian12
+# Pinned by digest: a moving tag is remote code that changes without review
+# (hadolint DL3006, radarlint S6596). This is the current static-debian12 index.
+FROM gcr.io/distroless/static-debian12@sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2
 COPY --from=build /out/scheduler /scheduler
-COPY --from=grpc-health-probe /grpc_health_probe /grpc_health_probe
+COPY --from=reserve-verify /grpc_health_probe /grpc_health_probe
 COPY deploy/docker/config/default.json /config/default.json
 ENTRYPOINT ["/scheduler"]
 CMD ["-config", "/config/default.json"]
