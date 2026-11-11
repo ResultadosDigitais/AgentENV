@@ -155,7 +155,7 @@ if [[ "$image_digest" == "$zero_digest" ]]; then
 error: image_digest is still the placeholder in config/build_deps.lock.toml.
 Publish the reserve once and commit the digest it prints:
   gcloud builds submit --project rd-sre-stg-01 --config deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml --substitutions _TAG=${image_tag} .
-  gcloud artifacts docker images describe ${image_repository}:${image_tag} --format=get(image_summary.digest)
+  gcloud artifacts docker images describe ${image_repository}:${image_tag} --format='get(image_summary.digest)'
 Then set image_digest here and BUILD_DEPS_DIGEST in deploy/docker/Dockerfile.scheduler.
 EOF
     failures=1

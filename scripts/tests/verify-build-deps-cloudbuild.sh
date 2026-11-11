@@ -62,6 +62,13 @@ grep -Fq '${_IMAGE}:${_TAG}' "$config" ||
     fail "the config does not publish \${_IMAGE}:\${_TAG}"
 grep -Fq 'gcloud artifacts docker images describe' "$config" ||
     fail "the config does not log the published digest"
+# The format expression is quoted: `get(image_summary.digest)` is an ordinary
+# word with parentheses, which bash rejects as a syntax error.
+if grep -Fq -- '--format=get(image_summary.digest)' "$config"; then
+    fail "the config passes --format unquoted; bash rejects the parentheses"
+fi
+grep -Fq -- "--format='get(image_summary.digest)'" "$config" ||
+    fail "the config does not quote --format='get(image_summary.digest)'"
 grep -Fq 'sha256sum' "$config" ||
     fail "the config does not log the sha256 of each staged file"
 grep -Fq 'gcloud builds submit --project rd-sre-stg-01 --config deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml --substitutions _TAG=v0.4.46-1.15.1-patch-v1 .' "$config" ||

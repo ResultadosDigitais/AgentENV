@@ -7,7 +7,7 @@
 # Owner action (account of the substrate pipeline; the sandbox cannot reach
 # GCP). Run from the repository root:
 #   gcloud builds submit --project rd-sre-stg-01 --config deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml --substitutions _TAG=v0.4.46-1.15.1-patch-v1 .
-#   gcloud artifacts docker images describe us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps:v0.4.46-1.15.1-patch-v1 --format=get(image_summary.digest)
+#   gcloud artifacts docker images describe us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps:v0.4.46-1.15.1-patch-v1 --format='get(image_summary.digest)'
 # Commit the printed digest as image_digest in config/build_deps.lock.toml and
 # as BUILD_DEPS_DIGEST in deploy/docker/Dockerfile.scheduler.
 
@@ -57,7 +57,7 @@ steps:
       - -ceu
       - |
         gcloud artifacts docker images describe "${_IMAGE}:${_TAG}" \
-          --format=get(image_summary.digest) | tee deploy/cloudbuild/build-deps/digest.txt
+          --format='get(image_summary.digest)' | tee deploy/cloudbuild/build-deps/digest.txt
         sha256sum deploy/cloudbuild/build-deps/grpc_health_probe \
           deploy/cloudbuild/build-deps/firecracker \
           deploy/cloudbuild/build-deps/vmlinux
