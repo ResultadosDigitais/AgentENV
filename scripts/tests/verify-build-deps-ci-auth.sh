@@ -86,6 +86,36 @@ if [[ -z "$encoded_line" || -z "$build_line" || "$encoded_line" -ge "$build_line
     fail "integration-tests.yml does not authenticate before the first image build"
 fi
 
+# Every workflow that builds the scheduler image resolves the private reserve,
+# so each one must federate before the build. Scan the whole directory so a new
+# job cannot build the image anonymously.
+scheduler_builders=()
+for file in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/*.yaml; do
+    [[ -f "$file" ]] || continue
+    if grep -Fq 'deploy/docker/Dockerfile.scheduler' "$file"; then
+        scheduler_builders+=("$file")
+    fi
+done
+if (( ${#scheduler_builders[@]} == 0 )); then
+    fail "no workflow builds deploy/docker/Dockerfile.scheduler; the auth check covers nothing"
+fi
+for file in "${scheduler_builders[@]}"; do
+    name="$(basename "$file")"
+    grep -Fq "workload_identity_provider: ${provider}" "$file" ||
+        fail "${name} builds the scheduler image without the workload identity provider"
+    grep -Fq "service_account: ${service_account}" "$file" ||
+        fail "${name} builds the scheduler image without the reserve service account"
+    grep -Eq '^[[:space:]]+id-token: write$' "$file" ||
+        fail "${name} builds the scheduler image without id-token: write"
+    grep -Fq "gcloud auth configure-docker ${registry} --quiet" "$file" ||
+        fail "${name} builds the scheduler image without configuring Docker for ${registry}"
+    encoded_line="$(auth_line_in "$file")"
+    build_line="$(first_line_in "$file" 'deploy/docker/Dockerfile\.scheduler')"
+    if [[ -z "$encoded_line" || -z "$build_line" || "$encoded_line" -ge "$build_line" ]]; then
+        fail "${name} does not authenticate before building the scheduler image"
+    fi
+done
+
 if (( failures != 0 )); then
     echo "verify-build-deps-ci-auth: FAILED" >&2
     exit 1

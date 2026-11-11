@@ -6,6 +6,7 @@ on:
     paths:
       - "services/**"
       - "deploy/**"
+      - "config/build_deps.lock.toml"
       - "src/api/openapi.yml"
       - "src/api/testdata/pagination.json"
       - "scripts/tests/verify-no-github-release-downloads.sh"
@@ -15,6 +16,7 @@ on:
     paths:
       - "services/**"
       - "deploy/**"
+      - "config/build_deps.lock.toml"
       - "src/api/openapi.yml"
       - "src/api/testdata/pagination.json"
       - "scripts/tests/verify-no-github-release-downloads.sh"
