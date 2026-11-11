@@ -9,6 +9,7 @@ on:
       - "src/api/openapi.yml"
       - "src/api/testdata/pagination.json"
       - "scripts/tests/verify-no-github-release-downloads.sh"
+      - "scripts/tests/verify-build-deps-ci-auth.sh"
       - ".github/workflows/services-ci.yml"
   push:
     paths:
@@ -17,6 +18,7 @@ on:
       - "src/api/openapi.yml"
       - "src/api/testdata/pagination.json"
       - "scripts/tests/verify-no-github-release-downloads.sh"
+      - "scripts/tests/verify-build-deps-ci-auth.sh"
       - ".github/workflows/services-ci.yml"
 
 jobs:
@@ -30,6 +32,9 @@ jobs:
       - name: Build-deps guard (no GitHub releases downloads)
         working-directory: .
         run: make verify-build-deps-guard
+      - name: Build-deps CI auth guard
+        working-directory: .
+        run: make verify-build-deps-ci-auth
       - uses: actions/setup-go@v6
         with:
           go-version-file: services/go.mod
@@ -48,3 +53,26 @@ jobs:
         run: make fmt-check
       - name: Go vet
         run: make vet
+
+  build-deps-reserve:
+    name: build-deps reserve (Artifact Registry pull)
+    runs-on: ubuntu-latest
+    # The reserve lives in a private Artifact Registry repository. The job needs
+    # the repository content and an OIDC token exchanged through workload
+    # identity; no service-account key and no secret are involved.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Authenticate to Artifact Registry through workload identity
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: projects/627931310875/locations/global/workloadIdentityPools/pf-gha-agentenv-fork/providers/services-ci
+          service_account: gha-agentenv-fork-ci@rd-sre-stg-01.iam.gserviceaccount.com
+      - name: Pull the build-deps reserve image
+        run: |
+          repository="$(sed -n 's/^image_repository = "\(.*\)"/\1/p' config/build_deps.lock.toml)"
+          tag="$(sed -n 's/^image_tag = "\(.*\)"/\1/p' config/build_deps.lock.toml)"
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          docker pull "${repository}:${tag}"

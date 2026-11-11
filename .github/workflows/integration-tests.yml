@@ -52,12 +52,28 @@ jobs:
   e2e-tests:
     name: e2e-tests (${{ matrix.e2e_name }})
     runs-on: ubuntu-latest
+    # docker-compose builds the scheduler image, which resolves the build-deps
+    # reserve from a private Artifact Registry repository. The federated token
+    # is minted per job; no key, secret or pull_request_target is involved.
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
         e2e_name: [single-node, docker-compose]
     steps:
       - uses: actions/checkout@v6
+      - name: Authenticate to Artifact Registry through workload identity
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: projects/627931310875/locations/global/workloadIdentityPools/pf-gha-agentenv-fork/providers/services-ci
+          service_account: gha-agentenv-fork-ci@rd-sre-stg-01.iam.gserviceaccount.com
+      - name: Configure Docker for the build-deps registry
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
       - uses: ./.github/actions/rust-ci-setup
         with:
           ci_deps_target: ci-deps

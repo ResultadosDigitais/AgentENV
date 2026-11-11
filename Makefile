@@ -64,8 +64,8 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all test-buildkit test-buildkit-users \
-	verify-build-deps verify-build-deps-guard verify-build-deps-staging \
-	verify-build-deps-cloudbuild verify-build-deps-pins \
+	verify-build-deps verify-build-deps-guard verify-build-deps-ci-auth \
+	verify-build-deps-staging verify-build-deps-cloudbuild verify-build-deps-pins \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
@@ -166,10 +166,13 @@ install-ublk: build-ublk
 
 # Offline gates for the build-time dependency reserve (OPSAI-6696): no network
 # and no GCP access required.
-verify-build-deps: verify-build-deps-guard verify-build-deps-staging verify-build-deps-cloudbuild
+verify-build-deps: verify-build-deps-guard verify-build-deps-ci-auth verify-build-deps-staging verify-build-deps-cloudbuild
 
 verify-build-deps-guard:
 	bash $(TEST_SCRIPTS_DIR)/verify-no-github-release-downloads.sh
+
+verify-build-deps-ci-auth:
+	bash $(TEST_SCRIPTS_DIR)/verify-build-deps-ci-auth.sh
 
 verify-build-deps-staging:
 	bash $(TEST_SCRIPTS_DIR)/verify-build-deps-staging.sh
