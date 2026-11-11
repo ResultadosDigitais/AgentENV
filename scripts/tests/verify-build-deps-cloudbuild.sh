@@ -58,6 +58,7 @@ if grep -Eqi 'arm64|aarch64|TARGETARCH|buildx|--manifest|multi-arch' "$config"; 
 fi
 
 # The run publishes the tag and logs the digest plus every file digest.
+# shellcheck disable=SC2016 # the literal ${_IMAGE}:${_TAG} is what the YAML must contain
 grep -Fq '${_IMAGE}:${_TAG}' "$config" ||
     fail "the config does not publish \${_IMAGE}:\${_TAG}"
 grep -Fq 'gcloud artifacts docker images describe' "$config" ||
