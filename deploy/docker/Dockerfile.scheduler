@@ -23,6 +23,8 @@ FROM ${BUILD_DEPS_IMAGE}@${BUILD_DEPS_DIGEST} AS reserve
 # Re-check the pinned digest of the probe inside the build: a divergent byte
 # fails closed before the binary ships.
 FROM alpine:3.21 AS reserve-verify
+# hadolint DL4006: the sha256 pipeline must fail when either side fails.
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 ARG GRPC_HEALTH_PROBE_SHA256=da81f8e285c7fc6002ed2dc33725494b9451abc6506352b789003903b6753af2
 COPY --from=reserve /grpc_health_probe /grpc_health_probe
 RUN ACTUAL="$(sha256sum /grpc_health_probe | cut -d' ' -f1)" \
@@ -32,7 +34,9 @@ RUN ACTUAL="$(sha256sum /grpc_health_probe | cut -d' ' -f1)" \
 	fi \
 	&& chmod +x /grpc_health_probe
 
-FROM gcr.io/distroless/static-debian12
+# Pinned by digest: a moving tag is remote code that changes without review
+# (hadolint DL3006, radarlint S6596). This is the current static-debian12 index.
+FROM gcr.io/distroless/static-debian12@sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2
 COPY --from=build /out/scheduler /scheduler
 COPY --from=reserve-verify /grpc_health_probe /grpc_health_probe
 COPY deploy/docker/config/default.json /config/default.json
