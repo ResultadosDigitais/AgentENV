@@ -26,11 +26,16 @@ on:
 jobs:
   go-services:
     runs-on: ubuntu-latest
+    # Read-only repository access: this job only builds and tests services.
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: services
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Build-deps guard (no GitHub releases downloads)
         working-directory: .
         run: make verify-build-deps-guard
@@ -67,6 +72,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Authenticate to Artifact Registry through workload identity
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
