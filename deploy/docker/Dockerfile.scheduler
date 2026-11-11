@@ -3,7 +3,7 @@
 # deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml and pinned by
 # config/build_deps.lock.toml; the digest makes the bytes immutable.
 ARG BUILD_DEPS_IMAGE=us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps
-ARG BUILD_DEPS_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+ARG BUILD_DEPS_DIGEST=sha256:8f2131306de394ab21b5ff9b2a519251dddee0718a28ed0587c64f3774fbcbdd
 
 FROM golang:1.25-bookworm AS build
 ARG TARGETOS=linux

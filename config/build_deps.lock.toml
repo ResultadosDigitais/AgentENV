@@ -19,9 +19,9 @@
 
 image_repository = "us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps"
 image_tag = "v0.4.46-1.15.1-patch-v1"
-# Placeholder: the release owner replaces it with the digest printed by the
-# reserve build (`gcloud artifacts docker images describe ...`).
-image_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# Digest printed by the reserve build 89dd65d1 on 2026-11-11. The scheduler
+# Dockerfile pins the same value as BUILD_DEPS_DIGEST.
+image_digest = "sha256:8f2131306de394ab21b5ff9b2a519251dddee0718a28ed0587c64f3774fbcbdd"
 
 # grpc_health_probe v0.4.46, amd64. Same digest the scheduler Dockerfile
 # verified before the reserve existed.
