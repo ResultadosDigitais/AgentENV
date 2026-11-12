@@ -187,11 +187,9 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		)
 		shape.status = schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_LOOKUP_FAILED
 	}
-	mode := s.resourceLimit.ResolvedShapeAdmission()
-
 	// A create whose template shape could not be read must not be admitted
 	// blind once the shape rule decides and a memory ceiling exists.
-	if reserve && !bodyHasShape && mode == config.ShapeAdmissionOn &&
+	if reserve && !bodyHasShape && s.resourceLimit.ShapeAdmissionEnabled() &&
 		memoryLimitConfigured(s.resourceLimit) && shape.lookupFailed() {
 		recordShapeAdmission(shapeKindCreate, shapeOutcomeUnknownShape, shapeReasonUnknownTemplateShape)
 		s.logger.Warn("scheduler refused create with unknown template shape",
@@ -210,10 +208,10 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		// The body shape filters exactly as before in every mode; shadow only
 		// records the verdict on top of the same decision.
 		eligible = s.projectCreateShape(eligible, bodyMemory, bodyCPU, shape, true)
-	case reserve && mode == config.ShapeAdmissionOn && shape.resolved():
+	case reserve && s.resourceLimit.ShapeAdmissionEnabled() && shape.resolved():
 		reserveMemory, reserveCPU = shape.memoryBytes, shape.cpuCount
 		eligible = s.projectCreateShape(eligible, shape.memoryBytes, shape.cpuCount, shape, true)
-	case reserve && mode == config.ShapeAdmissionShadow:
+	case reserve && s.resourceLimit.ShapeAdmissionShadow():
 		switch shape.status {
 		case schedulerv1.TemplateShapeStatus_TEMPLATE_SHAPE_STATUS_RESOLVED:
 			// Record the verdict per node without changing the decision.

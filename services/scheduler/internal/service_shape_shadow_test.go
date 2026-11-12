@@ -200,6 +200,47 @@ func TestShapeAdmissionCreateWithoutMemoryMBUsesResolvedShape(t *testing.T) {
 	}
 }
 
+// OPSAI-6922: the shadow verdict is published per layer but never enforced. A
+// node whose published 32 GiB layer is refused still admits both the create and
+// the resume, exactly as off does.
+func TestShapeAdmissionShadowPublishesButNeverRefuses(t *testing.T) {
+	limit := admissionLimit(false)
+	limit.ShapeAdmission = strPtr(config.ShapeAdmissionShadow)
+	service := newReservationService(t, limit, false, nil, "owner")
+	// 70 GiB allocated + 32 GiB = 102% of the 100 GiB node, above the 80% ceiling.
+	heartbeatWithPaused(t, service, "owner", "sbx-1", 70, 32)
+
+	resp, err := service.ListObservedNodes(context.Background(), &schedulerv1.ListObservedNodesRequest{ClusterId: "cluster-1"})
+	if err != nil {
+		t.Fatalf("list observed nodes failed: %v", err)
+	}
+	var refused bool
+	for _, layer := range resp.GetNodes()[0].GetAdmission().GetLayers() {
+		if layer.GetMemoryGb() == 32 && !layer.GetAdmitted() && layer.GetReason() == ReasonMemoryAllocated {
+			refused = true
+		}
+	}
+	if !refused {
+		t.Fatal("expected the published 32 GiB layer to be refused")
+	}
+
+	created, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{Hint: resolvedHint(32, 4)})
+	if err != nil {
+		t.Fatalf("shadow must not refuse the create on the shape verdict, got %v", err)
+	}
+	if created.GetNode().GetNodeId() != "owner" {
+		t.Fatalf("create landed on %q, want owner", created.GetNode().GetNodeId())
+	}
+
+	resumed, err := service.ScheduleResume(context.Background(), &schedulerv1.ScheduleResumeRequest{SandboxId: "sbx-1"})
+	if err != nil {
+		t.Fatalf("schedule resume failed: %v", err)
+	}
+	if !resumed.GetAdmitted() || resumed.GetNode().GetNodeId() != "owner" {
+		t.Fatalf("shadow must not refuse the resume on the shape verdict, got %+v", resumed)
+	}
+}
+
 // A shadow resume keeps today's decision: the owner is admitted with no
 // reservation and no binding change, and the verdict is recorded.
 func TestShapeAdmissionResumeShadowDefersAndMoves(t *testing.T) {

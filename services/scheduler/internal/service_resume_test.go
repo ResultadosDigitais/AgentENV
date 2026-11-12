@@ -237,7 +237,10 @@ func TestScheduleResumeRejectsUnknownSandbox(t *testing.T) {
 func TestListObservedNodesCarriesAdmissionVerdicts(t *testing.T) {
 	service, _ := newResumeService(t, fixedCapacityProvider{
 		"owner": {AllocatableMemoryBytes: 100 * gib, Source: "kubernetes"},
-	}, &config.NodeResourceLimit{MaxMemoryAllocatedPercent: uint32Ptr(80)})
+	}, &config.NodeResourceLimit{
+		MaxMemoryAllocatedPercent: uint32Ptr(80),
+		ShapeAdmission:            strPtr(config.ShapeAdmissionOn),
+	})
 	heartbeatWithPaused(t, service, "owner", "sbx-1", 70, 16)
 
 	resp, err := service.ListObservedNodes(context.Background(), &schedulerv1.ListObservedNodesRequest{ClusterId: "cluster-1"})
@@ -285,5 +288,47 @@ func TestListObservedNodesOmitsAdmissionWhenShapeAdmissionOff(t *testing.T) {
 	}
 	if got := resp.GetNodes()[0].GetAdmission(); got != nil {
 		t.Fatalf("shape_admission off must omit the verdict, got %+v", got)
+	}
+}
+
+// OPSAI-6922: shadow computes and publishes the per-layer verdict without
+// enforcing it. The publication must carry the default layers exactly as with
+// the rule on, so an observer (the ProductFactory node pool autoscaler) can
+// measure the rule before it decides.
+func TestListObservedNodesPublishesAdmissionLayersInShadow(t *testing.T) {
+	service, _ := newResumeService(t, fixedCapacityProvider{
+		"owner": {AllocatableMemoryBytes: 100 * gib, Source: "kubernetes"},
+	}, &config.NodeResourceLimit{
+		MaxMemoryAllocatedPercent: uint32Ptr(80),
+		ShapeAdmission:            strPtr(config.ShapeAdmissionShadow),
+	})
+	heartbeatWithPaused(t, service, "owner", "sbx-1", 70, 16)
+
+	resp, err := service.ListObservedNodes(context.Background(), &schedulerv1.ListObservedNodesRequest{ClusterId: "cluster-1"})
+	if err != nil {
+		t.Fatalf("list observed nodes failed: %v", err)
+	}
+	admission := resp.GetNodes()[0].GetAdmission()
+	if admission == nil {
+		t.Fatal("shadow must publish the admission verdict")
+	}
+	if len(admission.GetLayers()) != 4 {
+		t.Fatalf("got %d layers, want the 4 default layers", len(admission.GetLayers()))
+	}
+	byLayer := map[uint64]*schedulerv1.AdmissionVerdict{}
+	for _, layer := range admission.GetLayers() {
+		byLayer[layer.GetMemoryGb()] = layer
+	}
+	for _, memoryGB := range config.DefaultAdmissionLayerMemoryGB {
+		if byLayer[memoryGB] == nil {
+			t.Fatalf("shadow must publish the %d GiB layer, got %+v", memoryGB, admission.GetLayers())
+		}
+	}
+	// 70 GiB allocated plus 16 GiB = 86% > 80%.
+	if got := byLayer[16]; got.GetAdmitted() || got.GetReason() != ReasonMemoryAllocated {
+		t.Fatalf("16 GiB verdict = %+v, want rejected memory_allocated", got)
+	}
+	if got := byLayer[8]; !got.GetAdmitted() || got.GetReason() != "" {
+		t.Fatalf("8 GiB verdict = %+v, want admitted with no reason", got)
 	}
 }
