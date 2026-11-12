@@ -173,9 +173,13 @@ func EvaluateLayerAdmission(n RichNode, layer config.AdmissionLayer, limit *conf
 }
 
 // EvaluateNodeAdmission returns the verdict for every configured layer, or nil
-// when the shape admission kill switch is off.
+// when the shape admission kill switch is off. It computes the verdict whenever
+// the rule is observed (on or shadow): shadow exists to measure and publish the
+// verdict without enforcing it, so the layers must be present there too. Only
+// the scheduling filters gate a refusal on ShapeAdmissionEnabled, never this
+// publication.
 func EvaluateNodeAdmission(n RichNode, limit *config.NodeResourceLimit) []LayerVerdict {
-	if limit == nil || !limit.ShapeAdmissionEnabled() {
+	if limit == nil || !limit.ShapeAdmissionObserved() {
 		return nil
 	}
 	layers := limit.ResolvedAdmissionLayers()
