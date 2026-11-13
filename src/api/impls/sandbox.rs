@@ -1330,6 +1330,7 @@ impl Sandboxes<()> for ApiImpl {
             cpu_count: body.cpu_count,
             memory_mb: body.memory_mb,
             memory_request_mb: None,
+            pool: body.pool.clone(),
         };
         Ok(
             match self

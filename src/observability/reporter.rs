@@ -387,6 +387,7 @@ impl ObservabilityReporter {
             service_instance_id: snapshot.service_instance_id,
             version: snapshot.version,
             commit: snapshot.commit,
+            pool: snapshot.pool,
             machine_info: Some(scheduler::MachineInfo {
                 cpu_family: snapshot.machine_info.cpu_family,
                 cpu_model: snapshot.machine_info.cpu_model,
@@ -620,6 +621,7 @@ mod tests {
             node_id: "node-a".to_string(),
             service_instance_id: "svc-a".to_string(),
             cluster_id: uuid::Uuid::new_v4(),
+            pool: "spot".to_string(),
             machine_info: crate::observability::MachineInfo {
                 cpu_family: "6".to_string(),
                 cpu_model: "158".to_string(),
@@ -654,6 +656,7 @@ mod tests {
         };
 
         let req = ObservabilityReporter::build_heartbeat_request(snapshot, 123, None);
+        assert_eq!(req.pool, "spot");
         assert_eq!(req.paused_sandboxes.len(), 1);
         assert_eq!(req.paused_sandboxes[0].sandbox_id, sandbox_id.to_string());
         assert_eq!(req.paused_sandboxes[0].cpu_count, 4);
@@ -671,6 +674,7 @@ mod tests {
             node_id: "node-a".to_string(),
             service_instance_id: "svc-a".to_string(),
             cluster_id: uuid::Uuid::new_v4(),
+            pool: String::new(),
             machine_info: crate::observability::MachineInfo {
                 cpu_family: String::new(),
                 cpu_model: String::new(),
@@ -711,6 +715,7 @@ mod tests {
             node_id: "node-a".to_string(),
             service_instance_id: "svc-a".to_string(),
             cluster_id: uuid::Uuid::new_v4(),
+            pool: String::new(),
             machine_info: crate::observability::MachineInfo {
                 cpu_family: String::new(),
                 cpu_model: String::new(),

@@ -491,3 +491,6 @@ node_id = "node-a"
 cluster_id = "00000000-0000-0000-0000-000000000000"
 # Identifier for this service instance.
 service_instance_id = "service-instance-a"
+# Named node pool reported to the scheduler. Empty keeps the node shared: it
+# only receives sandboxes that do not ask for a pool.
+pool = ""

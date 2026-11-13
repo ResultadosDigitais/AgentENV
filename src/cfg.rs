@@ -782,6 +782,14 @@ pub struct NodeIdentityConfig {
     pub cluster_id: Option<String>,
     #[config(env = "AENV_SERVICE_INSTANCE_ID")]
     pub service_instance_id: Option<String>,
+    /// Named node pool reported in the scheduler heartbeat. Empty means the
+    /// node is shared: it only receives sandboxes that did not ask for a pool.
+    #[config(
+        default = "",
+        env = "AENV_NODE_POOL",
+        parse_env = parse_trimmed_string
+    )]
+    pub pool: String,
 }
 
 #[derive(Debug, Config, Clone)]

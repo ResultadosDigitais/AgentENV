@@ -77,6 +77,7 @@ impl ObservabilityService {
             node_id: self.identity.id.clone(),
             service_instance_id: self.identity.service_instance_id.clone(),
             cluster_id: self.identity.cluster_id,
+            pool: self.identity.pool.clone(),
             machine_info: self.machine_info.clone(),
             sandbox_count: runtime.running_sandbox_count,
             sandbox_ids: self.orchestrator.list_sandbox_ids().await?,
