@@ -1376,6 +1376,93 @@ async fn rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running() -> Result<(
     Ok(())
 }
 
+/// OPSAI-7467: a persisted pause that crosses the memory ceiling returns
+/// without compacting, repeatedly.
+///
+/// The pause used to pay the rewrite inside the call: the card measured 46.4 s
+/// against about 12 s for six consecutive memory pauses. This runs the same
+/// shape — six persisted pauses over the ceiling, each rewriting the ballast
+/// pages — and asserts every pause after the first stays within 20% of it and
+/// that each one leaves the durable work order instead of a compacted layer. The
+/// 12 GiB rewrite of the card belongs to the node scenario (p-11 of the plan,
+/// recorded on the card); the guest the CI can boot is smaller, so the size is
+/// derived from it, and the shape of the measurement is identical.
+#[tokio::test]
+async fn consecutive_deferred_pauses_stay_within_20_percent_of_the_first() -> Result<()> {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!(
+            "skipping consecutive_deferred_pauses_stay_within_20_percent_of_the_first: /dev/kvm \
+             is not available on this host"
+        );
+        return Ok(());
+    }
+    common::setup().await;
+
+    let sandbox_config = common::default_sandbox_config()?;
+    let mem_size_mib = u64::from(sandbox_config.mem_size_mib);
+    let ballast_mib = (mem_size_mib / 8).max(1);
+
+    // One byte is a real bound and is crossed by the boot's own pages, so every
+    // persisted pause takes the deferred path. Admission is consulted for real:
+    // the memory chain's transient bound is zero (`compaction_view_bytes = 0`),
+    // so the node admits it and the pause must return without a rewrite.
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?
+        .with_chain_bytes_ceiling(1)
+        .with_rootfs_chain_disk_multiple(0);
+    sandbox.start().await?;
+    write_disk_marker(&mut sandbox).await?;
+    if !chain_ballast_dir_is_tmpfs(&mut sandbox).await? {
+        eprintln!(
+            "skipping consecutive_deferred_pauses_stay_within_20_percent_of_the_first: \
+             {CHAIN_TMPFS_DIR} is not tmpfs in this guest, so the ballast would not reach the \
+             memory chain"
+        );
+        sandbox.stop().await?;
+        return Ok(());
+    }
+    seed_chain_ballast(&mut sandbox, ballast_mib).await?;
+
+    let artifact_root = tempfile::tempdir()?;
+    let mut durations = Vec::new();
+    for cycle in 0..6 {
+        rewrite_chain_ballast(&mut sandbox, ballast_mib).await?;
+        let generation = artifact_root.path().join(format!("gen-{cycle}"));
+        let started = std::time::Instant::now();
+        SandboxBackend::pause(&mut sandbox, Some(&generation))
+            .await
+            .with_context(|| format!("deferred pause {cycle}"))?;
+        durations.push(started.elapsed());
+        assert!(
+            generation.join("deferred-compaction.json").exists(),
+            "pause {cycle} must leave the durable work order instead of compacting"
+        );
+        assert!(
+            !generation.join("mem_compacted.commit").exists(),
+            "pause {cycle} must return without compacting the memory chain"
+        );
+        // The next cycle rewrites the same ballast pages on a running VM.
+        sandbox
+            .resume()
+            .await
+            .with_context(|| format!("resume after deferred pause {cycle}"))?;
+    }
+
+    let first = durations[0].as_secs_f64();
+    for (cycle, duration) in durations.iter().enumerate().skip(1) {
+        // A fixed floor absorbs scheduler noise on a small guest; above it, the
+        // assertion is the card's 20%.
+        let allowed = first * 1.2 + 0.15;
+        assert!(
+            duration.as_secs_f64() <= allowed,
+            "pause {cycle} took {duration:?}, above 20% of the first ({first:.3}s, allowed \
+             {allowed:.3}s): {durations:?}"
+        );
+    }
+    eprintln!("deferred memory pause durations: {durations:?}");
+    sandbox.stop().await?;
+    Ok(())
+}
+
 /// Guest directory on the overlay **rootfs** the rootfs-ceiling test writes to.
 ///
 /// `/tmp` is created on the user image's rootfs by the guest init — it is not a
