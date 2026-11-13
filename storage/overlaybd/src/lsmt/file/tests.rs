@@ -4049,3 +4049,350 @@ async fn test_direct_io_create_sparse() {
     assert_eq!(lsmt.size().await.unwrap(), vsize);
     assert_eq!(lsmt.file_type(), LSMTFileType::SparseReadWrite);
 }
+
+/// Flat in-memory source: `read_at(offset, len)` is indexed by byte offset, so
+/// a [`SegmentMapping`]'s `moffset` (in 512-byte sectors) addresses it directly.
+struct MemorySourceFile {
+    data: Vec<u8>,
+}
+
+impl MemorySourceFile {
+    fn new(data: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self { data })
+    }
+}
+
+#[async_trait]
+impl VirtualFile for MemorySourceFile {
+    async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+        let offset = offset as usize;
+        ensure!(
+            offset + len <= self.data.len(),
+            "read of {len} bytes at {offset} past source end {}",
+            self.data.len()
+        );
+        Ok(Bytes::copy_from_slice(&self.data[offset..offset + len]))
+    }
+
+    async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
+        let offset = offset as usize;
+        ensure!(
+            offset + dst.len() <= self.data.len(),
+            "read of {} bytes at {offset} past source end {}",
+            dst.len(),
+            self.data.len()
+        );
+        dst.copy_from_slice(&self.data[offset..offset + dst.len()]);
+        Ok(dst.len())
+    }
+
+    async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+        bail!("MemorySourceFile is read-only")
+    }
+
+    async fn size(&self) -> Result<u64> {
+        Ok(self.data.len() as u64)
+    }
+}
+
+fn compact_options(zero_detection: bool) -> CompactOptions {
+    CompactOptions { zero_detection }
+}
+
+#[tokio::test]
+async fn test_compact_zero_detection_records_zero_run_without_data() {
+    let temp_dir = TempDir::new().unwrap();
+    let vsize = 3 * 4096u64;
+    let mut source = vec![0xAAu8; 4096];
+    source.extend(std::iter::repeat_n(0u8, 4096));
+    source.extend(std::iter::repeat_n(0xBBu8, 4096));
+    let src = MemorySourceFile::new(source);
+
+    let dest: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("zeroed.lsmt")).unwrap());
+    let mut args = CommitArgs::new(dest.clone());
+    args.concurrency = 4;
+    let stats = compact_to_with_options(
+        &[src as Arc<dyn VirtualFile>],
+        &[SegmentMapping::new(
+            0,
+            (vsize / ALIGNMENT) as u32,
+            0,
+            false,
+            0,
+        )],
+        vsize,
+        args,
+        compact_options(true),
+    )
+    .await
+    .expect("compact with zero detection");
+
+    assert_eq!(stats.input_bytes, vsize);
+    assert_eq!(stats.skipped_bytes, 4096);
+    assert_eq!(stats.written_bytes, vsize - 4096);
+
+    let ro = open_file_ro(dest).await.unwrap();
+    assert_eq!(ro.read_at(0, 4096).await.unwrap().as_ref(), &[0xAAu8; 4096]);
+    assert_eq!(
+        ro.read_at(4096, 4096).await.unwrap().as_ref(),
+        &[0u8; 4096],
+        "the discarded range must read back as zeros"
+    );
+    assert_eq!(
+        ro.read_at(8192, 4096).await.unwrap().as_ref(),
+        &[0xBBu8; 4096]
+    );
+
+    let mappings = ro.index_view().expect("index view").mappings().to_vec();
+    let zeroed: Vec<_> = mappings.iter().filter(|m| m.zeroed).collect();
+    assert_eq!(zeroed.len(), 1, "one zero segment expected: {mappings:#?}");
+    assert_eq!(zeroed[0].offset(), 8);
+    assert_eq!(zeroed[0].length(), 8);
+    assert_eq!(zeroed[0].moffset, NO_PHYSICAL_OFFSET);
+    assert_eq!(
+        mappings.iter().map(|m| m.length()).sum::<u32>(),
+        (vsize / ALIGNMENT) as u32
+    );
+    assert!(
+        stats.written_bytes <= stats.input_bytes - stats.skipped_bytes,
+        "the layer must never hold more data than the resident (non-skipped) bytes"
+    );
+}
+
+#[tokio::test]
+async fn test_compact_zero_detection_off_keeps_zero_written_blocks_as_data() {
+    let temp_dir = TempDir::new().unwrap();
+    let vsize = 4096u64;
+    let src = MemorySourceFile::new(vec![0u8; vsize as usize]);
+
+    let dest: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("zero-off.lsmt")).unwrap());
+    let stats = compact_to_with_options(
+        &[src as Arc<dyn VirtualFile>],
+        &[SegmentMapping::new(
+            0,
+            (vsize / ALIGNMENT) as u32,
+            0,
+            false,
+            0,
+        )],
+        vsize,
+        CommitArgs::new(dest.clone()),
+        compact_options(false),
+    )
+    .await
+    .expect("compact with zero detection off");
+
+    assert_eq!(stats.skipped_bytes, 0);
+    assert_eq!(stats.written_bytes, vsize);
+    let ro = open_file_ro(dest).await.unwrap();
+    let mappings = ro.index_view().expect("index view").mappings().to_vec();
+    assert!(
+        mappings.iter().all(|m| !m.zeroed),
+        "with the option off every block must be written as data: {mappings:#?}"
+    );
+    assert_eq!(
+        ro.read_at(0, vsize as usize).await.unwrap().as_ref(),
+        &[0u8; 4096]
+    );
+}
+
+#[tokio::test]
+async fn test_compact_zero_detection_fails_instead_of_zeroing_a_failed_read() {
+    let temp_dir = TempDir::new().unwrap();
+    let src: Arc<dyn VirtualFile> = Arc::new(ShortReadFile::new(vec![0x5a; 4096], 1));
+    let dest: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("zero-error.lsmt")).unwrap());
+
+    let err = compact_to_with_options(
+        &[src],
+        &[SegmentMapping::new(0, 8, 0, false, 0)],
+        4096,
+        CommitArgs::new(dest),
+        compact_options(true),
+    )
+    .await
+    .expect_err("a failed read must abort the compact, never become a zero segment");
+    assert_err_contains(&err, "failed to read");
+}
+
+#[tokio::test]
+async fn test_compact_zero_detection_alternating_4k_pattern() {
+    let temp_dir = TempDir::new().unwrap();
+    let vsize = 64 * 1024 * 1024u64;
+    let page = 4096usize;
+    let mut source = vec![0u8; vsize as usize];
+    for page_idx in 0..vsize as usize / page {
+        if page_idx % 2 == 1 {
+            source[page_idx * page..(page_idx + 1) * page].fill(0x5A);
+        }
+    }
+    let src = MemorySourceFile::new(source);
+
+    let dest: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("alternating.lsmt")).unwrap());
+    let mut args = CommitArgs::new(dest.clone());
+    args.concurrency = 8;
+    let stats = compact_to_with_options(
+        &[src as Arc<dyn VirtualFile>],
+        &[SegmentMapping::new(
+            0,
+            (vsize / ALIGNMENT) as u32,
+            0,
+            false,
+            0,
+        )],
+        vsize,
+        args,
+        compact_options(true),
+    )
+    .await
+    .expect("compact the worst alternating pattern");
+
+    assert_eq!(stats.skipped_bytes, vsize / 2);
+    assert_eq!(stats.written_bytes, vsize / 2);
+
+    let ro = open_file_ro(dest).await.unwrap();
+    let mappings = ro.index_view().expect("index view").mappings().to_vec();
+    let zeroed = mappings.iter().filter(|m| m.zeroed).count();
+    let index_bytes = mappings.len() * size_of::<DiskSegmentMapping>();
+    eprintln!(
+        "alternating 4K pattern over {} MiB: {} mappings ({} zeroed, {} data), {} index bytes",
+        vsize / (1024 * 1024),
+        mappings.len(),
+        zeroed,
+        mappings.len() - zeroed,
+        index_bytes
+    );
+    assert_eq!(
+        mappings.len(),
+        vsize as usize / page,
+        "each 4 KiB run must stay a separate segment"
+    );
+    assert_eq!(zeroed, mappings.len() / 2);
+    assert_eq!(ro.read_at(0, page).await.unwrap().as_ref(), &[0u8; 4096]);
+    assert_eq!(
+        ro.read_at(page as u64, page).await.unwrap().as_ref(),
+        &[0x5Au8; 4096]
+    );
+    assert_eq!(
+        ro.read_at(vsize - page as u64, page)
+            .await
+            .unwrap()
+            .as_ref(),
+        &[0x5Au8; 4096]
+    );
+}
+
+#[tokio::test]
+async fn test_compact_preserves_zeroed_segments_across_a_flatten() {
+    let temp_dir = TempDir::new().unwrap();
+    let vsize = 2 * 4096u64;
+    let mut source = vec![0x11u8; 4096];
+    source.extend(std::iter::repeat_n(0u8, 4096));
+    let src = MemorySourceFile::new(source);
+
+    let first: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("first.lsmt")).unwrap());
+    compact_to_with_options(
+        &[src as Arc<dyn VirtualFile>],
+        &[SegmentMapping::new(
+            0,
+            (vsize / ALIGNMENT) as u32,
+            0,
+            false,
+            0,
+        )],
+        vsize,
+        CommitArgs::new(first.clone()),
+        compact_options(true),
+    )
+    .await
+    .expect("compact with zero detection");
+    let ro = open_file_ro(first).await.unwrap();
+    assert!(
+        ro.index_view().unwrap().mappings().iter().any(|m| m.zeroed),
+        "source layer must carry a zeroed segment"
+    );
+
+    let flat: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("flat.lsmt")).unwrap());
+    ro.flatten(flat.clone()).await.expect("flatten the layer");
+
+    let flat_ro = open_file_ro(flat).await.unwrap();
+    assert!(
+        flat_ro
+            .index_view()
+            .unwrap()
+            .mappings()
+            .iter()
+            .any(|m| m.zeroed),
+        "the compact chain must keep the zeroed segment without writing its data"
+    );
+    assert_eq!(
+        flat_ro.read_at(0, 4096).await.unwrap().as_ref(),
+        &[0x11u8; 4096]
+    );
+    assert_eq!(
+        flat_ro.read_at(4096, 4096).await.unwrap().as_ref(),
+        &[0u8; 4096]
+    );
+}
+
+/// Resume stacks the pause's memory layer on top of the previous lowers and
+/// reads through the merged index. A zeroed segment written by the new pause
+/// must therefore hide the lower layer's data for that range, exactly like the
+/// runtime that produced it would read it.
+#[tokio::test]
+async fn test_zeroed_segment_hides_lower_layer_through_merged_read() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut lower_source = vec![0x33u8; 4096];
+    lower_source.extend(std::iter::repeat_n(0x33u8, 4096));
+    lower_source.extend(std::iter::repeat_n(0x33u8, 4096));
+    let lower_source = MemorySourceFile::new(lower_source);
+    let lower_path = temp_dir.path().join("lower.lsmt");
+    let lower: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&lower_path).unwrap());
+    compact_to_with_options(
+        &[lower_source as Arc<dyn VirtualFile>],
+        &[SegmentMapping::new(0, 24, 0, false, 0)],
+        3 * 4096,
+        CommitArgs::new(lower.clone()),
+        compact_options(false),
+    )
+    .await
+    .expect("build lower layer");
+
+    // Top layer: data, then a range the host discarded (zeros).
+    let mut top_source = vec![0x44u8; 4096];
+    top_source.extend(std::iter::repeat_n(0u8, 4096));
+    let top_source = MemorySourceFile::new(top_source);
+    let top_path = temp_dir.path().join("top.lsmt");
+    let top: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&top_path).unwrap());
+    compact_to_with_options(
+        &[top_source as Arc<dyn VirtualFile>],
+        &[SegmentMapping::new(0, 16, 0, false, 0)],
+        3 * 4096,
+        CommitArgs::new(top.clone()),
+        compact_options(true),
+    )
+    .await
+    .expect("build zeroed top layer");
+
+    // open_files_ro takes the oldest/base layer first.
+    let stacked = open_files_ro(&[lower, top]).await.expect("merge layers");
+    assert_eq!(
+        stacked.read_at(0, 4096).await.unwrap().as_ref(),
+        &[0x44u8; 4096]
+    );
+    assert_eq!(
+        stacked.read_at(4096, 4096).await.unwrap().as_ref(),
+        &[0u8; 4096],
+        "the zeroed segment must read as zeros instead of falling through to the lower layer"
+    );
+    assert_eq!(
+        stacked.read_at(8192, 4096).await.unwrap().as_ref(),
+        &[0x33u8; 4096],
+        "ranges the top layer does not cover still come from the lower layer"
+    );
+}

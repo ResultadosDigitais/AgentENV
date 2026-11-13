@@ -2,7 +2,6 @@ use super::types::*;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use futures_util::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
-use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind};
@@ -1123,49 +1122,17 @@ pub(super) fn append_invalid_index_padding(index_bytes: &mut Vec<u8>, padding_co
     }
 }
 
-fn compact_is_zero_block(_buf: &[u8]) -> bool {
-    // Keep parity with upstream OverlayBD: file.cpp currently short-circuits
-    // `is_zero_block()` to treat compacted data blocks as non-zero.
-    COMPACT_ZERO_DETECTION_ENABLED
-}
-
-/// Emit a contiguous run of blocks with the same zero/non-zero properties
-/// as one index segment, into `index`. Append non-zero blocks to the output
-/// data buffer, then prepare `segment` to accumulate the next run.
-fn push_compact_segment(
-    chunk: &[u8],
-    data: &mut Vec<u8>,
-    prev_end_blocks: &mut usize,
-    zero_detected: bool,
-    segment: &mut SegmentMapping,
-    index: &mut Vec<SegmentMapping>,
-) {
-    // A zero record occupies no physical range in the destination, so it must
-    // not advance the data cursor. Save `next_moffset` before replacing the
-    // record's offset with the marker: it is the physical destination offset
-    // used for the next segment's data write.
-    let next_moffset = if zero_detected {
-        segment.moffset
-    } else {
-        segment.mend()
-    };
-    if zero_detected {
-        segment.zeroed = true;
-        segment.moffset = NO_PHYSICAL_OFFSET;
-    } else {
-        let begin = *prev_end_blocks * ALIGNMENT_USIZE;
-        let len = segment.length() as usize * ALIGNMENT_USIZE;
-        data.extend_from_slice(&chunk[begin..begin + len]);
-    }
-
-    *prev_end_blocks += segment.length() as usize;
-    index.push(*segment);
-
-    let next_offset = segment.end();
-    segment.zeroed = false;
-    segment.segment.offset = next_offset;
-    segment.segment.length = 0;
-    segment.moffset = next_moffset;
+/// Whether every byte of a 512-byte block is zero.
+///
+/// The scan runs over bytes the pause already read into its compact buffer, so
+/// it compares machine words to stay a cheap pass over memory.
+fn is_zero_block(block: &[u8]) -> bool {
+    debug_assert_eq!(block.len(), ALIGNMENT_USIZE);
+    block
+        .as_chunks::<{ size_of::<u64>() }>()
+        .0
+        .iter()
+        .all(|word| u64::from_ne_bytes(*word) == 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,58 +1171,182 @@ struct CompactChunk {
 struct PreparedCompactChunk {
     order: usize,
     destination_offset: u64,
+    /// Bytes the destination must hold for this chunk. With zero detection this
+    /// is only the non-zero prefix of `buffer`.
     len: usize,
+    /// Zero source bytes this chunk left out of the destination.
+    skipped_bytes: u64,
     buffer: Box<dyn storage_util::CompactBuffer>,
+    /// Index entries whose `moffset` is relative to the chunk start in blocks.
+    /// Zero entries already carry `NO_PHYSICAL_OFFSET`.
     index: Vec<SegmentMapping>,
 }
 
+/// Emit one run of blocks as an index segment, copying the run's non-zero
+/// bytes toward `write_pos`.
+#[allow(clippy::too_many_arguments)]
+fn push_compact_run(
+    buffer: &mut [u8],
+    entry_start: usize,
+    logical_base: u64,
+    tag: u8,
+    run_start: usize,
+    run_len: usize,
+    zero: bool,
+    write_pos: &mut usize,
+    skipped_bytes: &mut u64,
+    index: &mut Vec<SegmentMapping>,
+) {
+    let logical = logical_base + run_start as u64;
+    if zero {
+        index.push(SegmentMapping::new(logical, run_len as u32, 0, true, tag));
+        *skipped_bytes += (run_len * ALIGNMENT_USIZE) as u64;
+    } else {
+        let byte_len = run_len * ALIGNMENT_USIZE;
+        let src = entry_start + run_start * ALIGNMENT_USIZE;
+        // Nothing was dropped before this run, so the bytes already sit at
+        // their destination; skipping the move keeps a zero-free pause as cheap
+        // as it is today.
+        if *write_pos != src {
+            buffer.copy_within(src..src + byte_len, *write_pos);
+        }
+        index.push(SegmentMapping::new(
+            logical,
+            run_len as u32,
+            (*write_pos / ALIGNMENT_USIZE) as u64,
+            false,
+            tag,
+        ));
+        *write_pos += byte_len;
+    }
+}
+
+/// Classify every 512-byte block already read into `buffer` and compact the
+/// non-zero blocks toward its start.
+///
+/// Returns the bytes the destination must hold, the zero bytes left out, and
+/// the index entries for the chunk, with `moffset` relative to the chunk start.
+fn compact_zeroed_chunk(
+    buffer: &mut [u8],
+    entries: &[CompactChunkEntry],
+) -> (usize, u64, Vec<SegmentMapping>) {
+    let mut index = Vec::with_capacity(entries.len());
+    let mut read_pos = 0usize;
+    let mut write_pos = 0usize;
+    let mut skipped_bytes = 0u64;
+
+    for entry in entries {
+        let entry_blocks = entry.len / ALIGNMENT_USIZE;
+        let mut run_start = 0usize;
+        let mut run_zero: Option<bool> = None;
+        for block_idx in 0..entry_blocks {
+            let block_start = read_pos + block_idx * ALIGNMENT_USIZE;
+            let zero = is_zero_block(&buffer[block_start..block_start + ALIGNMENT_USIZE]);
+            match run_zero {
+                None => {
+                    run_zero = Some(zero);
+                    run_start = block_idx;
+                }
+                Some(current) if current == zero => {}
+                Some(current) => {
+                    push_compact_run(
+                        buffer,
+                        read_pos,
+                        entry.logical_offset,
+                        entry.tag,
+                        run_start,
+                        block_idx - run_start,
+                        current,
+                        &mut write_pos,
+                        &mut skipped_bytes,
+                        &mut index,
+                    );
+                    run_zero = Some(zero);
+                    run_start = block_idx;
+                }
+            }
+        }
+        if let Some(zero) = run_zero {
+            push_compact_run(
+                buffer,
+                read_pos,
+                entry.logical_offset,
+                entry.tag,
+                run_start,
+                entry_blocks - run_start,
+                zero,
+                &mut write_pos,
+                &mut skipped_bytes,
+                &mut index,
+            );
+        }
+        read_pos += entry.len;
+    }
+
+    (write_pos, skipped_bytes, index)
+}
+
 /// Read all entries in `chunk` into a single writer-provided buffer.
+///
+/// With `zero_detection` the buffer is compacted in place and the returned
+/// index describes only the bytes that survived.
 async fn compact_read_chunk(
     src_layers: &[Arc<dyn VirtualFile>],
     writer: &dyn CompactWriter,
     chunk: CompactChunk,
+    zero_detection: bool,
 ) -> Result<PreparedCompactChunk> {
     let mut buffer = writer.alloc_buffer().await?;
-    let buffer_slice = buffer.as_mut().as_mut();
     let mut buffer_offset = 0usize;
-    let mut index = Vec::with_capacity(chunk.entries.len());
 
-    for entry in &chunk.entries {
-        let layer_idx = entry.tag as usize;
-        ensure!(layer_idx < src_layers.len(), "Invalid layer tag");
+    {
+        let buffer_slice = buffer.as_mut().as_mut();
+        for entry in &chunk.entries {
+            let layer_idx = entry.tag as usize;
+            ensure!(layer_idx < src_layers.len(), "Invalid layer tag");
 
-        let got = src_layers[layer_idx]
-            .read_at_into(
+            let got = src_layers[layer_idx]
+                .read_at_into(
+                    entry.src_offset,
+                    &mut buffer_slice[buffer_offset..buffer_offset + entry.len],
+                )
+                .await?;
+            ensure!(
+                got == entry.len,
+                "failed to read {} bytes from source layer {} at offset {}, got {}",
+                entry.len,
+                layer_idx,
                 entry.src_offset,
-                &mut buffer_slice[buffer_offset..buffer_offset + entry.len],
-            )
-            .await?;
-        ensure!(
-            got == entry.len,
-            "failed to read {} bytes from source layer {} at offset {}, got {}",
-            entry.len,
-            layer_idx,
-            entry.src_offset,
-            got
-        );
+                got
+            );
 
-        let block_len = (entry.len / ALIGNMENT_USIZE) as u32;
-        let dest_phys = chunk.dest_moffset + (buffer_offset / ALIGNMENT_USIZE) as u64;
-        index.push(SegmentMapping::new(
-            entry.logical_offset,
-            block_len,
-            dest_phys,
-            false,
-            entry.tag,
-        ));
-
-        buffer_offset += entry.len;
+            buffer_offset += entry.len;
+        }
     }
+
+    let (len, skipped_bytes, index) = if zero_detection {
+        compact_zeroed_chunk(buffer.as_mut().as_mut(), &chunk.entries)
+    } else {
+        let mut index = Vec::with_capacity(chunk.entries.len());
+        let mut entry_offset = 0usize;
+        for entry in &chunk.entries {
+            index.push(SegmentMapping::new(
+                entry.logical_offset,
+                (entry.len / ALIGNMENT_USIZE) as u32,
+                (entry_offset / ALIGNMENT_USIZE) as u64,
+                false,
+                entry.tag,
+            ));
+            entry_offset += entry.len;
+        }
+        (chunk.total_len, 0, index)
+    };
 
     Ok(PreparedCompactChunk {
         order: chunk.order,
         destination_offset: chunk.dest_moffset * ALIGNMENT,
-        len: chunk.total_len,
+        len,
+        skipped_bytes,
         buffer,
         index,
     })
@@ -1263,11 +1354,21 @@ async fn compact_read_chunk(
 
 async fn compact_write_chunk(
     writer: &dyn CompactWriter,
-    prepared: PreparedCompactChunk,
+    mut prepared: PreparedCompactChunk,
 ) -> Result<(usize, Vec<SegmentMapping>)> {
-    writer
-        .write(prepared.buffer, prepared.destination_offset, prepared.len)
-        .await?;
+    // The reader stored destination offsets relative to the chunk; shift them
+    // now that the chunk's destination is known.
+    let base_blocks = prepared.destination_offset / ALIGNMENT;
+    for mapping in &mut prepared.index {
+        if !mapping.zeroed {
+            mapping.moffset += base_blocks;
+        }
+    }
+    if prepared.len > 0 {
+        writer
+            .write(prepared.buffer, prepared.destination_offset, prepared.len)
+            .await?;
+    }
     Ok((prepared.order, prepared.index))
 }
 
@@ -1275,116 +1376,52 @@ async fn compact_copy_chunk(
     src_layers: &[Arc<dyn VirtualFile>],
     writer: &dyn CompactWriter,
     chunk: CompactChunk,
+    zero_detection: bool,
 ) -> Result<(usize, Vec<SegmentMapping>)> {
-    let prepared = compact_read_chunk(src_layers, writer, chunk).await?;
+    let prepared = compact_read_chunk(src_layers, writer, chunk, zero_detection).await?;
     compact_write_chunk(writer, prepared).await
 }
 
-// ---------------------------------------------------------------------------
-// Legacy per-mapping copy — used only when COMPACT_ZERO_DETECTION_ENABLED
-// ---------------------------------------------------------------------------
-
-/// Copy data blocks for a single mapping, with optional zero-block detection.
+/// Read chunks concurrently but write them in chunk order, assigning
+/// destination offsets as the writes advance.
 ///
-/// Kept as a fallback for the zero-detection path which may change the output
-/// size per mapping and therefore cannot be pre-chunked.
-async fn compact_copy_mapping_with_zero_detection(
+/// With `zero_detection` each chunk's destination depends on how many bytes the
+/// previous chunks dropped, so the offsets cannot be pre-computed; without it
+/// the chunk's pre-computed destination from the chunking phase is kept.
+async fn compact_write_chunks_ordered(
     src_layers: &[Arc<dyn VirtualFile>],
-    writer: &dyn CompactWriter,
-    mapping: SegmentMapping,
-    moffset: u64,
-) -> Result<(u64, Vec<SegmentMapping>)> {
-    let layer_idx = mapping.tag as usize;
-    ensure!(layer_idx < src_layers.len(), "Invalid layer tag");
-
-    let mut src_offset = mapping.moffset * ALIGNMENT;
-    let mut remaining = mapping.length() as u64 * ALIGNMENT;
-    let mut dest_offset = moffset * ALIGNMENT;
-    let mut written_bytes = 0u64;
-    let buf_size = writer.buffer_size();
-    ensure!(
-        buf_size.is_multiple_of(ALIGNMENT_USIZE),
-        "CompactWriter buffer size {buf_size} not aligned"
-    );
+    writer: &Arc<dyn CompactWriter>,
+    chunks: Vec<CompactChunk>,
+    concurrency: usize,
+    zero_detection: bool,
+    dest_start_moffset: u64,
+) -> Result<(Vec<SegmentMapping>, u64, u64, u64)> {
+    let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
+    let mut prepared = stream::iter(chunks)
+        .map(|chunk| {
+            let layers = src_layers.clone();
+            let writer = writer.clone();
+            async move { compact_read_chunk(&layers, writer.as_ref(), chunk, zero_detection).await }
+        })
+        .buffered(concurrency);
 
     let mut index = Vec::new();
-    let mut segment = SegmentMapping::new(mapping.offset(), 0, moffset, false, mapping.tag);
-    let mut data = Vec::with_capacity(buf_size);
-
-    while remaining > 0 {
-        let step = min(remaining as usize, buf_size);
-        let chunk = src_layers[layer_idx].read_at(src_offset, step).await?;
-        ensure!(
-            chunk.len() == step,
-            "failed to read {} bytes from source layer {} at offset {}, got {}",
-            step,
-            layer_idx,
-            src_offset,
-            chunk.len()
-        );
-
-        data.clear();
-        let mut prev_end_blocks = 0usize;
-        let mut zero_detected = false;
-        let mut have_detection = false;
-
-        for block_begin in (0..step).step_by(ALIGNMENT_USIZE) {
-            let block_end = block_begin + ALIGNMENT_USIZE;
-            let is_zero = compact_is_zero_block(&chunk[block_begin..block_end]);
-            if is_zero {
-                if have_detection && !zero_detected && segment.length() > 0 {
-                    push_compact_segment(
-                        &chunk,
-                        &mut data,
-                        &mut prev_end_blocks,
-                        false,
-                        &mut segment,
-                        &mut index,
-                    );
-                }
-                segment.segment.length += 1;
-                zero_detected = true;
-                have_detection = true;
-                continue;
-            }
-
-            if have_detection && zero_detected {
-                push_compact_segment(
-                    &chunk,
-                    &mut data,
-                    &mut prev_end_blocks,
-                    true,
-                    &mut segment,
-                    &mut index,
-                );
-            }
-            segment.segment.length += 1;
-            zero_detected = false;
-            have_detection = true;
+    let mut skipped_bytes = 0u64;
+    let mut written_bytes = 0u64;
+    let mut output_moffset = dest_start_moffset;
+    while let Some(prepared) = prepared.next().await {
+        let mut prepared = prepared?;
+        if zero_detection {
+            prepared.destination_offset = output_moffset * ALIGNMENT;
+            output_moffset += (prepared.len / ALIGNMENT_USIZE) as u64;
         }
-
-        if segment.length() > 0 {
-            push_compact_segment(
-                &chunk,
-                &mut data,
-                &mut prev_end_blocks,
-                have_detection && zero_detected,
-                &mut segment,
-                &mut index,
-            );
-        }
-
-        if !data.is_empty() {
-            writer.write_all_at(&data, dest_offset).await?;
-            dest_offset += data.len() as u64;
-            written_bytes += data.len() as u64;
-        }
-
-        src_offset += step as u64;
-        remaining -= step as u64;
+        skipped_bytes += prepared.skipped_bytes;
+        written_bytes += prepared.len as u64;
+        let (_, entries) = compact_write_chunk(writer.as_ref(), prepared).await?;
+        index.extend(entries);
     }
 
-    Ok((written_bytes / ALIGNMENT, index))
+    Ok((index, skipped_bytes, written_bytes, output_moffset))
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,6 +1461,30 @@ pub async fn compact_to(
     virtual_size: u64,
     commit_args: CommitArgs,
 ) -> Result<()> {
+    compact_to_with_options(
+        src_layers,
+        mappings,
+        virtual_size,
+        commit_args,
+        CompactOptions::default(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Compact with explicit [`CompactOptions`], returning the byte accounting of
+/// the run.
+///
+/// Same contract as [`compact_to`]; the options are opt-in, so a caller that
+/// passes [`CompactOptions::default()`] gets the historical output, and
+/// [`CompactStats`] tells how much data zero detection left out.
+pub async fn compact_to_with_options(
+    src_layers: &[Arc<dyn VirtualFile>],
+    mappings: &[SegmentMapping],
+    virtual_size: u64,
+    commit_args: CommitArgs,
+    options: CompactOptions,
+) -> Result<CompactStats> {
     let mut header = HeaderTrailer::new();
     header.size = U32::new(size_of::<HeaderTrailer>() as u32);
     header.virtual_size = U64::new(virtual_size);
@@ -1445,142 +1506,131 @@ pub async fn compact_to(
 
     writer.write_all_at(&header_buf, 0).await?;
 
+    let zero_detection = options.zero_detection;
+    let mut stats = CompactStats {
+        input_bytes: mappings
+            .iter()
+            .map(|m| u64::from(m.length()) * ALIGNMENT)
+            .sum(),
+        ..CompactStats::default()
+    };
     let mut compact_index: Vec<SegmentMapping> = Vec::with_capacity(mappings.len());
     let mut dest_moffset = HEADER_SIZE / ALIGNMENT;
 
-    if COMPACT_ZERO_DETECTION_ENABLED {
-        // Legacy per-mapping path. Zero detection may change the output size
-        // per mapping, so we cannot pre-chunk or pre-compute offsets.
-        for m in mappings {
-            if m.zeroed {
-                let mut zero = *m;
-                zero.moffset = NO_PHYSICAL_OFFSET;
-                compact_index.push(zero);
-                continue;
+    // Phase 1: Pack non-zeroed mappings into buffer-sized chunks.
+    //
+    // Each chunk aggregates data from one or more mappings (possibly from
+    // different source layers) up to `writer.buffer_size()` bytes. Large
+    // mappings that exceed the buffer size are split across chunks.
+    //
+    // Zeroed mappings don't consume destination space — they are recorded
+    // directly in `compact_index` and skipped during chunking.
+    let buf_size = writer.buffer_size();
+    ensure!(
+        buf_size >= ALIGNMENT_USIZE && buf_size.is_multiple_of(ALIGNMENT_USIZE),
+        "CompactWriter buffer size {buf_size} not aligned"
+    );
+    let mut chunks: Vec<CompactChunk> = Vec::new();
+    let mut current_chunk: Option<CompactChunk> = None;
+    let mut chunk_order = 0usize;
+
+    for m in mappings {
+        if m.zeroed {
+            let mut zero = *m;
+            zero.moffset = NO_PHYSICAL_OFFSET;
+            compact_index.push(zero);
+            stats.skipped_bytes += u64::from(m.length()) * ALIGNMENT;
+            // NOTE: no need to advance dest_moffset, as this is a zero segement,
+            // does not occupy space in dset file.
+            continue;
+        }
+
+        let mut remaining = m.length() as usize * ALIGNMENT_USIZE;
+        let mut src_off = m.moffset * ALIGNMENT;
+        let mut logical_off = m.offset();
+
+        while remaining > 0 {
+            let chunk = current_chunk.get_or_insert_with(|| {
+                let c = CompactChunk {
+                    entries: Vec::new(),
+                    dest_moffset,
+                    total_len: 0,
+                    order: chunk_order,
+                };
+                chunk_order += 1;
+                c
+            });
+
+            let space = buf_size - chunk.total_len;
+            let take = remaining
+                .min(space)
+                .min(Segment::MAX_LENGTH as usize * ALIGNMENT_USIZE);
+
+            chunk.entries.push(CompactChunkEntry {
+                tag: m.tag,
+                src_offset: src_off,
+                len: take,
+                logical_offset: logical_off,
+            });
+            chunk.total_len += take;
+
+            let blocks_taken = (take / ALIGNMENT_USIZE) as u64;
+            logical_off += blocks_taken;
+            src_off += take as u64;
+            remaining -= take;
+            dest_moffset += blocks_taken;
+
+            if chunk.total_len >= buf_size {
+                chunks.push(current_chunk.take().unwrap());
             }
-            let (written_blocks, entries) = compact_copy_mapping_with_zero_detection(
-                src_layers,
-                writer.as_ref(),
-                *m,
-                dest_moffset,
-            )
-            .await?;
-            compact_index.extend(entries);
-            dest_moffset += written_blocks;
+        }
+    }
+    // Flush remaining partial chunk.
+    if let Some(chunk) = current_chunk.take() {
+        chunks.push(chunk);
+    }
+
+    // Phase 2: Copy data blocks, potentially in parallel.
+    //
+    // Zero detection shrinks a chunk by an amount only known after reading it,
+    // so destination offsets are assigned in write order and the ordered
+    // pipeline is used even for writers that tolerate random writes.
+    if zero_detection || writer.requires_ordered_writes() {
+        let (entries, skipped_bytes, written_bytes, output_moffset) = compact_write_chunks_ordered(
+            src_layers,
+            &writer,
+            chunks,
+            concurrency,
+            zero_detection,
+            HEADER_SIZE / ALIGNMENT,
+        )
+        .await?;
+        compact_index.extend(entries);
+        stats.skipped_bytes += skipped_bytes;
+        stats.written_bytes += written_bytes;
+        if zero_detection {
+            dest_moffset = output_moffset;
         }
     } else {
-        // Phase 1: Pack non-zeroed mappings into buffer-sized chunks.
-        //
-        // Each chunk aggregates data from one or more mappings (possibly from
-        // different source layers) up to `writer.buffer_size()` bytes. Large
-        // mappings that exceed the buffer size are split across chunks.
-        //
-        // Zeroed mappings don't consume destination space — they are recorded
-        // directly in `compact_index` and skipped during chunking.
-        let buf_size = writer.buffer_size();
-        ensure!(
-            buf_size >= ALIGNMENT_USIZE && buf_size.is_multiple_of(ALIGNMENT_USIZE),
-            "CompactWriter buffer size {buf_size} not aligned"
-        );
-        let mut chunks: Vec<CompactChunk> = Vec::new();
-        let mut current_chunk: Option<CompactChunk> = None;
-        let mut chunk_order = 0usize;
-
-        for m in mappings {
-            if m.zeroed {
-                let mut zero = *m;
-                zero.moffset = NO_PHYSICAL_OFFSET;
-                compact_index.push(zero);
-                // NOTE: no need to advance dest_moffset, as this is a zero segement,
-                // does not occupy space in dset file.
-                continue;
-            }
-
-            let mut remaining = m.length() as usize * ALIGNMENT_USIZE;
-            let mut src_off = m.moffset * ALIGNMENT;
-            let mut logical_off = m.offset();
-
-            while remaining > 0 {
-                let chunk = current_chunk.get_or_insert_with(|| {
-                    let c = CompactChunk {
-                        entries: Vec::new(),
-                        dest_moffset,
-                        total_len: 0,
-                        order: chunk_order,
-                    };
-                    chunk_order += 1;
-                    c
-                });
-
-                let space = buf_size - chunk.total_len;
-                let take = remaining
-                    .min(space)
-                    .min(Segment::MAX_LENGTH as usize * ALIGNMENT_USIZE);
-
-                chunk.entries.push(CompactChunkEntry {
-                    tag: m.tag,
-                    src_offset: src_off,
-                    len: take,
-                    logical_offset: logical_off,
-                });
-                chunk.total_len += take;
-
-                let blocks_taken = (take / ALIGNMENT_USIZE) as u64;
-                logical_off += blocks_taken;
-                src_off += take as u64;
-                remaining -= take;
-                dest_moffset += blocks_taken;
-
-                if chunk.total_len >= buf_size {
-                    chunks.push(current_chunk.take().unwrap());
-                }
-            }
+        // `buffer_unordered` already caps in-flight chunk copies at
+        // `concurrency`, so no extra semaphore is needed here.
+        let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
+        let mut results: Vec<(usize, Vec<SegmentMapping>)> = stream::iter(chunks)
+            .map(|chunk| {
+                let writer = writer.clone();
+                let layers = src_layers.clone();
+                async move { compact_copy_chunk(&layers, writer.as_ref(), chunk, false).await }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        results.sort_by_key(|(order, _)| *order);
+        for (_, entries) in results {
+            compact_index.extend(entries);
         }
-        // Flush remaining partial chunk.
-        if let Some(chunk) = current_chunk.take() {
-            chunks.push(chunk);
-        }
-
-        // Phase 2: Copy data blocks, potentially in parallel.
-        if concurrency == 1 {
-            for chunk in chunks {
-                let (_, entries) = compact_copy_chunk(src_layers, writer.as_ref(), chunk).await?;
-                compact_index.extend(entries);
-            }
-        } else if writer.requires_ordered_writes() {
-            let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
-            let mut prepared = stream::iter(chunks)
-                .map(|chunk| {
-                    let layers = src_layers.clone();
-                    let writer = writer.clone();
-                    async move { compact_read_chunk(&layers, writer.as_ref(), chunk).await }
-                })
-                .buffered(concurrency);
-
-            while let Some(chunk) = prepared.next().await {
-                let (_, entries) = compact_write_chunk(writer.as_ref(), chunk?).await?;
-                compact_index.extend(entries);
-            }
-        } else {
-            // `buffer_unordered` already caps in-flight chunk copies at
-            // `concurrency`, so no extra semaphore is needed here.
-            let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
-            let mut results: Vec<(usize, Vec<SegmentMapping>)> = stream::iter(chunks)
-                .map(|chunk| {
-                    let writer = writer.clone();
-                    let layers = src_layers.clone();
-                    async move { compact_copy_chunk(&layers, writer.as_ref(), chunk).await }
-                })
-                .buffer_unordered(concurrency)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            results.sort_by_key(|(order, _)| *order);
-            for (_, entries) in results {
-                compact_index.extend(entries);
-            }
-        }
+        stats.written_bytes += dest_moffset * ALIGNMENT - HEADER_SIZE;
     }
 
     // Phase 3: Write the index and trailer.
@@ -1630,7 +1680,7 @@ pub async fn compact_to(
     writer.write_all_at(&trailer_buf, trailer_offset).await?;
     writer.finalize().await?;
 
-    Ok(())
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -1638,38 +1688,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detected_zero_does_not_advance_compact_data_cursor() {
-        let chunk = [0xAB; 2 * ALIGNMENT_USIZE];
-        let mut data = Vec::new();
-        let mut prev_end_blocks = 0;
-        let mut segment = SegmentMapping::new(0, 1, 8, false, 0);
-        let mut index = Vec::new();
-        push_compact_segment(
-            &chunk,
-            &mut data,
-            &mut prev_end_blocks,
-            true,
-            &mut segment,
-            &mut index,
-        );
-        assert!(data.is_empty());
-        assert_eq!(
-            index[0],
-            SegmentMapping::new(0, 1, NO_PHYSICAL_OFFSET, true, 0)
-        );
-        assert_eq!(segment, SegmentMapping::new(1, 0, 8, false, 0));
+    fn zeroed_chunk_drops_zero_runs_and_keeps_data_contiguous() {
+        let mut buffer = vec![0u8; 4 * ALIGNMENT_USIZE];
+        buffer[ALIGNMENT_USIZE..2 * ALIGNMENT_USIZE].fill(0xAB);
+        buffer[3 * ALIGNMENT_USIZE..4 * ALIGNMENT_USIZE].fill(0xCD);
+        let entry = CompactChunkEntry {
+            tag: 0,
+            src_offset: 0,
+            len: 4 * ALIGNMENT_USIZE,
+            logical_offset: 10,
+        };
 
-        segment.segment.length = 1;
-        push_compact_segment(
-            &chunk,
-            &mut data,
-            &mut prev_end_blocks,
-            false,
-            &mut segment,
-            &mut index,
+        let (written, skipped, index) =
+            compact_zeroed_chunk(&mut buffer, std::slice::from_ref(&entry));
+
+        assert_eq!(written, 2 * ALIGNMENT_USIZE);
+        assert_eq!(skipped, 2 * ALIGNMENT_USIZE as u64);
+        assert_eq!(&buffer[..ALIGNMENT_USIZE], &[0xAB; ALIGNMENT_USIZE]);
+        assert_eq!(
+            &buffer[ALIGNMENT_USIZE..2 * ALIGNMENT_USIZE],
+            &[0xCD; ALIGNMENT_USIZE]
         );
-        assert_eq!(data.as_slice(), &[0xAB; ALIGNMENT_USIZE]);
-        assert_eq!(index[1], SegmentMapping::new(1, 1, 8, false, 0));
-        assert_eq!(segment, SegmentMapping::new(2, 0, 9, false, 0));
+        assert_eq!(
+            index,
+            vec![
+                SegmentMapping::new(10, 1, 0, true, 0),
+                SegmentMapping::new(11, 1, 0, false, 0),
+                SegmentMapping::new(12, 1, 0, true, 0),
+                SegmentMapping::new(13, 1, 1, false, 0),
+            ]
+        );
     }
 }
