@@ -22,7 +22,7 @@ use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::compact_to;
+use overlaybd::index_file::{compact_to_with_options, CompactOptions, CompactStats};
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -1790,6 +1790,17 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     .await
 }
 
+/// Named, recoverable failure code: reading a dirty memory page failed, so the
+/// pause cannot produce a memory layer. It is never downgraded to a zero page —
+/// absence from the host reads as zeros and is detected from the bytes, while a
+/// failed read aborts the pause and lets the lifecycle restore the sandbox.
+pub(crate) const MEMORY_SNAPSHOT_DIRTY_RANGE_READ_FAILED: &str =
+    "MEMORY_SNAPSHOT_DIRTY_RANGE_READ_FAILED";
+
+/// Histogram of bytes a pause left out because the host already discarded the
+/// pages. Bounded labels: no sandbox id.
+const MEMORY_SNAPSHOT_SKIPPED_BYTES: &str = "agentenv_memory_snapshot_skipped_bytes";
+
 async fn publish_memory_overlaybd_layer(
     src_layers: &[Arc<dyn VirtualFile>],
     mappings: &[SegmentMapping],
@@ -1798,7 +1809,7 @@ async fn publish_memory_overlaybd_layer(
     mode: OverlaybdCompactOutput,
     concurrency: usize,
     drop_page_cache: bool,
-) -> Result<()> {
+) -> Result<CompactStats> {
     let lower_tmp = output_path.with_extension("commit.tmp");
     let build_result = async {
         let output_file: Arc<dyn VirtualFile> = Arc::new(
@@ -1806,9 +1817,24 @@ async fn publish_memory_overlaybd_layer(
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
         let commit_args = create_commit_args(output_file, mode, concurrency).await?;
-        compact_to(src_layers, mappings, virtual_size, commit_args)
-            .await
-            .context("compact memory layer")?;
+        // The pause reads dirty ranges from the live Firecracker process. A
+        // guest page the host already discarded reads back as zeros, so
+        // recording it as an unbacked zero segment keeps the layer content
+        // intact while writing none of its bytes.
+        let stats = compact_to_with_options(
+            src_layers,
+            mappings,
+            virtual_size,
+            commit_args,
+            CompactOptions {
+                zero_detection: true,
+            },
+        )
+        .await
+        .with_context(|| {
+            format!("{MEMORY_SNAPSHOT_DIRTY_RANGE_READ_FAILED}: compact memory layer")
+        })?;
+
         tokio::fs::rename(&lower_tmp, output_path)
             .await
             .with_context(|| {
@@ -1820,7 +1846,7 @@ async fn publish_memory_overlaybd_layer(
         if drop_page_cache {
             drop_page_cache_after_write(output_path).await?;
         }
-        Ok(())
+        Ok(stats)
     }
     .await;
 
@@ -1950,7 +1976,7 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
     let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
     let src_layers = vec![source_file];
-    publish_memory_overlaybd_layer(
+    let stats = publish_memory_overlaybd_layer(
         &src_layers,
         &mappings,
         memory_size,
@@ -1961,6 +1987,14 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     )
     .await
     .context("compact dirty memory ranges as overlaybd layer")?;
+
+    metrics::histogram!(MEMORY_SNAPSHOT_SKIPPED_BYTES).record(stats.skipped_bytes as f64);
+    tracing::info!(
+        dirty_bytes = stats.input_bytes,
+        skipped_bytes = stats.skipped_bytes,
+        written_bytes = stats.written_bytes,
+        "memory snapshot skipped host-discarded pages"
+    );
 
     Ok((data_path, memory_size))
 }
@@ -3743,6 +3777,40 @@ mod tests {
         assert!(image_config.download_override.is_none());
     }
 
+    struct PatternSource {
+        data: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl VirtualFile for PatternSource {
+        async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+            let offset = offset as usize;
+            anyhow::ensure!(
+                offset + len <= self.data.len(),
+                "read past pattern source end"
+            );
+            Ok(Bytes::copy_from_slice(&self.data[offset..offset + len]))
+        }
+
+        async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
+            let offset = offset as usize;
+            anyhow::ensure!(
+                offset + dst.len() <= self.data.len(),
+                "read past pattern source end"
+            );
+            dst.copy_from_slice(&self.data[offset..offset + dst.len()]);
+            Ok(dst.len())
+        }
+
+        async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("pattern source is read-only")
+        }
+
+        async fn size(&self) -> Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+    }
+
     struct FailingSource;
 
     #[async_trait]
@@ -3774,7 +3842,7 @@ mod tests {
             .await
             .expect("write existing final");
         let source: Arc<dyn VirtualFile> = Arc::new(FailingSource);
-        publish_memory_overlaybd_layer(
+        let err = publish_memory_overlaybd_layer(
             &[source],
             &one_page_mapping(),
             OVERLAYBD_ALIGNMENT,
@@ -3785,11 +3853,67 @@ mod tests {
         )
         .await
         .expect_err("copy failure should be returned");
+        assert!(
+            err.to_string()
+                .contains(MEMORY_SNAPSHOT_DIRTY_RANGE_READ_FAILED),
+            "the read failure must carry its named code: {err:#}"
+        );
 
         assert!(!lower_tmp.exists());
         assert_eq!(
             tokio::fs::read(&output).await.expect("read final"),
             existing
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_memory_layer_records_discarded_pages_as_zeroed_segments() {
+        use overlaybd::index_file::open_file_ro;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("memory.commit");
+        let mut data = vec![0x77u8; 4096];
+        data.extend(std::iter::repeat_n(0u8, 4096));
+        let source: Arc<dyn VirtualFile> = Arc::new(PatternSource { data });
+
+        let stats = publish_memory_overlaybd_layer(
+            &[source],
+            &[SegmentMapping::new(0, 16, 0, false, 0)],
+            16 * OVERLAYBD_ALIGNMENT,
+            &output,
+            OverlaybdCompactOutput::Raw,
+            1,
+            false,
+        )
+        .await
+        .expect("publish memory layer");
+
+        assert_eq!(stats.skipped_bytes, 4096);
+        assert_eq!(stats.written_bytes, 4096);
+
+        let layer_file = Arc::new(LocalFile::open_ro(&output).expect("open published layer"));
+        let ro = open_file_ro(layer_file)
+            .await
+            .expect("read published layer");
+        assert_eq!(
+            ro.read_at(0, 4096).await.expect("read data page").as_ref(),
+            &[0x77u8; 4096]
+        );
+        assert_eq!(
+            ro.read_at(4096, 4096)
+                .await
+                .expect("read zero page")
+                .as_ref(),
+            &[0u8; 4096],
+            "a discarded page must read back as zeros from the sealed layer"
+        );
+        assert!(
+            ro.index_view()
+                .expect("index view")
+                .mappings()
+                .iter()
+                .any(|m| m.zeroed),
+            "the published memory layer must carry a zeroed segment"
         );
     }
 
