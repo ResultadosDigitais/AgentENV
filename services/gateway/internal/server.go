@@ -262,9 +262,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	reservationID := ""
 
 	if hasSandbox && resumeRequest {
+		body, err := captureRequestBody(r)
+		if err != nil {
+			s.logger.Warn("Fatal error when reading resume body",
+				zap.String("sandbox_id", sandboxID),
+				zap.Error(err),
+			)
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
 		resumeReq := &schedulerv1.ScheduleResumeRequest{
 			SandboxId: sandboxID,
 			ClusterId: strings.TrimSpace(r.URL.Query().Get("clusterID")),
+			Pool:      parsePool(body),
 		}
 		if shape, ok := s.sandboxShapes.get(sandboxID); ok {
 			resumeReq.CpuCount = shape.CPUCount

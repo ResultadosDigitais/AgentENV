@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -179,5 +180,39 @@ func TestSandboxShapeCacheDropsEmptyShape(t *testing.T) {
 	cache.forget("sbx-1")
 	if _, ok := cache.get("sbx-1"); ok {
 		t.Fatal("expected forget to drop the shape")
+	}
+}
+
+// The resume body may ask for a pool; the gateway forwards it so the scheduler
+// keeps the sandbox on nodes of that pool.
+func TestResumeForwardsPoolToScheduler(t *testing.T) {
+	var got *schedulerv1.ScheduleResumeRequest
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleResumeFunc: func(_ context.Context, req *schedulerv1.ScheduleResumeRequest, _ ...grpc.CallOption) (*schedulerv1.ScheduleResumeResponse, error) {
+			got = req
+			return &schedulerv1.ScheduleResumeResponse{
+				Node:     &schedulerv1.Node{NodeId: "owner", Endpoint: upstream.URL},
+				Admitted: true,
+			}, nil
+		},
+	}, 5*time.Second, 4<<20)
+
+	request := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes/sbx-1/resume", strings.NewReader(`{"timeout":60,"pool":"spot"}`))
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if got == nil {
+		t.Fatal("expected a ScheduleResume call")
+	}
+	if got.GetPool() != "spot" {
+		t.Fatalf("pool = %q, want spot", got.GetPool())
 	}
 }

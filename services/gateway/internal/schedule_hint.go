@@ -30,6 +30,7 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error
 			Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
 				NewColdSandbox: parseNewColdSandboxHint(body),
 			},
+			Pool: parsePool(body),
 		}, nil
 	case "/sandboxes", "/v2/sandboxes":
 		body, err := captureRequestBody(r)
@@ -40,6 +41,7 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error
 			Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
 				NewSandbox: parseNewSandboxHint(body),
 			},
+			Pool: parsePool(body),
 		}, nil
 	default:
 		return nil, nil
@@ -157,4 +159,23 @@ func parseNewSandboxHint(body []byte) *schedulerv1.NewSandboxHint {
 	hint.TemplateId = parsed.TemplateID
 	hint.Metadata = parsed.Metadata
 	return hint
+}
+
+// schedulePoolBody mirrors the optional pool field shared by the create and
+// resume request bodies (src/api/openapi.yml).
+type schedulePoolBody struct {
+	Pool string `json:"pool"`
+}
+
+// parsePool extracts the optional pool from a create or resume body. A missing
+// or malformed body keeps the empty pool, which only matches the shared nodes.
+func parsePool(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var parsed schedulePoolBody
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.Pool)
 }
