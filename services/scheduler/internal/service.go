@@ -120,7 +120,15 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	s.lockAdmission()
 	defer s.unlockAdmission()
 
-	discovered := s.nodes.Snapshot( /* allowLingering */ false)
+	// The requested pool is a placement directive, not a preference: the
+	// candidates are exactly the nodes whose pool equals it (empty only
+	// matches the shared nodes). There is no fallback to another pool.
+	requestedPool := strings.TrimSpace(req.GetHint().GetPool())
+	discovered := FilterByPool(
+		s.nodes.Snapshot( /* allowLingering */ false),
+		requestedPool,
+		s.nodes.NodePool,
+	)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
 		snapshot, observedAt := s.nodes.PeekObservedAt(n.ID)
@@ -228,12 +236,13 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		s.logger.Debug("scheduler selection failed",
 			zap.String("strategy", s.strategy.Name()),
 			zap.String("hint", summarizeScheduleHint(req.GetHint())),
+			zap.String("pool", requestedPool),
 			zap.Int("candidate_nodes", len(rich)),
 			zap.Int("eligible_nodes", len(eligible)),
 			zap.Error(selectErr),
 		)
 		if errors.Is(selectErr, ErrNoNodes) {
-			err = status.Error(codes.Unavailable, "no nodes available")
+			err = poolUnavailable(requestedPool)
 			return nil, err
 		}
 		err = status.Error(codes.Internal, selectErr.Error())
@@ -255,6 +264,31 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		Node:          node.Node.ToProto(),
 		ReservationId: reservationID,
 	}, nil
+}
+
+// poolUnavailable is the capacity refusal for a create that found no admitted
+// node. A request that asked for a pool has that pool named in the message, so
+// the caller can tell an empty pool from a pool whose nodes are exhausted.
+func poolUnavailable(pool string) error {
+	if pool == "" {
+		return status.Error(codes.Unavailable, "no nodes available")
+	}
+	return status.Error(codes.Unavailable, fmt.Sprintf("no nodes available in pool %q", pool))
+}
+
+// poolDeferredReason is the resume refusal reason when the owner is outside the
+// requested pool and the sandbox cannot move. It names the pool so the reason
+// stays distinguishable from a plain capacity refusal.
+func poolDeferredReason(pool string) string {
+	if pool == "" {
+		return "pool_unavailable"
+	}
+	return "pool_unavailable:" + pool
+}
+
+// crossNodeResumeEnabled reports whether a resume may move away from its owner.
+func (s *Service) crossNodeResumeEnabled() bool {
+	return s.resourceLimit != nil && s.resourceLimit.CrossNodeResumeEnabled()
 }
 
 // reservationShapeFromHint resolves the shape a create reserves. reserve is
@@ -438,7 +472,7 @@ func (s *Service) observeResumeShadow(sandboxID string, owner Node, req *schedul
 		return
 	}
 	if s.resourceLimit.CrossNodeResumeEnabled() {
-		if candidates := s.resumeCandidates(owner.ID, memoryBytes, cpuCount, sandboxID); len(candidates) > 0 {
+		if candidates := s.resumeCandidates(owner.ID, memoryBytes, cpuCount, sandboxID, strings.TrimSpace(req.GetPool())); len(candidates) > 0 {
 			recordShapeAdmission(shapeKindResume, shapeOutcomeWouldMove, reason)
 			s.logResumeShadow(shapeOutcomeWouldMove, reason, sandboxID, owner.ID, memoryBytes, ownerRich)
 			return
@@ -765,12 +799,33 @@ func (s *Service) ScheduleResume(_ context.Context, req *schedulerv1.ScheduleRes
 		return nil, status.Error(codes.NotFound, "sandbox assignment not found")
 	}
 
-	if s.resourceLimit == nil || !s.resourceLimit.ShapeAdmissionObserved() {
+	// The pool is a placement directive independent of the shape admission
+	// mode: a sandbox that asked for a pool never resumes on an owner outside
+	// it. Without cross-node resume, a mismatch is deferred and the pool is
+	// named; with it, planResume may move the sandbox to a node of the pool.
+	requestedPool := strings.TrimSpace(req.GetPool())
+	ownerInPool := s.nodes.NodePool(owner.ID) == requestedPool
+	if !ownerInPool && !s.crossNodeResumeEnabled() {
+		recordResumeAdmission("pool_mismatch")
+		s.logger.Info("scheduler deferred resume outside its pool",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("node_id", owner.ID),
+			zap.String("node_pool", s.nodes.NodePool(owner.ID)),
+			zap.String("requested_pool", requestedPool),
+		)
+		return &schedulerv1.ScheduleResumeResponse{
+			Node:     owner.ToProto(),
+			Admitted: false,
+			Reason:   poolDeferredReason(requestedPool),
+		}, nil
+	}
+
+	if ownerInPool && (s.resourceLimit == nil || !s.resourceLimit.ShapeAdmissionObserved()) {
 		recordResumeAdmission("disabled")
 		return &schedulerv1.ScheduleResumeResponse{Node: owner.ToProto(), Admitted: true}, nil
 	}
 
-	if s.resourceLimit.ShapeAdmissionShadow() {
+	if ownerInPool && s.resourceLimit.ShapeAdmissionShadow() {
 		// Shadow evaluates the rule and records the verdict but keeps today's
 		// decision: the owner is admitted with no reservation and no binding
 		// change.
@@ -849,28 +904,42 @@ func (s *Service) planResume(sandboxID string, owner Node, req *schedulerv1.Sche
 	s.lockAdmission()
 	defer s.unlockAdmission()
 
+	requestedPool := strings.TrimSpace(req.GetPool())
+	ownerInPool := s.nodes.NodePool(owner.ID) == requestedPool
+
 	memoryBytes, cpuCount, known := s.pausedShape(owner.ID, sandboxID, req)
 	if !known {
 		return resumePlan{known: false}
 	}
 
-	ownerRich := s.projectReservationsExcept([]RichNode{s.richNode(owner.ID)}, sandboxID)[0]
-	admitted, reason := EvaluateShapeAdmission(ownerRich, memoryBytes, cpuCount, s.resourceLimit)
-	if admitted {
-		return resumePlan{
-			known:         true,
-			admitted:      true,
-			node:          owner,
-			reservationID: s.reserve(owner.ID, memoryBytes, cpuCount, sandboxID),
+	reason := ""
+	if ownerInPool {
+		ownerRich := s.projectReservationsExcept([]RichNode{s.richNode(owner.ID)}, sandboxID)[0]
+		var admitted bool
+		admitted, reason = EvaluateShapeAdmission(ownerRich, memoryBytes, cpuCount, s.resourceLimit)
+		if admitted {
+			return resumePlan{
+				known:         true,
+				admitted:      true,
+				node:          owner,
+				reservationID: s.reserve(owner.ID, memoryBytes, cpuCount, sandboxID),
+			}
 		}
+	} else {
+		reason = poolDeferredReason(requestedPool)
 	}
 	if !s.resourceLimit.CrossNodeResumeEnabled() {
 		return resumePlan{known: true, reason: reason, node: owner}
 	}
 
-	candidates := s.resumeCandidates(owner.ID, memoryBytes, cpuCount, sandboxID)
+	candidates := s.resumeCandidates(owner.ID, memoryBytes, cpuCount, sandboxID, requestedPool)
 	selected, selectErr := s.strategy.Select(candidates, nil)
 	if selectErr != nil {
+		// A pool request whose pool has no admitted candidate names the pool in
+		// the refusal, so it is distinguishable from a plain capacity refusal.
+		if ownerInPool && requestedPool != "" {
+			reason = fmt.Sprintf("%s in pool %q", reason, requestedPool)
+		}
 		return resumePlan{known: true, reason: reason, node: owner}
 	}
 	return resumePlan{
@@ -925,9 +994,14 @@ func (s *Service) richNode(nodeID string) RichNode {
 
 // resumeCandidates returns every node except the owner that admits the paused
 // shape, using the existing scheduling filters. In-flight reservations, except
-// the resuming sandbox's own (excludeKey), are projected before filtering.
-func (s *Service) resumeCandidates(ownerID string, memoryBytes uint64, cpuCount uint32, excludeKey string) []RichNode {
-	discovered := s.nodes.Snapshot( /* allowLingering */ false)
+// the resuming sandbox's own (excludeKey), are projected before filtering. The
+// pool filter keeps cross-node resume inside the requested pool.
+func (s *Service) resumeCandidates(ownerID string, memoryBytes uint64, cpuCount uint32, excludeKey string, pool string) []RichNode {
+	discovered := FilterByPool(
+		s.nodes.Snapshot( /* allowLingering */ false),
+		pool,
+		s.nodes.NodePool,
+	)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, node := range discovered {
 		if node.ID == ownerID {

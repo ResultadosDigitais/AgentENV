@@ -73,6 +73,7 @@ type nodeListItem struct {
 	ID                   string              `json:"id"`
 	ServiceInstanceID    string              `json:"serviceInstanceID"`
 	ClusterID            string              `json:"clusterID"`
+	Pool                 string              `json:"pool"`
 	MachineInfo          nodeListMachineInfo `json:"machineInfo"`
 	Status               string              `json:"status"`
 	SandboxCount         uint32              `json:"sandboxCount"`
@@ -172,6 +173,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			ID:                observed.GetNodeId(),
 			ServiceInstanceID: observed.GetServiceInstanceId(),
 			ClusterID:         observed.GetClusterId(),
+			Pool:              observed.GetPool(),
 			MachineInfo: nodeListMachineInfo{
 				CPUFamily:       observed.GetMachineInfo().GetCpuFamily(),
 				CPUModel:        observed.GetMachineInfo().GetCpuModel(),

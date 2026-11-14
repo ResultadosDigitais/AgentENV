@@ -4595,6 +4595,12 @@ pub struct NewColdSandbox {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_boot_args: Option<String>,
+
+    /// Named node pool the sandbox asks for. Empty (the default) only matches nodes without a pool; a non-empty pool only matches nodes of that pool, with no fallback to another pool or to the shared nodes.
+    #[serde(rename = "pool")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 
 impl NewColdSandbox {
@@ -4618,6 +4624,7 @@ impl NewColdSandbox {
             disk_size_mb: None,
             attached_drives: None,
             extra_boot_args: None,
+            pool: None,
         }
     }
 }
@@ -4675,6 +4682,9 @@ impl std::fmt::Display for NewColdSandbox {
             self.extra_boot_args.as_ref().map(|extra_boot_args| {
                 ["extraBootArgs".to_string(), extra_boot_args.to_string()].join(",")
             }),
+            self.pool
+                .as_ref()
+                .map(|pool| ["pool".to_string(), pool.to_string()].join(",")),
         ];
 
         write!(
@@ -4714,6 +4724,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub disk_size_mb: Vec<u32>,
             pub attached_drives: Vec<Vec<models::AttachedDrive>>,
             pub extra_boot_args: Vec<String>,
+            pub pool: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4815,6 +4826,10 @@ impl std::str::FromStr for NewColdSandbox {
                     "extraBootArgs" => intermediate_rep.extra_boot_args.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "pool" => intermediate_rep.pool.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewColdSandbox".to_string(),
@@ -4850,6 +4865,7 @@ impl std::str::FromStr for NewColdSandbox {
             disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
             attached_drives: intermediate_rep.attached_drives.into_iter().next(),
             extra_boot_args: intermediate_rep.extra_boot_args.into_iter().next(),
+            pool: intermediate_rep.pool.into_iter().next(),
         })
     }
 }
@@ -4981,6 +4997,12 @@ pub struct NewSandbox {
     #[validate(range(min = 1u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_request_mb: Option<u32>,
+
+    /// Named node pool the sandbox asks for. Empty (the default) only matches nodes without a pool; a non-empty pool only matches nodes of that pool, with no fallback to another pool or to the shared nodes.
+    #[serde(rename = "pool")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 
 impl NewSandbox {
@@ -5002,6 +5024,7 @@ impl NewSandbox {
             cpu_count: None,
             memory_mb: None,
             memory_request_mb: None,
+            pool: None,
         }
     }
 }
@@ -5055,6 +5078,9 @@ impl std::fmt::Display for NewSandbox {
             self.memory_request_mb.as_ref().map(|memory_request_mb| {
                 ["memoryRequestMB".to_string(), memory_request_mb.to_string()].join(",")
             }),
+            self.pool
+                .as_ref()
+                .map(|pool| ["pool".to_string(), pool.to_string()].join(",")),
         ];
 
         write!(
@@ -5092,6 +5118,7 @@ impl std::str::FromStr for NewSandbox {
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
             pub memory_request_mb: Vec<u32>,
+            pub pool: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -5185,6 +5212,10 @@ impl std::str::FromStr for NewSandbox {
                     "memoryRequestMB" => intermediate_rep.memory_request_mb.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "pool" => intermediate_rep.pool.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandbox".to_string(),
@@ -5220,6 +5251,7 @@ impl std::str::FromStr for NewSandbox {
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),
             memory_mb: intermediate_rep.memory_mb.into_iter().next(),
             memory_request_mb: intermediate_rep.memory_request_mb.into_iter().next(),
+            pool: intermediate_rep.pool.into_iter().next(),
         })
     }
 }
@@ -5341,6 +5373,12 @@ pub struct NewSandboxV2 {
     #[validate(range(min = 128u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u32>,
+
+    /// Named node pool the sandbox asks for. Empty (the default) only matches nodes without a pool; a non-empty pool only matches nodes of that pool, with no fallback to another pool or to the shared nodes.
+    #[serde(rename = "pool")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 
 impl NewSandboxV2 {
@@ -5360,6 +5398,7 @@ impl NewSandboxV2 {
             volume_mounts: None,
             cpu_count: None,
             memory_mb: None,
+            pool: None,
         }
     }
 }
@@ -5407,6 +5446,9 @@ impl std::fmt::Display for NewSandboxV2 {
             self.memory_mb
                 .as_ref()
                 .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+            self.pool
+                .as_ref()
+                .map(|pool| ["pool".to_string(), pool.to_string()].join(",")),
         ];
 
         write!(
@@ -5442,6 +5484,7 @@ impl std::str::FromStr for NewSandboxV2 {
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
+            pub pool: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -5527,6 +5570,10 @@ impl std::str::FromStr for NewSandboxV2 {
                     "memoryMB" => intermediate_rep.memory_mb.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "pool" => intermediate_rep.pool.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandboxV2".to_string(),
@@ -5560,6 +5607,7 @@ impl std::str::FromStr for NewSandboxV2 {
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),
             memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+            pool: intermediate_rep.pool.into_iter().next(),
         })
     }
 }
@@ -5843,6 +5891,12 @@ pub struct Node {
     #[validate(custom(function = "check_xss_string"))]
     pub cluster_id: String,
 
+    /// Named node pool reported by the node agent. Empty for a shared node
+    #[serde(rename = "pool")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+
     #[serde(rename = "machineInfo")]
     #[validate(nested)]
     pub machine_info: models::MachineInfo,
@@ -5899,6 +5953,7 @@ impl Node {
             id,
             service_instance_id,
             cluster_id,
+            pool: None,
             machine_info,
             status,
             sandbox_count,
@@ -5927,6 +5982,9 @@ impl std::fmt::Display for Node {
             Some(self.service_instance_id.to_string()),
             Some("clusterID".to_string()),
             Some(self.cluster_id.to_string()),
+            self.pool
+                .as_ref()
+                .map(|pool| ["pool".to_string(), pool.to_string()].join(",")),
             // Skipping machineInfo in query parameter serialization
 
             // Skipping status in query parameter serialization
@@ -5967,6 +6025,7 @@ impl std::str::FromStr for Node {
             pub id: Vec<String>,
             pub service_instance_id: Vec<String>,
             pub cluster_id: Vec<String>,
+            pub pool: Vec<String>,
             pub machine_info: Vec<models::MachineInfo>,
             pub status: Vec<models::NodeStatus>,
             pub sandbox_count: Vec<u32>,
@@ -6014,6 +6073,10 @@ impl std::str::FromStr for Node {
                     ),
                     #[allow(clippy::redundant_clone)]
                     "clusterID" => intermediate_rep.cluster_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "pool" => intermediate_rep.pool.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -6090,6 +6153,7 @@ impl std::str::FromStr for Node {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "clusterID missing in Node".to_string())?,
+            pool: intermediate_rep.pool.into_iter().next(),
             machine_info: intermediate_rep
                 .machine_info
                 .into_iter()
@@ -6202,6 +6266,12 @@ pub struct NodeDetail {
     #[validate(custom(function = "check_xss_string"))]
     pub service_instance_id: String,
 
+    /// Named node pool reported by the node agent. Empty for a shared node
+    #[serde(rename = "pool")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+
     #[serde(rename = "machineInfo")]
     #[validate(nested)]
     pub machine_info: models::MachineInfo,
@@ -6253,6 +6323,7 @@ impl NodeDetail {
             commit,
             id,
             service_instance_id,
+            pool: None,
             machine_info,
             status,
             sandbox_count,
@@ -6280,6 +6351,9 @@ impl std::fmt::Display for NodeDetail {
             Some(self.id.to_string()),
             Some("serviceInstanceID".to_string()),
             Some(self.service_instance_id.to_string()),
+            self.pool
+                .as_ref()
+                .map(|pool| ["pool".to_string(), pool.to_string()].join(",")),
             // Skipping machineInfo in query parameter serialization
 
             // Skipping status in query parameter serialization
@@ -6318,6 +6392,7 @@ impl std::str::FromStr for NodeDetail {
             pub commit: Vec<String>,
             pub id: Vec<String>,
             pub service_instance_id: Vec<String>,
+            pub pool: Vec<String>,
             pub machine_info: Vec<models::MachineInfo>,
             pub status: Vec<models::NodeStatus>,
             pub sandbox_count: Vec<u32>,
@@ -6364,6 +6439,10 @@ impl std::str::FromStr for NodeDetail {
                     ),
                     #[allow(clippy::redundant_clone)]
                     "serviceInstanceID" => intermediate_rep.service_instance_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "pool" => intermediate_rep.pool.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -6436,6 +6515,7 @@ impl std::str::FromStr for NodeDetail {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "serviceInstanceID missing in NodeDetail".to_string())?,
+            pool: intermediate_rep.pool.into_iter().next(),
             machine_info: intermediate_rep
                 .machine_info
                 .into_iter()
@@ -6930,12 +7010,21 @@ pub struct ResumedSandbox {
     #[validate(range(min = 0u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
+
+    /// Named node pool the resumed sandbox asks for. Empty (the default) only matches an owner without a pool; a non-empty pool only resumes on a node of that pool, with no fallback.
+    #[serde(rename = "pool")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 
 impl ResumedSandbox {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new() -> ResumedSandbox {
-        ResumedSandbox { timeout: Some(15) }
+        ResumedSandbox {
+            timeout: Some(15),
+            pool: None,
+        }
     }
 }
 
@@ -6948,6 +7037,9 @@ impl std::fmt::Display for ResumedSandbox {
             self.timeout
                 .as_ref()
                 .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
+            self.pool
+                .as_ref()
+                .map(|pool| ["pool".to_string(), pool.to_string()].join(",")),
         ];
 
         write!(
@@ -6970,6 +7062,7 @@ impl std::str::FromStr for ResumedSandbox {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub timeout: Vec<u32>,
+            pub pool: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6995,6 +7088,10 @@ impl std::str::FromStr for ResumedSandbox {
                     "timeout" => intermediate_rep.timeout.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "pool" => intermediate_rep.pool.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing ResumedSandbox".to_string(),
@@ -7010,6 +7107,7 @@ impl std::str::FromStr for ResumedSandbox {
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(ResumedSandbox {
             timeout: intermediate_rep.timeout.into_iter().next(),
+            pool: intermediate_rep.pool.into_iter().next(),
         })
     }
 }
@@ -8012,6 +8110,12 @@ pub struct SandboxForkRequest {
     #[validate(range(min = 1u32, max = 100u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+
+    /// Named node pool the clone belongs to. A fork runs on the source sandbox's node, so the placement is inherited from the source and never re-selected.
+    #[serde(rename = "pool")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 
 impl SandboxForkRequest {
@@ -8020,6 +8124,7 @@ impl SandboxForkRequest {
         SandboxForkRequest {
             timeout: None,
             count: Some(1),
+            pool: None,
         }
     }
 }
@@ -8036,6 +8141,9 @@ impl std::fmt::Display for SandboxForkRequest {
             self.count
                 .as_ref()
                 .map(|count| ["count".to_string(), count.to_string()].join(",")),
+            self.pool
+                .as_ref()
+                .map(|pool| ["pool".to_string(), pool.to_string()].join(",")),
         ];
 
         write!(
@@ -8059,6 +8167,7 @@ impl std::str::FromStr for SandboxForkRequest {
         struct IntermediateRep {
             pub timeout: Vec<u32>,
             pub count: Vec<u32>,
+            pub pool: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -8088,6 +8197,10 @@ impl std::str::FromStr for SandboxForkRequest {
                     "count" => intermediate_rep.count.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "pool" => intermediate_rep.pool.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxForkRequest".to_string(),
@@ -8104,6 +8217,7 @@ impl std::str::FromStr for SandboxForkRequest {
         std::result::Result::Ok(SandboxForkRequest {
             timeout: intermediate_rep.timeout.into_iter().next(),
             count: intermediate_rep.count.into_iter().next(),
+            pool: intermediate_rep.pool.into_iter().next(),
         })
     }
 }

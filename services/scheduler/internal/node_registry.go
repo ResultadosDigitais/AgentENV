@@ -34,6 +34,9 @@ type NodeRegistry interface {
 	// PausedSandboxResources returns the persisted shape of one paused sandbox
 	// as reported by its owner's latest heartbeat.
 	PausedSandboxResources(nodeID string, sandboxID string) (cpuCount uint32, memoryBytes uint64, ok bool)
+	// NodePool returns the named pool the node reported in its latest heartbeat.
+	// Empty when the node never reported one, which makes it a shared node.
+	NodePool(nodeID string) string
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -178,6 +181,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 			MachineInfo:       machineInfo,
 			LastSeenUnixMs:    nowMs,
 			Snapshot:          cloneSnapshot(req.GetSnapshot()),
+			Pool:              strings.TrimSpace(req.GetPool()),
 		},
 		p2pEndpoint:     cloneP2PEndpoint(req.GetP2PEndpoint()),
 		pausedSandboxes: pausedSandboxesFromHeartbeat(req.GetPausedSandboxes()),
@@ -411,6 +415,18 @@ func (r *AtomicNodeRegistry) PausedSandboxResources(nodeID string, sandboxID str
 		return 0, 0, false
 	}
 	return resource.GetCpuCount(), resource.GetMemoryBytes(), true
+}
+
+// NodePool returns the pool the node reported in its latest heartbeat. A node
+// that never reported one is a shared node, so the empty string is the default.
+func (r *AtomicNodeRegistry) NodePool(nodeID string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	record, ok := r.observed[nodeID]
+	if !ok || record.node == nil {
+		return ""
+	}
+	return strings.TrimSpace(record.node.GetPool())
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

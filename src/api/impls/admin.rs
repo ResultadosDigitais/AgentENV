@@ -72,7 +72,8 @@ impl From<NodeMetricsSnapshot> for models::NodeMetrics {
 
 impl From<NodeSnapshot> for models::Node {
     fn from(node: NodeSnapshot) -> Self {
-        models::Node::new(
+        let pool = node.pool.clone();
+        let mut model = models::Node::new(
             node.version,
             node.commit,
             node.node_id,
@@ -86,7 +87,9 @@ impl From<NodeSnapshot> for models::Node {
             node.create_fails,
             node.sandbox_starting_count,
             node.paused_sandbox_count,
-        )
+        );
+        model.pool = Some(pool);
+        model
     }
 }
 
@@ -199,7 +202,8 @@ impl Admin<()> for ApiImpl {
             }
         };
 
-        let detail = models::NodeDetail::new(
+        let pool = node.pool.clone();
+        let mut detail = models::NodeDetail::new(
             node.cluster_id.to_string(),
             node.version,
             node.commit,
@@ -213,6 +217,7 @@ impl Admin<()> for ApiImpl {
             node.create_fails,
             node.paused_sandbox_count,
         );
+        detail.pool = Some(pool);
         Ok(NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(detail))
     }
 }

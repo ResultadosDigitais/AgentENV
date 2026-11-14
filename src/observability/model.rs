@@ -54,6 +54,8 @@ pub struct NodeSnapshot {
     pub node_id: String,
     pub service_instance_id: String,
     pub cluster_id: uuid::Uuid,
+    /// Named node pool from the node configuration; empty for a shared node.
+    pub pool: String,
     pub machine_info: MachineInfo,
     pub sandbox_count: u32,
     pub sandbox_ids: Vec<SandboxId>,
