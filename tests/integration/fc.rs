@@ -1376,23 +1376,117 @@ async fn rootfs_chain_growth_past_the_ceiling_keeps_the_vm_running() -> Result<(
     Ok(())
 }
 
-/// OPSAI-7467: a persisted pause that crosses the memory ceiling returns
-/// without compacting, repeatedly.
+/// The deferred work a persisted pause must leave for one chain, measured in
+/// layers it handed to the maintenance worker.
+///
+/// This is the deterministic form of "the pause did not compact": a descriptor
+/// exists and is still `pending`, every layer it folds exists inside the
+/// generation, the chain's image config ends with exactly those layers (so the
+/// pause carried the whole inherited chain forward instead of rewriting it), and
+/// the compacted output does not exist yet. A pause that compacted inside the
+/// call has no descriptor, so the probe fails.
+///
+/// Returns `Err` with the missing evidence instead of asserting, because the
+/// negative control asserts that a pre-change inline pause fails this probe.
+fn deferred_chain_evidence(
+    chain_dir: &Path,
+    config_file: &str,
+    compacted_file: &str,
+) -> Result<usize> {
+    let descriptor_path = chain_dir.join("deferred-compaction.json");
+    let descriptor_bytes = fs::read(&descriptor_path)
+        .with_context(|| format!("read deferred work order {}", descriptor_path.display()))?;
+    let descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes)
+        .with_context(|| format!("parse deferred work order {}", descriptor_path.display()))?;
+    anyhow::ensure!(
+        descriptor.get("state").and_then(serde_json::Value::as_str) == Some("pending"),
+        "deferred work order {} must stay pending",
+        descriptor_path.display()
+    );
+    let compactable: Vec<&str> = descriptor
+        .get("compactable")
+        .and_then(serde_json::Value::as_array)
+        .with_context(|| {
+            format!(
+                "deferred work order {} must name the layers it folds",
+                descriptor_path.display()
+            )
+        })?
+        .iter()
+        .map(|layer| {
+            layer
+                .as_str()
+                .context("a compactable layer must be a path string")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !compactable.is_empty(),
+        "deferred work order {} must fold at least one layer",
+        descriptor_path.display()
+    );
+    for layer in &compactable {
+        anyhow::ensure!(
+            Path::new(layer).is_file(),
+            "layer {} named by the deferred work order must exist",
+            layer
+        );
+    }
+    anyhow::ensure!(
+        !chain_dir.join(compacted_file).exists(),
+        "the pause must not write the compacted output {}",
+        chain_dir.join(compacted_file).display()
+    );
+
+    let config_path = chain_dir.join(config_file);
+    let config: ImageConfig = serde_json::from_slice(
+        &fs::read(&config_path)
+            .with_context(|| format!("read image config {}", config_path.display()))?,
+    )
+    .with_context(|| format!("parse image config {}", config_path.display()))?;
+    let config_files: Vec<&str> = config
+        .lowers
+        .iter()
+        .map(|lower| lower.file.as_str())
+        .filter(|file| !file.is_empty())
+        .collect();
+    let deferred_start = config_files.len().checked_sub(compactable.len());
+    anyhow::ensure!(
+        deferred_start.is_some_and(|start| config_files[start..] == compactable[..]),
+        "the image config {} must end with every layer the work order folds: config \
+         {config_files:?}, deferred {compactable:?}",
+        config_path.display()
+    );
+    Ok(compactable.len())
+}
+
+/// OPSAI-7467: a persisted pause that crosses a chain bound returns without
+/// compacting, repeatedly.
 ///
 /// The pause used to pay the rewrite inside the call: the card measured 46.4 s
 /// against about 12 s for six consecutive memory pauses. This runs the same
 /// shape — six persisted pauses over the ceiling, each rewriting the ballast
-/// pages — and asserts every pause after the first stays within 20% of it and
-/// that each one leaves the durable work order instead of a compacted layer. The
-/// 12 GiB rewrite of the card belongs to the node scenario (p-11 of the plan,
+/// pages — and asserts the invariant the change guarantees, deterministically:
+/// the call returns with the whole chain carried forward into a durable work
+/// order and no compacted output, so a later pause never pays for the earlier
+/// ones. The rootfs chain is made runtime-owned by rooting the generations in
+/// the persisted sandbox store, which is the production layout; the work order
+/// it leaves therefore grows pause after pause while the pause itself writes one
+/// sealed layer, and that growth is asserted. Wall-clock durations are printed
+/// for information only: on the shared CI runner they vary between 0.18 s and
+/// 1.59 s with no trend, so they are never a pass condition. The card's 12 GiB
+/// rewrite and its 20% bound belong to the node scenario (p-11 of the plan,
 /// recorded on the card); the guest the CI can boot is smaller, so the size is
-/// derived from it, and the shape of the measurement is identical.
+/// derived from it.
+///
+/// The negative control is the pre-change inline path (`pause_to_dir`, the hook
+/// the code already exposes): under the same ceiling it compacts inside the call
+/// and cannot satisfy this probe.
 #[tokio::test]
-async fn consecutive_deferred_pauses_stay_within_20_percent_of_the_first() -> Result<()> {
+async fn consecutive_deferred_pauses_leave_the_chain_to_the_worker() -> Result<()> {
     if !Path::new("/dev/kvm").exists() {
         eprintln!(
-            "skipping consecutive_deferred_pauses_stay_within_20_percent_of_the_first: /dev/kvm \
-             is not available on this host"
+            "skipping consecutive_deferred_pauses_leave_the_chain_to_the_worker: /dev/kvm is \
+             not available on this host"
         );
         return Ok(());
     }
@@ -1402,18 +1496,25 @@ async fn consecutive_deferred_pauses_stay_within_20_percent_of_the_first() -> Re
     let mem_size_mib = u64::from(sandbox_config.mem_size_mib);
     let ballast_mib = (mem_size_mib / 8).max(1);
 
+    let artifact_root = tempfile::tempdir()?;
     // One byte is a real bound and is crossed by the boot's own pages, so every
     // persisted pause takes the deferred path. Admission is consulted for real:
     // the memory chain's transient bound is zero (`compaction_view_bytes = 0`),
     // so the node admits it and the pause must return without a rewrite.
+    //
+    // The generations are rooted in the persisted sandbox store, the root every
+    // production pause writes into: that is what makes the rootfs layers of the
+    // earlier pauses runtime-owned, so each work order folds the chain the pause
+    // inherited instead of only its own layer.
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?
         .with_chain_bytes_ceiling(1)
-        .with_rootfs_chain_disk_multiple(0);
+        .with_rootfs_chain_disk_multiple(0)
+        .with_persisted_sandbox_store_root(artifact_root.path().to_path_buf());
     sandbox.start().await?;
     write_disk_marker(&mut sandbox).await?;
     if !chain_ballast_dir_is_tmpfs(&mut sandbox).await? {
         eprintln!(
-            "skipping consecutive_deferred_pauses_stay_within_20_percent_of_the_first: \
+            "skipping consecutive_deferred_pauses_leave_the_chain_to_the_worker: \
              {CHAIN_TMPFS_DIR} is not tmpfs in this guest, so the ballast would not reach the \
              memory chain"
         );
@@ -1422,8 +1523,9 @@ async fn consecutive_deferred_pauses_stay_within_20_percent_of_the_first() -> Re
     }
     seed_chain_ballast(&mut sandbox, ballast_mib).await?;
 
-    let artifact_root = tempfile::tempdir()?;
     let mut durations = Vec::new();
+    let mut deferred_rootfs_layers = Vec::new();
+    let mut previous_rootfs_layers = 0;
     for cycle in 0..6 {
         rewrite_chain_ballast(&mut sandbox, ballast_mib).await?;
         let generation = artifact_root.path().join(format!("gen-{cycle}"));
@@ -1432,14 +1534,45 @@ async fn consecutive_deferred_pauses_stay_within_20_percent_of_the_first() -> Re
             .await
             .with_context(|| format!("deferred pause {cycle}"))?;
         durations.push(started.elapsed());
+
+        // The pause itself wrote one dirty-delta layer per chain...
         assert!(
-            generation.join("deferred-compaction.json").exists(),
-            "pause {cycle} must leave the durable work order instead of compacting"
+            generation.join("mem_overlaybd/overlaybd.commit").is_file(),
+            "pause {cycle} must write the dirty memory delta"
         );
         assert!(
-            !generation.join("mem_compacted.commit").exists(),
-            "pause {cycle} must return without compacting the memory chain"
+            generation.join("rootfs/snapshot.commit").is_file(),
+            "pause {cycle} must seal the dirty rootfs delta"
         );
+        // ...and left the rewrite of the inherited chain to the worker.
+        let memory_layers =
+            deferred_chain_evidence(&generation, "mem_image.json", "mem_compacted.commit")
+                .with_context(|| {
+                    format!("deferred pause {cycle} must leave the memory chain to the worker")
+                })?;
+        assert!(
+            memory_layers >= 1,
+            "pause {cycle} must defer at least the memory delta it wrote"
+        );
+        let rootfs_layers = deferred_chain_evidence(
+            &generation.join("rootfs"),
+            "image.json",
+            "managed-base.commit",
+        )
+        .with_context(|| {
+            format!("deferred pause {cycle} must leave the rootfs chain to the worker")
+        })?;
+        if cycle > 0 {
+            assert!(
+                rootfs_layers > previous_rootfs_layers,
+                "pause {cycle} must fold the rootfs chain it inherited plus its own layer \
+                 ({rootfs_layers} deferred layers) instead of paying the previous pauses, was \
+                 {previous_rootfs_layers}: {deferred_rootfs_layers:?}"
+            );
+        }
+        previous_rootfs_layers = rootfs_layers;
+        deferred_rootfs_layers.push(rootfs_layers);
+
         // The next cycle rewrites the same ballast pages on a running VM.
         sandbox
             .resume()
@@ -1447,18 +1580,35 @@ async fn consecutive_deferred_pauses_stay_within_20_percent_of_the_first() -> Re
             .with_context(|| format!("resume after deferred pause {cycle}"))?;
     }
 
-    let first = durations[0].as_secs_f64();
-    for (cycle, duration) in durations.iter().enumerate().skip(1) {
-        // A fixed floor absorbs scheduler noise on a small guest; above it, the
-        // assertion is the card's 20%.
-        let allowed = first * 1.2 + 0.15;
-        assert!(
-            duration.as_secs_f64() <= allowed,
-            "pause {cycle} took {duration:?}, above 20% of the first ({first:.3}s, allowed \
-             {allowed:.3}s): {durations:?}"
-        );
-    }
-    eprintln!("deferred memory pause durations: {durations:?}");
+    eprintln!("deferred memory pause durations (information only): {durations:?}");
+    eprintln!("deferred rootfs chain layers folded by the worker: {deferred_rootfs_layers:?}");
+
+    // Negative control: `pause_to_dir` is the pre-change inline path. Under the
+    // same ceiling it compacts inside the call and then refuses, so it cannot
+    // leave the deferred work order the assertions above require.
+    rewrite_chain_ballast(&mut sandbox, ballast_mib).await?;
+    let inline_generation = artifact_root.path().join("gen-inline");
+    let inline_error =
+        match FirecrackerSandbox::pause_to_dir(&mut sandbox, &inline_generation).await {
+            Ok(_) => bail!(
+                "the inline control compacted inside the pause and still returned Ok, so this \
+             scenario no longer distinguishes the deferred path"
+            ),
+            Err(error) => error,
+        };
+    let message = format!("{inline_error:#}");
+    assert!(
+        message.contains("CHAIN_BYTES_CEILING_EXCEEDED"),
+        "the inline control must keep today's behavior and refuse after compacting inside the \
+         pause: {message}"
+    );
+    assert!(
+        deferred_chain_evidence(&inline_generation, "mem_image.json", "mem_compacted.commit")
+            .is_err(),
+        "the inline pause must fail the deferred evidence: the pre-change path compacts inside \
+         the call"
+    );
+    sandbox.resume().await?;
     sandbox.stop().await?;
     Ok(())
 }
