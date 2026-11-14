@@ -20,6 +20,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_NODE_ID` | hostname-derived | Override the runtime node identifier used in observability/admin snapshots |
 | `AENV_CLUSTER_ID` | nil UUID | Override the cluster UUID used for P2P peer discovery and scheduler grouping |
 | `AENV_SERVICE_INSTANCE_ID` | random UUIDv7 | Override the per-process service instance UUID included in heartbeats |
+| `AENV_NODE_POOL` | empty | Named node pool reported in scheduler heartbeats. Empty keeps the node shared; a pooled node only receives sandboxes that ask for its pool |
 | `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED` | from config | Enable scheduler heartbeat reporting |
 | `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` | unset | Override scheduler heartbeat reporting endpoint |
 | `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS` | `5` | Override heartbeat reporting interval in seconds |

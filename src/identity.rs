@@ -19,6 +19,8 @@ pub struct NodeIdentity {
     pub service_instance_id: String,
     pub commit: String,
     pub version: String,
+    /// Named node pool from the node configuration; empty for a shared node.
+    pub pool: String,
 }
 
 impl NodeIdentity {
@@ -45,6 +47,7 @@ impl NodeIdentity {
                 .unwrap_or_else(|| Uuid::now_v7().to_string()),
             commit: build_commit().to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            pool: config.pool.trim().to_string(),
         }
     }
 }
@@ -113,5 +116,24 @@ mod tests {
                 std::env::remove_var("AENV_GIT_COMMIT");
             },
         }
+    }
+
+    #[test]
+    fn node_identity_defaults_to_a_shared_pool() {
+        let identity = NodeIdentity::from_config(&NodeIdentityConfig::default());
+        assert!(
+            identity.pool.is_empty(),
+            "a node without a configured pool is shared"
+        );
+    }
+
+    #[test]
+    fn node_identity_trims_the_configured_pool() {
+        let config = NodeIdentityConfig {
+            pool: "  spot  ".to_string(),
+            ..NodeIdentityConfig::default()
+        };
+        let identity = NodeIdentity::from_config(&config);
+        assert_eq!(identity.pool, "spot");
     }
 }

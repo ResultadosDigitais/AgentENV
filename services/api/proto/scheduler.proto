@@ -42,6 +42,10 @@ message ScheduleRequestHint {
     NewColdSandboxHint new_cold_sandbox = 1;
     NewSandboxHint new_sandbox = 2;
   }
+  // Named node pool the request asks for. The scheduler only considers nodes
+  // whose pool equals this value, and an empty pool only matches nodes without
+  // a pool. Enforcing, unlike the advisory fields of the typed hint.
+  string pool = 3;
 }
 
 // NewColdSandboxHint describes a POST /sandboxes-cold request.
@@ -240,6 +244,9 @@ message ObservedNode {
   NodeSnapshot snapshot = 8;
   int64 last_seen_unix_ms = 9;
   NodeAdmission admission = 10;
+  // Named node pool the node agent reported in its configuration. Empty when
+  // the node belongs to no pool (the shared nodes).
+  string pool = 11;
 }
 
 // PausedSandboxResources is the persisted shape of one paused sandbox on the
@@ -262,6 +269,9 @@ message HeartbeatRequest {
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
   repeated PausedSandboxResources paused_sandboxes = 10;
+  // Named node pool from the node agent's configuration. Empty means the node
+  // is shared: it only receives sandboxes that did not ask for a pool.
+  string pool = 11;
 }
 
 message HeartbeatResponse {
@@ -372,6 +382,9 @@ message ScheduleResumeRequest {
   // heartbeat reports them, that figure wins.
   uint32 cpu_count = 3;
   uint64 memory_bytes = 4;
+  // Named node pool the resume asks for. Empty only matches a node without a
+  // pool; a non-empty pool only matches nodes of that pool.
+  string pool = 5;
 }
 
 message ScheduleResumeResponse {

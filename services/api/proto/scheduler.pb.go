@@ -316,7 +316,11 @@ type ScheduleRequestHint struct {
 	//
 	//	*ScheduleRequestHint_NewColdSandbox
 	//	*ScheduleRequestHint_NewSandbox
-	Kind          isScheduleRequestHint_Kind `protobuf_oneof:"kind"`
+	Kind isScheduleRequestHint_Kind `protobuf_oneof:"kind"`
+	// Named node pool the request asks for. The scheduler only considers nodes
+	// whose pool equals this value, and an empty pool only matches nodes without
+	// a pool. Enforcing, unlike the advisory fields of the typed hint.
+	Pool          string `protobuf:"bytes,3,opt,name=pool,proto3" json:"pool,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -374,6 +378,13 @@ func (x *ScheduleRequestHint) GetNewSandbox() *NewSandboxHint {
 		}
 	}
 	return nil
+}
+
+func (x *ScheduleRequestHint) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
 }
 
 type isScheduleRequestHint_Kind interface {
@@ -1500,8 +1511,11 @@ type ObservedNode struct {
 	Snapshot          *NodeSnapshot          `protobuf:"bytes,8,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	LastSeenUnixMs    int64                  `protobuf:"varint,9,opt,name=last_seen_unix_ms,json=lastSeenUnixMs,proto3" json:"last_seen_unix_ms,omitempty"`
 	Admission         *NodeAdmission         `protobuf:"bytes,10,opt,name=admission,proto3" json:"admission,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Named node pool the node agent reported in its configuration. Empty when
+	// the node belongs to no pool (the shared nodes).
+	Pool          string `protobuf:"bytes,11,opt,name=pool,proto3" json:"pool,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ObservedNode) Reset() {
@@ -1604,6 +1618,13 @@ func (x *ObservedNode) GetAdmission() *NodeAdmission {
 	return nil
 }
 
+func (x *ObservedNode) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
+}
+
 // PausedSandboxResources is the persisted shape of one paused sandbox on the
 // reporting node. The scheduler projects it when it decides whether a resume
 // fits, so a resume goes through the same capacity rule as a new sandbox.
@@ -1679,8 +1700,11 @@ type HeartbeatRequest struct {
 	SandboxIds        []string                  `protobuf:"bytes,8,rep,name=sandbox_ids,json=sandboxIds,proto3" json:"sandbox_ids,omitempty"`
 	P2PEndpoint       *P2PEndpoint              `protobuf:"bytes,9,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
 	PausedSandboxes   []*PausedSandboxResources `protobuf:"bytes,10,rep,name=paused_sandboxes,json=pausedSandboxes,proto3" json:"paused_sandboxes,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Named node pool from the node agent's configuration. Empty means the node
+	// is shared: it only receives sandboxes that did not ask for a pool.
+	Pool          string `protobuf:"bytes,11,opt,name=pool,proto3" json:"pool,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -1781,6 +1805,13 @@ func (x *HeartbeatRequest) GetPausedSandboxes() []*PausedSandboxResources {
 		return x.PausedSandboxes
 	}
 	return nil
+}
+
+func (x *HeartbeatRequest) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
 }
 
 type HeartbeatResponse struct {
@@ -2762,8 +2793,11 @@ type ScheduleResumeRequest struct {
 	// Template shape of the paused sandbox. The gateway supplies it while the
 	// node heartbeat does not carry per-sandbox paused resources yet; once the
 	// heartbeat reports them, that figure wins.
-	CpuCount      uint32 `protobuf:"varint,3,opt,name=cpu_count,json=cpuCount,proto3" json:"cpu_count,omitempty"`
-	MemoryBytes   uint64 `protobuf:"varint,4,opt,name=memory_bytes,json=memoryBytes,proto3" json:"memory_bytes,omitempty"`
+	CpuCount    uint32 `protobuf:"varint,3,opt,name=cpu_count,json=cpuCount,proto3" json:"cpu_count,omitempty"`
+	MemoryBytes uint64 `protobuf:"varint,4,opt,name=memory_bytes,json=memoryBytes,proto3" json:"memory_bytes,omitempty"`
+	// Named node pool the resume asks for. Empty only matches a node without a
+	// pool; a non-empty pool only matches nodes of that pool.
+	Pool          string `protobuf:"bytes,5,opt,name=pool,proto3" json:"pool,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2824,6 +2858,13 @@ func (x *ScheduleResumeRequest) GetMemoryBytes() uint64 {
 		return x.MemoryBytes
 	}
 	return 0
+}
+
+func (x *ScheduleResumeRequest) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
 }
 
 type ScheduleResumeResponse struct {
@@ -2995,11 +3036,12 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x19api/proto/scheduler.proto\x12\fscheduler.v1\";\n" +
 	"\x04Node\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1a\n" +
-	"\bendpoint\x18\x02 \x01(\tR\bendpoint\"\xac\x01\n" +
+	"\bendpoint\x18\x02 \x01(\tR\bendpoint\"\xc0\x01\n" +
 	"\x13ScheduleRequestHint\x12L\n" +
 	"\x10new_cold_sandbox\x18\x01 \x01(\v2 .scheduler.v1.NewColdSandboxHintH\x00R\x0enewColdSandbox\x12?\n" +
 	"\vnew_sandbox\x18\x02 \x01(\v2\x1c.scheduler.v1.NewSandboxHintH\x00R\n" +
-	"newSandboxB\x06\n" +
+	"newSandbox\x12\x12\n" +
+	"\x04pool\x18\x03 \x01(\tR\x04poolB\x06\n" +
 	"\x04kind\"\xef\x01\n" +
 	"\x12NewColdSandboxHint\x12\x1b\n" +
 	"\tcpu_count\x18\x01 \x01(\rR\bcpuCount\x12\x1b\n" +
@@ -3093,7 +3135,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x0fcapacity_source\x18\x04 \x01(\tR\x0ecapacitySource\x126\n" +
 	"\x06layers\x18\x05 \x03(\v2\x1e.scheduler.v1.AdmissionVerdictR\x06layers\x122\n" +
 	"\x15reserved_memory_bytes\x18\x06 \x01(\x04R\x13reservedMemoryBytes\x12!\n" +
-	"\freserved_cpu\x18\a \x01(\rR\vreservedCpu\"\xa0\x03\n" +
+	"\freserved_cpu\x18\a \x01(\rR\vreservedCpu\"\xb4\x03\n" +
 	"\fObservedNode\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x1d\n" +
@@ -3106,12 +3148,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
 	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\x129\n" +
 	"\tadmission\x18\n" +
-	" \x01(\v2\x1b.scheduler.v1.NodeAdmissionR\tadmission\"w\n" +
+	" \x01(\v2\x1b.scheduler.v1.NodeAdmissionR\tadmission\x12\x12\n" +
+	"\x04pool\x18\v \x01(\tR\x04pool\"w\n" +
 	"\x16PausedSandboxResources\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1b\n" +
 	"\tcpu_count\x18\x02 \x01(\rR\bcpuCount\x12!\n" +
-	"\fmemory_bytes\x18\x03 \x01(\x04R\vmemoryBytes\"\xd2\x03\n" +
+	"\fmemory_bytes\x18\x03 \x01(\x04R\vmemoryBytes\"\xe6\x03\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -3125,7 +3168,8 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"sandboxIds\x12<\n" +
 	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x12O\n" +
 	"\x10paused_sandboxes\x18\n" +
-	" \x03(\v2$.scheduler.v1.PausedSandboxResourcesR\x0fpausedSandboxes\";\n" +
+	" \x03(\v2$.scheduler.v1.PausedSandboxResourcesR\x0fpausedSandboxes\x12\x12\n" +
+	"\x04pool\x18\v \x01(\tR\x04pool\";\n" +
 	"\x11HeartbeatResponse\x12&\n" +
 	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xf9\x01\n" +
 	"\fSandboxEvent\x12\x1d\n" +
@@ -3189,14 +3233,15 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x15UnregisterNodeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12.\n" +
 	"\x13service_instance_id\x18\x02 \x01(\tR\x11serviceInstanceId\"\x18\n" +
-	"\x16UnregisterNodeResponse\"\x95\x01\n" +
+	"\x16UnregisterNodeResponse\"\xa9\x01\n" +
 	"\x15ScheduleResumeRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x02 \x01(\tR\tclusterId\x12\x1b\n" +
 	"\tcpu_count\x18\x03 \x01(\rR\bcpuCount\x12!\n" +
-	"\fmemory_bytes\x18\x04 \x01(\x04R\vmemoryBytes\"\x9b\x01\n" +
+	"\fmemory_bytes\x18\x04 \x01(\x04R\vmemoryBytes\x12\x12\n" +
+	"\x04pool\x18\x05 \x01(\tR\x04pool\"\x9b\x01\n" +
 	"\x16ScheduleResumeResponse\x12&\n" +
 	"\x04node\x18\x01 \x01(\v2\x12.scheduler.v1.NodeR\x04node\x12\x1a\n" +
 	"\badmitted\x18\x02 \x01(\bR\badmitted\x12\x16\n" +

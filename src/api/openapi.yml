@@ -816,6 +816,13 @@ components:
           format: int32
           minimum: 1
           description: Memory request in MiB used by scheduler admission control (admission_mode=request). Must be > 0 and <= the sandbox's effective memoryMB. Defaults to memoryMB (today's behavior). Does not change VM size.
+        pool:
+          type: string
+          description: >-
+            Named node pool the sandbox asks for. Empty (the default) only
+            matches nodes without a pool; a non-empty pool only matches nodes
+            of that pool, with no fallback to another pool or to the shared
+            nodes.
 
     NewSandboxV2:
       description: >-
@@ -877,6 +884,13 @@ components:
             Guest memory in MiB for this sandbox, up to the template's
             memoryMB. Defaults to the template's. A lower value needs
             [resize].enabled on the node.
+        pool:
+          type: string
+          description: >-
+            Named node pool the sandbox asks for. Empty (the default) only
+            matches nodes without a pool; a non-empty pool only matches nodes
+            of that pool, with no fallback to another pool or to the shared
+            nodes.
 
     ResumedSandbox:
       properties:
@@ -886,6 +900,12 @@ components:
           minimum: 0
           default: 15
           description: Time to live for the sandbox in seconds.
+        pool:
+          type: string
+          description: >-
+            Named node pool the resumed sandbox asks for. Empty (the default)
+            only matches an owner without a pool; a non-empty pool only resumes
+            on a node of that pool, with no fallback.
 
     NewColdSandbox:
       required:
@@ -954,6 +974,13 @@ components:
         extraBootArgs:
           type: string
           description: Additional kernel command-line arguments appended to the Firecracker boot args for this cold-start sandbox. Arguments are whitespace-separated and may contain only 0-9, a-z, A-Z, underscore, hyphen, dot, slash, plus, or equals sign, so base64 values are allowed. The server also applies the firecracker.allowed_extra_boot_args_prefixes allowlist; non-matching or invalid arguments are silently ignored.
+        pool:
+          type: string
+          description: >-
+            Named node pool the sandbox asks for. Empty (the default) only
+            matches nodes without a pool; a non-empty pool only matches nodes
+            of that pool, with no fallback to another pool or to the shared
+            nodes.
 
     ConnectSandbox:
       type: object
@@ -1024,6 +1051,12 @@ components:
             snapshot, so the snapshot is captured once regardless of count.
             Each fork succeeds or fails independently; the outcome of each is
             reported in its entry of the response list.
+        pool:
+          type: string
+          description: >-
+            Named node pool the clone belongs to. A fork runs on the source
+            sandbox's node, so the placement is inherited from the source and
+            never re-selected.
 
     SandboxForkResult:
       type: object
@@ -1666,6 +1699,9 @@ components:
         clusterID:
           type: string
           description: Identifier of the cluster
+        pool:
+          type: string
+          description: Named node pool reported by the node agent. Empty for a shared node
         machineInfo:
           $ref: "#/components/schemas/MachineInfo"
         status:
@@ -1723,6 +1759,9 @@ components:
         serviceInstanceID:
           type: string
           description: Service instance identifier of the node
+        pool:
+          type: string
+          description: Named node pool reported by the node agent. Empty for a shared node
         machineInfo:
           $ref: "#/components/schemas/MachineInfo"
         status:

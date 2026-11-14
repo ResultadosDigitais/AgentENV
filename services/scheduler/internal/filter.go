@@ -3,6 +3,7 @@ package scheduler
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/config"
@@ -286,6 +287,22 @@ func startingCheck(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit)
 		return 0, 0, false
 	}
 	return s.GetSandboxStartingCount(), *limit.MaxSandboxStartingCount, s.GetSandboxStartingCount() > *limit.MaxSandboxStartingCount
+}
+
+// FilterByPool keeps only the nodes whose reported pool equals the requested
+// pool, where an empty request matches only nodes without a pool. That equality
+// is what isolates a pool: a shared sandbox never lands on a pooled node, and a
+// pooled sandbox never falls back to the shared nodes or to another pool.
+// nodePool returns the node's reported pool ("" when it never reported one).
+func FilterByPool(nodes []Node, pool string, nodePool func(nodeID string) string) []Node {
+	want := strings.TrimSpace(pool)
+	result := make([]Node, 0, len(nodes))
+	for _, node := range nodes {
+		if strings.TrimSpace(nodePool(node.ID)) == want {
+			result = append(result, node)
+		}
+	}
+	return result
 }
 
 // FilterByResourceLimit removes nodes that exceed any configured resource

@@ -412,6 +412,7 @@ Stable identity fields for this node. These values appear in node API responses 
 | `node_id` | string | hostname-derived | Stable node identifier returned by the admin/node APIs |
 | `cluster_id` | string (UUID) | nil UUID | Logical cluster identifier included in node snapshots |
 | `service_instance_id` | string | generated UUID | Unique process/service instance identifier for the current node runtime |
+| `pool` | string | `""` | Named node pool reported in the scheduler heartbeat. Empty keeps the node shared: it only receives sandboxes that did not ask for a pool. A pooled node only receives sandboxes that ask for its pool, and a sandbox that asks for a pool never falls back to another pool or to the shared nodes |
 
 ## `[observability]`
 
