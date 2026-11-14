@@ -13,8 +13,8 @@ use crate::virtualization::VirtualizationMode;
 pub use metrics::{OrchestratorMetrics, PausedSandboxResources};
 pub use persistence::paused_store_cost::{MonthlyCost, PausedStoreCost};
 pub use persistence::{
-    DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
-    SandboxPersistenceError, SandboxPersister,
+    DisabledSandboxPersister, FileBackedSandboxPersister, PausedArtifactCandidate,
+    PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
 // Shared so the periodic reaper skips and expires exactly the directory the
 // boot path writes.

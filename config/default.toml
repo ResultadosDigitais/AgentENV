@@ -262,6 +262,19 @@ rootfs_chain_disk_multiple = 2
 # only) or "enforce" (move to artifacts/.trash/, delete after a second grace).
 # A failed or unconfigured cluster list downgrades a pass to a report.
 # paused_artifact_reap = "off"
+# A pause that crosses a chain bound leaves the compaction to the maintenance
+# worker (OPSAI-7467) instead of paying it inside the call. These two knobs are
+# parameters, never kill switches: the boot refuses 0 in either one. A pause
+# that finds the budget full compacts inline, with today's recoverable refusals.
+# Concurrency of deferred compactions per node. PROVISIONAL 1: the 13/11/2026
+# measurement rewrote 12 GiB per pause on a 32 GiB VM and a compaction holds its
+# inputs and its output on disk at once, so one in-flight rewrite per node is
+# what the measured headroom sustains.
+deferred_compaction_max_concurrent = 1
+# Transient bytes of deferred compactions pending on this node, queued plus in
+# flight. PROVISIONAL 103079215104 (96 GiB): two times the shipped 48 GiB ceiling
+# above (one output in flight plus one queued), same OPSAI-5494 measurement.
+deferred_compaction_pending_bytes_budget = 103079215104
 
 [snapshot]
 # Node-local cache for snapshot artifacts.

@@ -1,6 +1,7 @@
 mod admin;
 mod attached_drives;
 pub(crate) mod auth;
+mod deferred_compaction;
 pub(crate) mod image_build;
 mod pagination;
 mod paused_artifacts;

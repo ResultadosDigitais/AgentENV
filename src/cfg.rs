@@ -842,6 +842,29 @@ pub struct OrchestratorConfig {
     /// Paused-artifact sweep kill switch; see [`PausedArtifactReapMode`].
     #[config(default = "off", env = "AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP")]
     pub paused_artifact_reap: PausedArtifactReapMode,
+
+    /// How many paused-chain compactions the maintenance worker may run at the
+    /// same time on this node. A pause that finds the budget full compacts
+    /// inline instead of queueing more work, so this is a hard ceiling and never
+    /// a kill switch: the boot refuses `0`. PROVISIONAL default `1`: the
+    /// 13/11/2026 measurement rewrote 12 GiB per pause on a 32 GiB VM and a
+    /// compaction needs its inputs and its output on disk at once, so one
+    /// in-flight rewrite per node is what the measured headroom sustains.
+    #[config(default = 1usize, env = "AENV_DEFERRED_COMPACTION_MAX_CONCURRENT")]
+    pub deferred_compaction_max_concurrent: usize,
+
+    /// Transient bytes of deferred compactions this node may have pending
+    /// (queued plus in flight). A pause whose compaction would cross it compacts
+    /// inline. The boot refuses `0`. PROVISIONAL default 103079215104 (96 GiB):
+    /// two times the shipped 48 GiB `chain_bytes_ceiling` — one compaction's
+    /// output in flight plus one queued behind it — derived from the same
+    /// OPSAI-5494 measurement. `compaction_transient_bytes` bounds each entry by
+    /// the device's virtual size and its inputs' allocated bytes.
+    #[config(
+        default = 103079215104u64,
+        env = "AENV_DEFERRED_COMPACTION_PENDING_BYTES_BUDGET"
+    )]
+    pub deferred_compaction_pending_bytes_budget: u64,
 }
 
 /// Custom extension service integration.
@@ -1235,6 +1258,25 @@ impl AppConfig {
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
+        self.validate_deferred_compaction()?;
+        Ok(())
+    }
+
+    /// The deferred-compaction knobs are parameters, never switches: `0` in
+    /// either one would silently turn the deferral off, so the boot refuses it.
+    fn validate_deferred_compaction(&self) -> Result<()> {
+        if self.orchestrator.deferred_compaction_max_concurrent == 0 {
+            bail!(
+                "orchestrator.deferred_compaction_max_concurrent must be greater than 0; \
+                 the pause must always have a concurrency budget"
+            );
+        }
+        if self.orchestrator.deferred_compaction_pending_bytes_budget == 0 {
+            bail!(
+                "orchestrator.deferred_compaction_pending_bytes_budget must be greater than 0; \
+                 a zero budget would silently disable deferred compaction"
+            );
+        }
         Ok(())
     }
 
@@ -2224,6 +2266,94 @@ mod tests {
         std::fs::write(&disabled_path, "[orchestrator]\nchain_bytes_ceiling = 0\n")?;
         let disabled = ConfigManager::new_from_path(&disabled_path)?;
         assert_eq!(disabled.config().orchestrator.chain_bytes_ceiling, 0);
+        Ok(())
+    }
+
+    /// The two deferred-compaction knobs ship the provisional defaults, are
+    /// overridable by their own env vars, and refuse `0` at boot.
+    #[test]
+    fn deferred_compaction_parameters_ship_their_defaults_and_refuse_zero() -> Result<()> {
+        use confique::meta::{Expr, FieldKind, Integer, LeafKind};
+
+        fn find_leaf(
+            meta: &confique::meta::Meta,
+            prefix: &str,
+            wanted: &str,
+        ) -> Option<(Option<&'static str>, Option<Expr>)> {
+            for field in meta.fields {
+                let path = if prefix.is_empty() {
+                    field.name.to_string()
+                } else {
+                    format!("{prefix}.{}", field.name)
+                };
+                match field.kind {
+                    FieldKind::Leaf { env, kind } => {
+                        if path == wanted {
+                            let default = match kind {
+                                LeafKind::Required { default } => default,
+                                LeafKind::Optional => None,
+                            };
+                            return Some((env, default));
+                        }
+                    }
+                    FieldKind::Nested { meta } => {
+                        if let Some(found) = find_leaf(meta, &path, wanted) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let (env, default) = find_leaf(
+            &AppConfig::META,
+            "",
+            "orchestrator.deferred_compaction_max_concurrent",
+        )
+        .expect("orchestrator.deferred_compaction_max_concurrent must exist");
+        assert_eq!(env, Some("AENV_DEFERRED_COMPACTION_MAX_CONCURRENT"));
+        assert_eq!(
+            default,
+            Some(Expr::Integer(Integer::Usize(1))),
+            "the provisional concurrency default is one compaction per node"
+        );
+
+        let (env, default) = find_leaf(
+            &AppConfig::META,
+            "",
+            "orchestrator.deferred_compaction_pending_bytes_budget",
+        )
+        .expect("orchestrator.deferred_compaction_pending_bytes_budget must exist");
+        assert_eq!(env, Some("AENV_DEFERRED_COMPACTION_PENDING_BYTES_BUDGET"));
+        assert_eq!(
+            default,
+            Some(Expr::Integer(Integer::U64(103_079_215_104))),
+            "the provisional budget is two times the shipped 48 GiB ceiling"
+        );
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shipped = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        let orchestrator = &shipped.config().orchestrator;
+        assert_eq!(orchestrator.deferred_compaction_max_concurrent, 1);
+        assert_eq!(
+            orchestrator.deferred_compaction_pending_bytes_budget,
+            103_079_215_104
+        );
+
+        // A parameter, never a kill switch: both zero values are refused.
+        let temp = tempdir()?;
+        for (key, value) in [
+            ("deferred_compaction_max_concurrent", "0"),
+            ("deferred_compaction_pending_bytes_budget", "0"),
+        ] {
+            let path = temp.path().join(format!("{key}.toml"));
+            std::fs::write(&path, format!("[orchestrator]\n{key} = {value}\n"))?;
+            assert!(
+                ConfigManager::new_from_path(&path).is_err(),
+                "{key} = {value} must be refused at boot"
+            );
+        }
         Ok(())
     }
 

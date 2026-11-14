@@ -7,10 +7,16 @@
 //! here keeps every other module's dependency direction intact.
 
 pub mod behavior_table;
+mod deferred_compaction;
 mod gateway_sandboxes;
 mod live_sandboxes;
 mod managed_layers;
 mod paused_artifacts;
+
+pub use deferred_compaction::{
+    DeferredCompactionReport, DeferredCompactionWorker, DEFERRED_COMPACTION_INTERVAL,
+    DEFERRED_COMPACTION_LOG,
+};
 
 pub use gateway_sandboxes::GatewaySandboxList;
 pub use live_sandboxes::{

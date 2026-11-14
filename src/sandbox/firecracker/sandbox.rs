@@ -394,7 +394,10 @@ impl SandboxBackend for FirecrackerSandbox {
         artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
         let pause_result = match artifact_root {
-            Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root)
+            // A persisted pause (the card's path) may leave a byte-triggered
+            // compaction to the maintenance worker; the generation directory it
+            // writes is named by the record that becomes durable right after.
+            Some(artifact_root) => FirecrackerSandbox::pause_to_dir_deferring(self, artifact_root)
                 .await
                 .map(|(snapshot_config, _)| snapshot_config),
             None => FirecrackerSandbox::pause(self).await,
@@ -1164,10 +1167,30 @@ impl FirecrackerSandbox {
     }
 
     /// Pause the running sandbox and persist its snapshot artifacts into a caller-managed directory.
+    ///
+    /// Keeps every byte-triggered compaction inline. Callers that persist the
+    /// generation for a later resume use [`Self::pause_to_dir_deferring`].
     #[tracing::instrument(skip(self, snapshot_dir))]
     pub async fn pause_to_dir(
         &mut self,
         snapshot_dir: &Path,
+    ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
+        self.pause_to_dir_with_compaction(snapshot_dir, false).await
+    }
+
+    /// Pause into a persisted generation, leaving a byte-triggered compaction to
+    /// the maintenance worker when admission allows it.
+    pub async fn pause_to_dir_deferring(
+        &mut self,
+        snapshot_dir: &Path,
+    ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
+        self.pause_to_dir_with_compaction(snapshot_dir, true).await
+    }
+
+    async fn pause_to_dir_with_compaction(
+        &mut self,
+        snapshot_dir: &Path,
+        defer_compaction: bool,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
         if self.has_writable_persistent_volumes() {
@@ -1183,7 +1206,7 @@ impl FirecrackerSandbox {
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
 
-        let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
+        let snapshot_result = self.snapshot_to_dir(snapshot_dir, defer_compaction).await;
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
@@ -1205,6 +1228,7 @@ impl FirecrackerSandbox {
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
+        defer_compaction: bool,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         // `snapshot_dir` is the exact directory this pause adopts its lowers
         // into (`inherited-layers/` for memory, `rootfs/inherited-layers/` for
@@ -1228,7 +1252,7 @@ impl FirecrackerSandbox {
             }
             LaunchMode::Fresh(_) => None,
         };
-        let mem_image_config = build_mem_snapshot_image_config(
+        let (mem_image_config, deferred_mem_compaction) = build_mem_snapshot_image_config(
             resume_mem_image_config_path,
             &mem_layer_path,
             snapshot_dir,
@@ -1240,6 +1264,7 @@ impl FirecrackerSandbox {
                 whole_chain_ceiling: 0,
             },
             &runtime_owned_roots,
+            defer_compaction,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -1255,6 +1280,13 @@ impl FirecrackerSandbox {
                 mem_image_config_path.display()
             )
         })?;
+        // Only after the config is durable: the worker swaps the config the
+        // descriptor names.
+        if let Some(descriptor) = deferred_mem_compaction.as_ref() {
+            descriptor.write(&crate::overlaybd::DeferredCompactionDescriptor::path_in(
+                snapshot_dir,
+            ))?;
+        }
 
         let mem_overlaybd_config = OverlaybdConfig {
             image_config_path: mem_image_config_path,
@@ -1296,6 +1328,7 @@ impl FirecrackerSandbox {
                 rootfs_limits,
                 &runtime_owned_roots,
                 size,
+                defer_compaction,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
@@ -1311,7 +1344,7 @@ impl FirecrackerSandbox {
             (rootfs_path, size)
         };
         let snapshot_extra_drives = self
-            .snapshot_extra_drives(snapshot_dir)
+            .snapshot_extra_drives(snapshot_dir, defer_compaction)
             .await
             .context("snapshot extra drives to persistent dir")?;
         let manifest_extra_drives = snapshot_extra_drives
@@ -2778,7 +2811,11 @@ impl FirecrackerSandbox {
         Ok(attachments)
     }
 
-    async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
+    async fn snapshot_extra_drives(
+        &self,
+        snapshot_dir: &Path,
+        defer_compaction: bool,
+    ) -> Result<Vec<ExtraDrive>> {
         let extra_drives = &self.launch.common().extra_drives;
         if extra_drives.is_empty() {
             return Ok(Vec::new());
@@ -2826,6 +2863,7 @@ impl FirecrackerSandbox {
                     },
                     runtime_owned_roots: &runtime_owned_roots,
                     compaction_view_bytes: runtime.actual_virtual_size,
+                    defer_compaction,
                 })
                 .await
                 .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -2881,6 +2919,9 @@ impl FirecrackerSandbox {
                 },
                 runtime_owned_roots: &runtime_owned_roots,
                 compaction_view_bytes: runtime.actual_virtual_size,
+                // The freeze/seal path is a capture step with no paused record
+                // naming the generation, so its rewrite stays inline.
+                defer_compaction: false,
             })
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;

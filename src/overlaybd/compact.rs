@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -41,6 +43,56 @@ impl OverlaybdCompactOutput {
             Self::Raw
         }
     }
+}
+
+/// Fraction of the compacted view reserved for the commit's index and metadata
+/// on top of its data blocks (one eighth).
+const COMPACTION_HEADROOM_OVERHEAD_DIVISOR: u64 = 8;
+
+/// Upper bound of the transient disk a compaction needs.
+///
+/// The merged commit cannot exceed the device's virtual size and cannot exceed
+/// the sum of its inputs' allocated bytes, because blocks rewritten by several
+/// layers are stored once; the smaller bound wins. The index and metadata add a
+/// fraction of the data, covered by the overhead divisor. Shared by the pause's
+/// pre-rewrite refusal and by the deferred worker, so both judge the same
+/// number: the pause leaves the work behind only when the node can finish it,
+/// and the worker re-checks the same bound before it starts.
+pub(crate) fn compaction_transient_bytes(view_bytes: u64, compactable_bytes: u64) -> u64 {
+    let merged_bytes = view_bytes.min(compactable_bytes);
+    merged_bytes.saturating_add(merged_bytes / COMPACTION_HEADROOM_OVERHEAD_DIVISOR)
+}
+
+/// Allocated bytes of the layers a compaction would rewrite, deduplicated by
+/// device and inode so a hardlinked layer counts once.
+///
+/// A remote lower has no local file and contributes nothing; an unreadable path
+/// is skipped, which can only under-report the transient bytes and is never a
+/// reason to start a rewrite that would not fit.
+pub(crate) fn compactable_allocated_bytes(layers: &[LayerConfig]) -> u64 {
+    let mut seen = HashSet::new();
+    let mut total = 0u64;
+    for layer in layers {
+        if layer.file.is_empty() {
+            continue;
+        }
+        if let Ok(metadata) = std::fs::metadata(&layer.file) {
+            if seen.insert((metadata.dev(), metadata.ino())) {
+                total = total.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+        }
+    }
+    total
+}
+
+/// Free bytes of the filesystem holding `path`, or `None` when the probe fails.
+///
+/// The deferred worker refuses to start a rewrite it cannot prove fits, exactly
+/// like the pause's inline refusal: an unreadable probe is a fail-closed answer.
+pub(crate) fn filesystem_free_bytes(path: &Path) -> Option<u64> {
+    let stats = nix::sys::statvfs::statvfs(path).ok()?;
+    let block_size = stats.fragment_size();
+    Some(stats.blocks_free().saturating_mul(block_size))
 }
 
 pub(crate) async fn create_commit_args(
@@ -317,6 +369,21 @@ mod tests {
             before
         );
         assert!(!has_temp_file(temp.path()));
+    }
+
+    /// The 13/11/2026 disk scenario: 8 GiB rewritten before a pause on a 63 GiB
+    /// guest disk needs 9 GiB of transient space, which the provisional 96 GiB
+    /// pending budget admits. The number is the pause's admission input, not the
+    /// chain's bytes, so mixing the two units would send the scenario inline.
+    #[test]
+    fn compaction_transient_bytes_bounds_the_13_11_disk_scenario() {
+        let gib = 1u64 << 30;
+        let required = compaction_transient_bytes(63 * gib, 8 * gib);
+        assert_eq!(required, 8 * gib + gib);
+        assert!(
+            required <= 96 * gib,
+            "the provisional pending budget must admit the measured pause"
+        );
     }
 
     #[test]
