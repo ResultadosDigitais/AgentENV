@@ -1198,29 +1198,38 @@ pub(super) mod tests {
         assert_eq!(server_url, "https://registry.example/v2");
     }
 
+    /// Install an executable script from a child process.
+    ///
+    /// Writing it in this test process lets a concurrent fork inherit the
+    /// writable fd, so a later exec of the same file fails with ETXTBSY
+    /// (os error 26); CLOEXEC only closes the fd at exec. The child closes the
+    /// file before it exits, so the test process never holds a writable fd to
+    /// the script it runs.
+    #[cfg(unix)]
+    fn install_executable_script(path: &std::path::Path, script: &str) {
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("install-executable-script")
+            .arg(path)
+            .arg(script)
+            .status()
+            .expect("install executable script");
+        assert!(status.success(), "install executable script: {status}");
+    }
+
     #[test]
     #[cfg(unix)]
     fn loads_credentials_from_docker_credential_helper_binary() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = TempDir::new().unwrap();
         let helper = temp.path().join("docker-credential-test");
-        let staged_helper = temp.path().join("docker-credential-test.tmp");
-        {
-            let mut file = std::fs::File::create(&staged_helper).unwrap();
-            file.write_all(
-                br#"#!/bin/sh
+        install_executable_script(
+            &helper,
+            r#"#!/bin/sh
 read _server
 printf '{"Username":"helper-user","Secret":"helper-secret"}'
 "#,
-            )
-            .unwrap();
-            file.sync_all().unwrap();
-        }
-        let mut permissions = std::fs::metadata(&staged_helper).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&staged_helper, permissions).unwrap();
-        std::fs::rename(&staged_helper, &helper).unwrap();
+        );
 
         let credentials =
             load_docker_credential_helper_binary(helper.to_str().unwrap(), "registry.example")
