@@ -205,6 +205,12 @@ async fn main() -> anyhow::Result<()> {
         config.orchestrator.paused_artifact_reap,
         config.snapshot.managed_layer_collect.gateway_url.as_deref(),
     );
+    // Drains the compaction work a pause left behind (OPSAI-7467). It depends on
+    // the records `load_all` just read, so it starts after `ApiImpl::new`.
+    let deferred_compaction = api_impl.start_deferred_compaction(
+        config.orchestrator.deferred_compaction_max_concurrent,
+        config.orchestrator.deferred_compaction_pending_bytes_budget,
+    );
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
@@ -221,6 +227,12 @@ async fn main() -> anyhow::Result<()> {
             if let Some(reap) = paused_artifact_reap {
                 reap.abort();
                 let _ = reap.await;
+            }
+            // Stopped before orchestration shutdown, so a pass never races the
+            // persister's own artifact removal or a resume's config swap.
+            if let Some(compaction) = deferred_compaction {
+                compaction.abort();
+                let _ = compaction.await;
             }
             if let Some(mut handle) = reporter.take() {
                 info!(target: "agentenv", "stopping observability reporter before process exit");

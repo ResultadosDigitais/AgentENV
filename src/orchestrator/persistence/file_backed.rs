@@ -11,7 +11,9 @@ use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use super::{
+    PausedArtifactCandidate, PersistenceResult, SandboxPersistenceError, SandboxPersister,
+};
 use crate::cfg::ConfigManager;
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
@@ -218,6 +220,46 @@ fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
         })?;
     ensure_supported_version(record.version)?;
     Ok(record)
+}
+
+/// Every string in `value` that names a paused image config.
+///
+/// The deferred worker needs the directory of each config (`mem_image.json`,
+/// `rootfs/image.json`, a drive's or volume's `image.json`) because the work
+/// order lives beside it, and a volume's directory sits outside the artifact
+/// root. Scanning the encoded state for those names keeps the worker free of
+/// backend-specific field knowledge: the record is the single source of which
+/// configs a generation has.
+fn image_config_paths(value: &Value) -> Vec<PathBuf> {
+    fn walk(value: &Value, found: &mut Vec<PathBuf>) {
+        match value {
+            Value::String(text) => {
+                let path = Path::new(text);
+                let is_config = matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("image.json") | Some("mem_image.json")
+                );
+                if is_config && !found.iter().any(|existing| existing == path) {
+                    found.push(path.to_path_buf());
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, found);
+                }
+            }
+            Value::Object(fields) => {
+                for item in fields.values() {
+                    walk(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
+    walk(value, &mut found);
+    found
 }
 
 fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
@@ -1004,6 +1046,38 @@ impl SandboxPersister for FileBackedSandboxPersister {
 
     fn artifacts_root(&self) -> Option<PathBuf> {
         Some(self.root.join("artifacts"))
+    }
+
+    async fn paused_artifact_candidates(&self) -> PersistenceResult<Vec<PausedArtifactCandidate>> {
+        let records = self.db().await?.entries().await.map_err(|source| {
+            SandboxPersistenceError::store("scan paused sandbox records", source)
+        })?;
+        let mut candidates = Vec::new();
+        for (key, bytes) in records {
+            let record = match decode_record(&bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    // A record `load_all` would discard cannot name a generation
+                    // anyone may resume, so the worker skips it instead of
+                    // acting on a directory that is about to be quarantined.
+                    debug!(
+                        record_key = %String::from_utf8_lossy(&key),
+                        error = %error,
+                        "deferred compaction skipped an invalid paused record"
+                    );
+                    continue;
+                }
+            };
+            if record.lifecycle != PersistedPausedLifecycle::Paused {
+                continue;
+            }
+            candidates.push(PausedArtifactCandidate {
+                sandbox_id: record.metadata.id,
+                artifact_root: record.artifact_root,
+                config_paths: image_config_paths(&record.state),
+            });
+        }
+        Ok(candidates)
     }
 }
 
@@ -2150,6 +2224,96 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(persister.sandbox_artifact_root(&sandbox_id).exists());
         Ok(())
+    }
+
+    /// R8: the descriptor is an optional sibling file, never a record field.
+    ///
+    /// A generation the new version paused therefore keeps record version 1 and
+    /// every field the previous version wrote; the previous version decodes it
+    /// and ignores the sibling, exactly as this test decodes a record written
+    /// without a descriptor (the previous version's shape) and a record written
+    /// with one. `git ls-remote --tags origin 'refs/tags/v0.2*'` is empty on
+    /// 13/11/2026 (only `v0.1.x` exists), so the previous runtime of the release
+    /// front is `rd/v0.2.4` and cannot be executed from this checkout; the
+    /// decode/validate path below is the compatibility contract and p-11 repeats
+    /// the real resume on the node.
+    #[tokio::test]
+    async fn load_all_keeps_a_paused_generation_with_a_sibling_deferred_descriptor(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = persister
+            .sandbox_artifact_root(&sandbox_id)
+            .join("generation");
+        let paused_state = paused_state(&snapshot_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .await?;
+
+        // What a deferred pause leaves beside the state it persisted.
+        crate::overlaybd::DeferredCompactionDescriptor::new(
+            "memory",
+            "mem_image.json",
+            "mem_compacted.commit",
+            Vec::new(),
+            0,
+            (0, 0),
+            "generation",
+        )
+        .write(&crate::overlaybd::DeferredCompactionDescriptor::path_in(
+            &snapshot_root,
+        ))?;
+
+        // The record is still version 1 and still loads, descriptor or not.
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the sibling file must not invalidate the record"
+        );
+        assert_eq!(loaded[0].id, sandbox_id);
+
+        let candidates = persister.paused_artifact_candidates().await?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sandbox_id, sandbox_id);
+        assert_eq!(candidates[0].artifact_root, snapshot_root);
+        Ok(())
+    }
+
+    /// The worker must find a volume's descriptor, whose directory is outside
+    /// the artifact root. It learns the config paths from the state it stores,
+    /// so this pins the extraction that makes that possible.
+    #[test]
+    fn image_config_paths_reads_every_config_the_paused_state_names() {
+        let state = serde_json::json!({
+            "mem_overlaybd_config": {
+                "image_config_path": "/state/gen/mem_image.json",
+                "read_only": true
+            },
+            "common": {
+                "rootfs_image_config": { "image_config_path": "/state/gen/rootfs/image.json" },
+                "extra_drives": [
+                    { "volume": { "image_config_path": "/volumes/v1/image.json" } },
+                    { "block": { "image_config_path": "/state/gen/drives/d0/image.json" } }
+                ]
+            }
+        });
+        let paths = image_config_paths(&state);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/state/gen/mem_image.json"),
+                PathBuf::from("/state/gen/rootfs/image.json"),
+                PathBuf::from("/volumes/v1/image.json"),
+                PathBuf::from("/state/gen/drives/d0/image.json"),
+            ]
+        );
     }
 
     #[tokio::test]

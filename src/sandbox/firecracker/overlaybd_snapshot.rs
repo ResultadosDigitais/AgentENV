@@ -29,7 +29,10 @@ use uuid::Uuid;
 
 use super::process_vm_reader::ProcessVmReader;
 use crate::cfg::ConfigManager;
-use crate::overlaybd::{compact_layers, create_commit_args, OverlaybdCompactOutput};
+use crate::overlaybd::{
+    compact_layers, compactable_allocated_bytes, compaction_transient_bytes, create_commit_args,
+    DeferredCompactionDescriptor, DeferredCompactionGate, OverlaybdCompactOutput,
+};
 use crate::sandbox::ublk::{UblkDevice, UblkDeviceManager};
 use crate::sandbox::SandboxCaptureError;
 
@@ -594,6 +597,13 @@ mod chain_metrics {
     pub(super) fn record_compaction_headroom_refused(kind: &'static str) {
         metrics::counter!(COMPACTION_HEADROOM_REFUSED, "kind" => kind).increment(1);
     }
+
+    /// The pause left the rewrite to the maintenance worker. The single metric
+    /// definition lives in the `overlaybd` leaf so the worker records the same
+    /// series.
+    pub(super) fn record_deferred_compaction(kind: &str, outcome: &'static str) {
+        crate::overlaybd::record_deferred_compaction(kind, outcome);
+    }
 }
 
 /// The five numbers every ceiling refusal logs, plus the artifact root's disk.
@@ -1106,6 +1116,7 @@ async fn rewrite_live_runtime_config_for_restack(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
@@ -1114,6 +1125,8 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     runtime_owned_roots: &[PathBuf],
     preflight: ChainPreflight,
     compaction_view_bytes: u64,
+    kind: &'static str,
+    defer_compaction: bool,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -1148,7 +1161,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         None
     };
 
-    let rewritten_lowers = rewrite_lowers_with_runtime_roots(
+    let rewritten = rewrite_lowers_with_runtime_roots(
         image_config.lowers,
         output_dir,
         appended_layer,
@@ -1162,9 +1175,15 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
             preflight,
             compaction_view_bytes,
         },
+        DeferredCompactionRequest::for_persistent_pause(
+            defer_compaction,
+            kind,
+            "image.json",
+            output_dir,
+        ),
     )
     .await?;
-    image_config.lowers = rewritten_lowers;
+    image_config.lowers = rewritten.lowers;
     image_config.upper = Default::default();
     image_config.result_file = "./result.txt".to_string();
 
@@ -1172,7 +1191,102 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     let bytes = serde_json::to_vec_pretty(&image_config)
         .context("serialize overlaybd rootfs image config with inherited runtime layers")?;
     write_bytes_atomically(&output_path, &bytes, "overlaybd rootfs image config")?;
+    // The descriptor is written only after the config is durable: the worker
+    // swaps the config it names, so a descriptor ahead of its config could
+    // point at a file that does not exist yet.
+    if let Some(descriptor) = rewritten.deferred.as_ref() {
+        descriptor.write(&DeferredCompactionDescriptor::path_in(output_dir))?;
+    }
     Ok(output_path)
+}
+
+/// Everything the pause needs to leave a byte-triggered compaction to the
+/// maintenance worker.
+///
+/// Built only by the persistent pause path: a capture into a temporary
+/// directory must keep today's inline behavior, because the worker only scans
+/// generations a `Paused` record names.
+#[derive(Clone)]
+pub(super) struct DeferredCompactionRequest {
+    pub(super) kind: &'static str,
+    /// Image config the worker swaps, relative to the generation directory
+    /// (`image.json` for rootfs/drive/volume, `mem_image.json` for memory).
+    pub(super) config_file: &'static str,
+    /// Bounded log field naming the directory the descriptor is written in.
+    pub(super) generation: String,
+    pub(super) gate: Arc<DeferredCompactionGate>,
+    pub(super) max_concurrent: usize,
+    pub(super) pending_budget: u64,
+}
+
+impl DeferredCompactionRequest {
+    /// A request with an explicit gate and budgets, so the red tests can drive
+    /// admission and the worker over the same instance.
+    #[cfg(test)]
+    pub(super) fn for_test(
+        gate: Arc<DeferredCompactionGate>,
+        kind: &'static str,
+        config_file: &'static str,
+        output_dir: &Path,
+        max_concurrent: usize,
+        pending_budget: u64,
+    ) -> Self {
+        Self {
+            kind,
+            config_file,
+            generation: output_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            gate,
+            max_concurrent,
+            pending_budget,
+        }
+    }
+
+    /// The request a persistent pause uses, or `None` when the pause must not
+    /// defer (a capture into a throwaway directory).
+    pub(super) fn for_persistent_pause(
+        defer: bool,
+        kind: &'static str,
+        config_file: &'static str,
+        output_dir: &Path,
+    ) -> Option<Self> {
+        if !defer {
+            return None;
+        }
+        let orchestrator = ConfigManager::global_config().orchestrator.clone();
+        Some(Self {
+            kind,
+            config_file,
+            generation: output_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            gate: DeferredCompactionGate::global(),
+            max_concurrent: orchestrator.deferred_compaction_max_concurrent,
+            pending_budget: orchestrator.deferred_compaction_pending_bytes_budget,
+        })
+    }
+}
+
+/// The result of one chain rewrite.
+///
+/// `deferred` is the work order the caller must persist **after** the image
+/// config is durable; it is `None` on the inline path, including every path that
+/// compacted in the pause, and on every path that adopted without a breach.
+#[derive(Debug)]
+pub(super) struct RewriteLowers {
+    pub(super) lowers: Vec<LayerConfig>,
+    pub(super) deferred: Option<DeferredCompactionDescriptor>,
+}
+
+impl std::ops::Deref for RewriteLowers {
+    type Target = Vec<LayerConfig>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lowers
+    }
 }
 
 /// The bound knobs a rewrite enforces, grouped so the positional argument list
@@ -1203,21 +1317,6 @@ impl ChainLimitPolicy {
     pub(super) fn disabled() -> Self {
         Self::default()
     }
-}
-
-/// Fraction of the compacted view reserved for the commit's index and metadata
-/// on top of its data blocks (one eighth).
-const COMPACTION_HEADROOM_OVERHEAD_DIVISOR: u64 = 8;
-
-/// Upper bound of the transient disk a compaction needs.
-///
-/// The merged commit cannot exceed the device's virtual size and cannot exceed
-/// the sum of its inputs' allocated bytes, because blocks rewritten by several
-/// layers are stored once; the smaller bound wins. The index and metadata add a
-/// fraction of the data, covered by the overhead divisor.
-fn compaction_transient_bytes(view_bytes: u64, compactable_bytes: u64) -> u64 {
-    let merged_bytes = view_bytes.min(compactable_bytes);
-    merged_bytes.saturating_add(merged_bytes / COMPACTION_HEADROOM_OVERHEAD_DIVISOR)
 }
 
 /// Refuse before a compaction that the node cannot finish.
@@ -1273,6 +1372,7 @@ fn ensure_compaction_headroom_with(
     Err(compaction_headroom_insufficient(required_bytes, free_bytes))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rewrite_lowers_with_runtime_roots(
     existing_lowers: Vec<LayerConfig>,
     output_dir: &Path,
@@ -1281,7 +1381,8 @@ async fn rewrite_lowers_with_runtime_roots(
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
     policy: ChainLimitPolicy,
-) -> Result<Vec<LayerConfig>> {
+    deferral: Option<DeferredCompactionRequest>,
+) -> Result<RewriteLowers> {
     let ChainLimitPolicy {
         limits,
         preflight,
@@ -1371,6 +1472,62 @@ async fn rewrite_lowers_with_runtime_roots(
         }
         if compactable.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
+        }
+        // The card's fix: a byte-triggered rewrite is the expensive one the pause
+        // used to pay inside the call (tens of seconds on the measured node). It
+        // is left to the maintenance worker whenever admission proves the node
+        // can finish it later: concurrency budget, pending-bytes budget, free
+        // disk at least the transient bytes, and a writable descriptor. The
+        // layer-count trigger stays inline — it protects overlaybd's 255-layer
+        // hard limit and is not the call the card measures — and a non-raw
+        // output stays inline because the descriptor only names a raw output.
+        if let Some(request) = deferral
+            .filter(|_| breach.is_some() && compaction_output == OverlaybdCompactOutput::Raw)
+        {
+            let transient = compaction_transient_bytes(
+                compaction_view_bytes,
+                compactable_allocated_bytes(&compactable),
+            );
+            let descriptor_path = DeferredCompactionDescriptor::path_in(output_dir);
+            let free_bytes = chain_refusal_log::filesystem_space(output_dir).map(|(free, _)| free);
+            // Admission (d): the work order must be writable in the generation
+            // directory. Proving it here, before adopting anything, is what lets
+            // a read-only artifact root fall back to today's inline path instead
+            // of failing the pause after the restack.
+            let writable = tempfile::NamedTempFile::new_in(output_dir).is_ok();
+            if writable
+                && request.gate.admit(
+                    &descriptor_path,
+                    transient,
+                    request.max_concurrent,
+                    request.pending_budget,
+                    free_bytes,
+                )
+            {
+                // Adopt the suffix exactly like the no-compaction path: the pause
+                // returns as soon as the dirty state is written, and the worker
+                // folds these adopted layers into one generation later.
+                // `compactable` already carries the appended layer, in order.
+                let adopted = adopt_runtime_owned_suffix(output_dir, compactable, None).await?;
+                let descriptor = DeferredCompactionDescriptor::new(
+                    request.kind,
+                    request.config_file,
+                    compaction_output_name,
+                    adopted.iter().map(|layer| layer.file.clone()).collect(),
+                    compaction_view_bytes,
+                    (limits.reclaimable_ceiling, limits.whole_chain_ceiling),
+                    request.generation,
+                );
+                lowers.extend(adopted);
+                chain_metrics::record_deferred_compaction(compaction_output_name, "deferred");
+                return Ok(RewriteLowers {
+                    lowers,
+                    deferred: Some(descriptor),
+                });
+            }
+            // Admission refused: take today's inline path. It is a path
+            // decision, never a new refusal code, and its own headroom check
+            // still runs before the rewrite.
         }
         // Refuse before the rewrite if the node cannot hold both the inputs
         // and the merged output at once. The check is inside this branch, not
@@ -1504,10 +1661,44 @@ async fn rewrite_lowers_with_runtime_roots(
                 ));
             }
         }
-        return Ok(lowers);
+        return Ok(RewriteLowers {
+            lowers,
+            deferred: None,
+        });
     }
 
     // Otherwise, adopt the runtime-owned suffix into the snapshot artifact dir.
+    let adopted =
+        adopt_runtime_owned_suffix(output_dir, runtime_owned_lowers, appended_layer).await?;
+    lowers.extend(adopted);
+    if limits_enforced {
+        chain_metrics::record_chain_bytes(
+            compaction_output_name,
+            accounting.reclaimable_bytes,
+            limits.reclaimable_ceiling,
+        );
+        chain_metrics::record_limit_ratios(compaction_output_name, accounting, limits);
+    }
+
+    Ok(RewriteLowers {
+        lowers,
+        deferred: None,
+    })
+}
+
+/// Adopt the runtime-owned suffix into the generation's `inherited-layers/`
+/// directory, hardlinking when possible, and append the layer the pause wrote.
+///
+/// Shared by the no-compaction path and by the deferred path: both leave the
+/// generation with every runtime layer reachable from its own directory, so the
+/// paused record never names a live runtime path. The returned layers are the
+/// adopted suffix in chain order plus the appended layer, which is exactly the
+/// unit a later compaction folds.
+async fn adopt_runtime_owned_suffix(
+    output_dir: &Path,
+    mut runtime_owned_lowers: Vec<LayerConfig>,
+    appended_layer: Option<LayerConfig>,
+) -> Result<Vec<LayerConfig>> {
     let inherited_layers_dir = output_dir.join(INHERITED_LAYERS_DIR);
     for (index, lower) in runtime_owned_lowers.iter_mut().enumerate() {
         let source = Path::new(&lower.file);
@@ -1519,21 +1710,10 @@ async fn rewrite_lowers_with_runtime_roots(
         link_or_copy_runtime_layer(source, &destination).await?;
         lower.file = destination.display().to_string();
     }
-    lowers.extend(runtime_owned_lowers);
-
     if let Some(layer) = appended_layer {
-        lowers.push(layer);
+        runtime_owned_lowers.push(layer);
     }
-    if limits_enforced {
-        chain_metrics::record_chain_bytes(
-            compaction_output_name,
-            accounting.reclaimable_bytes,
-            limits.reclaimable_ceiling,
-        );
-        chain_metrics::record_limit_ratios(compaction_output_name, accounting, limits);
-    }
-
-    Ok(lowers)
+    Ok(runtime_owned_lowers)
 }
 
 async fn capture_live_overlaybd_snapshot(
@@ -1638,11 +1818,12 @@ pub(super) async fn build_mem_snapshot_image_config(
     memory_output: OverlaybdCompactOutput,
     limits: ChainLimits,
     runtime_owned_roots: &[PathBuf],
-) -> Result<ImageConfig> {
+    defer_compaction: bool,
+) -> Result<(ImageConfig, Option<DeferredCompactionDescriptor>)> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
     let new_layer = local_layer_config(new_layer_path);
-    let lowers = rewrite_lowers_with_runtime_roots(
+    let rewritten = rewrite_lowers_with_runtime_roots(
         inherited_image_config.lowers,
         output_dir,
         Some(new_layer),
@@ -1659,14 +1840,23 @@ pub(super) async fn build_mem_snapshot_image_config(
             // memory chain keeps today's behavior.
             compaction_view_bytes: 0,
         },
+        DeferredCompactionRequest::for_persistent_pause(
+            defer_compaction,
+            "memory",
+            "mem_image.json",
+            output_dir,
+        ),
     )
     .await?;
 
-    Ok(ImageConfig {
-        repo_blob_url: inherited_image_config.repo_blob_url,
-        lowers,
-        ..Default::default()
-    })
+    Ok((
+        ImageConfig {
+            repo_blob_url: inherited_image_config.repo_blob_url,
+            lowers: rewritten.lowers,
+            ..Default::default()
+        },
+        rewritten.deferred,
+    ))
 }
 
 /// One overlaybd device's staging inputs, as the pause path hands them over.
@@ -1688,6 +1878,10 @@ pub(super) struct RestackSnapshotDevice<'a> {
     /// Virtual size of the device, the bound of the merged commit the compaction
     /// would write. `0` disables the pre-compaction headroom check.
     pub(super) compaction_view_bytes: u64,
+    /// Whether a byte-triggered compaction may be left to the maintenance
+    /// worker. Only the persistent pause path sets it; a capture into a
+    /// throwaway directory keeps the inline rewrite.
+    pub(super) defer_compaction: bool,
 }
 
 /// Stage a persisted snapshot config from the current live overlaybd runtime.
@@ -1709,6 +1903,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         limits,
         runtime_owned_roots,
         compaction_view_bytes,
+        defer_compaction,
     } = request;
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -1761,12 +1956,15 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         runtime_owned_roots,
         preflight,
         compaction_view_bytes,
+        kind,
+        defer_compaction,
     )
     .await;
 
     live_snapshot.finish_staging(staged_snapshot)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn restack_snapshot_overlaybd_rootfs(
     ublk_device: &UblkDevice,
     read_only: bool,
@@ -1775,6 +1973,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     limits: ChainLimits,
     runtime_owned_roots: &[PathBuf],
     compaction_view_bytes: u64,
+    defer_compaction: bool,
 ) -> Result<PathBuf> {
     restack_snapshot_overlaybd_device(RestackSnapshotDevice {
         ublk_device,
@@ -1786,6 +1985,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         limits,
         runtime_owned_roots,
         compaction_view_bytes,
+        defer_compaction,
     })
     .await
 }
@@ -2243,6 +2443,7 @@ mod tests {
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
             ChainLimitPolicy::disabled(),
+            None,
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -2842,6 +3043,7 @@ mod tests {
                 preflight: ChainPreflight::disabled(),
                 compaction_view_bytes: 0,
             },
+            None,
         )
         .await
         .expect("a shared prefix above the ceiling must not refuse the pause");
@@ -2897,6 +3099,7 @@ mod tests {
                 preflight: ChainPreflight::disabled(),
                 compaction_view_bytes: 0,
             },
+            None,
         )
         .await
         .expect_err("a chain above the ceiling must fail");
@@ -2964,6 +3167,7 @@ mod tests {
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
             ChainLimitPolicy::disabled(),
+            None,
         )
         .await
         .expect("rewrite with deep stable prefix");
@@ -3079,6 +3283,7 @@ mod tests {
                 preflight: ChainPreflight::disabled(),
                 compaction_view_bytes: 0,
             },
+            None,
         )
         .await
         .expect("a fully runtime-owned chain above the ceiling must compact, not fail");
@@ -3148,6 +3353,7 @@ mod tests {
                     preflight: ChainPreflight::disabled(),
                     compaction_view_bytes: 0,
                 },
+                None,
             )
             .await
             .unwrap_or_else(|error| {
@@ -3156,7 +3362,7 @@ mod tests {
             if output_dir.join(MANAGED_BASE_LAYER_FILE).exists() {
                 compaction_seen = true;
             }
-            lowers = rewritten;
+            lowers = rewritten.lowers;
         }
 
         let final_paths: Vec<PathBuf> = lowers
@@ -3313,6 +3519,7 @@ mod tests {
                 preflight: ChainPreflight::disabled(),
                 compaction_view_bytes: 8192,
             },
+            None,
         )
         .await
         .expect_err("a compaction on a full artifact root must refuse");
@@ -3401,6 +3608,7 @@ mod tests {
                 preflight: ChainPreflight::disabled(),
                 compaction_view_bytes: 0,
             },
+            None,
         )
         .await
         .expect("the whole chain above the relative bound must compact, not refuse");
@@ -3463,6 +3671,7 @@ mod tests {
                 preflight: ChainPreflight::disabled(),
                 compaction_view_bytes: 0,
             },
+            None,
         )
         .await
         .expect("a chain that fits the multiple must not be refused");
@@ -3530,6 +3739,7 @@ mod tests {
                 preflight: ChainPreflight::disabled(),
                 compaction_view_bytes: 0,
             },
+            None,
         )
         .await
         .expect("rewrite above the byte ceiling");
@@ -3586,6 +3796,7 @@ mod tests {
                 &runtime_owned_roots,
                 OverlaybdCompactOutput::Raw,
                 ChainLimitPolicy::disabled(),
+                None,
             )
             .await
             .expect("rewrite with the ceiling disabled");
@@ -3660,6 +3871,7 @@ mod tests {
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
             ChainLimitPolicy::disabled(),
+            None,
         )
         .await
         .expect("rewrite with shrinking budget");
@@ -3709,6 +3921,8 @@ mod tests {
             &[],
             ChainPreflight::disabled(),
             0,
+            "rootfs",
+            false,
         )
         .await
         .expect("stage snapshot");
@@ -3750,16 +3964,21 @@ mod tests {
         let new_layer = temp.path().join("mem_overlaybd").join("overlaybd.commit");
         std::fs::create_dir_all(new_layer.parent().unwrap()).expect("create mem layer dir");
         std::fs::write(&new_layer, b"memory delta").expect("write mem layer");
-        let image_config = build_mem_snapshot_image_config(
+        let (image_config, deferred) = build_mem_snapshot_image_config(
             Some(&parent_config_path),
             &new_layer,
             temp.path(),
             OverlaybdCompactOutput::Raw,
             ChainLimits::disabled(),
             &[],
+            false,
         )
         .await
         .expect("build memory image config");
+        assert!(
+            deferred.is_none(),
+            "a chain without a byte breach has nothing to defer"
+        );
 
         assert_eq!(image_config.repo_blob_url, repo_blob_url);
         assert_eq!(
@@ -3863,6 +4082,355 @@ mod tests {
         assert_eq!(
             tokio::fs::read(&output).await.expect("read final"),
             existing
+        );
+    }
+
+    /// R1: the pause that crosses the memory ceiling returns without calling
+    /// `compact_layers`; the durable descriptor is the only compaction work it
+    /// leaves, and the worker folds the chain under the ceiling afterwards.
+    #[tokio::test]
+    async fn deferred_pause_returns_without_compacting_and_the_worker_finishes_the_memory_chain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let generation = temp.path().join("artifacts").join("sandbox").join("gen");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&generation).expect("create generation dir");
+
+        let mut lowers = Vec::new();
+        for (index, byte) in [0xAAu8, 0xBB, 0xCC].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("mem-{index}"),
+                8192,
+                &[(0, byte), (4096, byte)],
+            )
+            .await;
+            lowers.push(local_layer_config(&path));
+        }
+        let appended = seal_raw_test_layer(
+            &runtime_root,
+            "mem-appended",
+            8192,
+            &[(0, 0xEE), (4096, 0xEE)],
+        )
+        .await;
+        let chain_paths: Vec<PathBuf> = lowers
+            .iter()
+            .map(|lower| PathBuf::from(&lower.file))
+            .chain(std::iter::once(appended.clone()))
+            .collect();
+        let chain_bytes = chain_allocated_bytes(&chain_paths);
+        let ceiling = chain_bytes * 3 / 4;
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let gate = DeferredCompactionGate::new_for_test();
+        let request = DeferredCompactionRequest::for_test(
+            gate.clone(),
+            "memory",
+            "mem_image.json",
+            &generation,
+            1,
+            96 << 30,
+        );
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &generation,
+            Some(local_layer_config(&appended)),
+            "mem_compacted.commit",
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: ceiling,
+                    whole_chain_ceiling: 0,
+                },
+                preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 0,
+            },
+            Some(request),
+        )
+        .await
+        .expect("a byte-triggered memory pause must defer the compaction");
+
+        assert!(
+            !generation.join("mem_compacted.commit").exists(),
+            "the deferred pause must return without compacting"
+        );
+        let descriptor = rewritten
+            .deferred
+            .clone()
+            .expect("the deferred pause must leave durable work");
+        assert_eq!(
+            descriptor.state,
+            crate::overlaybd::DeferredCompactionState::Pending
+        );
+        assert!(!descriptor.compactable.is_empty());
+        let descriptor_path = DeferredCompactionDescriptor::path_in(&generation);
+        descriptor
+            .write(&descriptor_path)
+            .expect("write descriptor");
+
+        // The caller writes the config after the rewrite, exactly like the
+        // pause path does; the descriptor names it.
+        let image_config = ImageConfig {
+            lowers: rewritten.lowers.clone(),
+            ..Default::default()
+        };
+        std::fs::write(
+            generation.join("mem_image.json"),
+            serde_json::to_vec_pretty(&image_config).expect("serialize mem image config"),
+        )
+        .expect("write mem image config");
+        assert!(
+            descriptor_path.exists(),
+            "the pause must leave its work order next to the config"
+        );
+        // The pause returns as soon as it adopted the suffix and wrote the
+        // config: every adopted input is reachable from the generation and the
+        // compacted output does not exist yet. The worker's own suite proves the
+        // rewrite and the unlink that follow (`maintenance::deferred_compaction`);
+        // this test pins the pause's side of the contract.
+        let staged = overlaybd::config::load_image_config(generation.join("mem_image.json"))
+            .expect("load staged memory image config");
+        let staged_files: Vec<String> = staged
+            .lowers
+            .iter()
+            .map(|lower| lower.file.clone())
+            .collect();
+        assert_eq!(
+            staged_files.len(),
+            descriptor.compactable.len(),
+            "every layer the descriptor folds must be named by the staged config"
+        );
+        assert!(
+            staged_files
+                .iter()
+                .all(|file| Path::new(file).starts_with(&generation)),
+            "the pause must leave the runtime layers inside the generation"
+        );
+    }
+
+    /// R2: the same mechanism on the disk chain. The whole rootfs chain above
+    /// `rootfs_chain_disk_multiple` is not compacted inside the pause; the worker
+    /// compacts it and the deduplicated chain comes back under the multiple.
+    #[tokio::test]
+    async fn deferred_pause_returns_without_compacting_and_the_worker_finishes_the_rootfs_chain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let stable_root = temp.path().join("image-cache");
+        let generation = temp
+            .path()
+            .join("artifacts")
+            .join("sandbox")
+            .join("gen")
+            .join("rootfs");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&stable_root).expect("create stable root");
+        std::fs::create_dir_all(&generation).expect("create generation dir");
+
+        const DISK_BYTES: u64 = 768 * 1024;
+        const REGION_BYTES: u64 = 256 * 1024;
+        let limit_bytes = 2 * DISK_BYTES;
+        let stable = stable_root.join("sha256-prefix.overlaybd.commit");
+        std::fs::write(&stable, vec![0x11u8; 1024 * 1024]).expect("write stable prefix");
+        let writes = |byte: u8| -> Vec<(u64, u8)> {
+            (0..REGION_BYTES / 4096)
+                .map(|index| (index * 4096, byte))
+                .collect()
+        };
+        let mut lowers = vec![local_layer_config(&stable)];
+        for (index, byte) in [0xAAu8, 0xBB, 0xCC].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("rootfs-{index}"),
+                DISK_BYTES,
+                &writes(byte),
+            )
+            .await;
+            lowers.push(local_layer_config(&path));
+        }
+        let appended =
+            seal_raw_test_layer(&runtime_root, "rootfs-appended", DISK_BYTES, &writes(0xDD)).await;
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+        let gate = DeferredCompactionGate::new_for_test();
+        let request = DeferredCompactionRequest::for_test(
+            gate.clone(),
+            "rootfs",
+            "image.json",
+            &generation,
+            1,
+            96 << 30,
+        );
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &generation,
+            Some(local_layer_config(&appended)),
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: 0,
+                    whole_chain_ceiling: limit_bytes,
+                },
+                preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: DISK_BYTES,
+            },
+            Some(request),
+        )
+        .await
+        .expect("a rootfs chain over the disk multiple must defer");
+
+        assert!(
+            !generation.join(MANAGED_BASE_LAYER_FILE).exists(),
+            "the pause must not compact the rootfs inline"
+        );
+        let descriptor = rewritten.deferred.clone().expect("durable work");
+        let descriptor_path = DeferredCompactionDescriptor::path_in(&generation);
+        descriptor
+            .write(&descriptor_path)
+            .expect("write descriptor");
+        std::fs::write(
+            generation.join("image.json"),
+            serde_json::to_vec_pretty(&ImageConfig {
+                lowers: rewritten.lowers.clone(),
+                ..Default::default()
+            })
+            .expect("serialize rootfs image config"),
+        )
+        .expect("write rootfs image config");
+
+        // The pause's side of the contract only: the whole chain is still above
+        // the multiple because the rewrite was deferred, not refused, and every
+        // adopted layer is reachable from the generation. The worker's suite
+        // proves the rewrite that brings the deduplicated chain back under it.
+        assert!(
+            !generation.join(MANAGED_BASE_LAYER_FILE).exists(),
+            "the deferred pause must not write the compacted generation"
+        );
+        let staged = overlaybd::config::load_image_config(generation.join("image.json"))
+            .expect("load staged rootfs image config");
+        assert_eq!(
+            staged
+                .lowers
+                .iter()
+                .filter(|lower| Path::new(&lower.file).starts_with(&generation))
+                .count(),
+            descriptor.compactable.len(),
+            "the staged config must name every layer the worker will fold"
+        );
+        let total_now = chain_allocated_bytes(
+            &staged
+                .lowers
+                .iter()
+                .filter(|lower| !lower.file.is_empty())
+                .map(|lower| PathBuf::from(&lower.file))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            total_now > limit_bytes,
+            "the deferred generation is still above the multiple until the worker runs: \
+             {total_now} vs {limit_bytes}"
+        );
+    }
+
+    /// R3: admission that cannot prove the node can finish the work takes
+    /// today's inline path, and that path keeps its three named codes.
+    #[tokio::test]
+    async fn a_refused_admission_keeps_the_inline_compaction_and_its_codes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+        let mut layers = Vec::new();
+        for (index, byte) in [0xAAu8, 0xBB].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("gen-{index}"),
+                8192,
+                &[(0, byte), (4096, byte)],
+            )
+            .await;
+            layers.push(local_layer_config(&path));
+        }
+        let appended = seal_raw_test_layer(&runtime_root, "appended", 8192, &[(0, 0xCC)]).await;
+        // Above one compacted generation but below the chain, so the inline path
+        // compacts and succeeds instead of refusing for a reason of its own.
+        let chain_paths: Vec<PathBuf> = layers
+            .iter()
+            .map(|lower| PathBuf::from(&lower.file))
+            .chain(std::iter::once(appended.clone()))
+            .collect();
+        let reclaimable_ceiling = chain_allocated_bytes(&chain_paths) * 3 / 4;
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+        let gate = DeferredCompactionGate::new_for_test();
+        // The node already has its one in-flight compaction, so the pause must
+        // not queue more work.
+        gate.begin_in_flight();
+        let request = DeferredCompactionRequest::for_test(
+            gate.clone(),
+            "rootfs",
+            "image.json",
+            &output_dir,
+            1,
+            u64::MAX,
+        );
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            layers,
+            &output_dir,
+            Some(local_layer_config(&appended)),
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling,
+                    whole_chain_ceiling: 0,
+                },
+                preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: 0,
+            },
+            Some(request),
+        )
+        .await
+        .expect("the inline path still compacts");
+        gate.end_in_flight();
+
+        assert!(
+            output_dir.join(MANAGED_BASE_LAYER_FILE).exists(),
+            "a refused admission must fall back to today's inline compaction"
+        );
+        assert!(
+            rewritten.deferred.is_none(),
+            "an inline compaction leaves no deferred work"
+        );
+        assert_eq!(gate.pending_transient_bytes(), 0);
+
+        // The refusal catalog the pause exposes keeps exactly the three codes the
+        // card requires; admission is a path decision, never an error.
+        assert_eq!(
+            pause_refusal_code(&paused_chain_limit_error(
+                PausedChainLimit::ChainBytesCeiling,
+                10,
+                1
+            )),
+            Some(CHAIN_BYTES_CEILING_EXCEEDED)
+        );
+        assert_eq!(
+            pause_refusal_code(&paused_chain_limit_error(
+                PausedChainLimit::RootfsDiskMultiple,
+                10,
+                1
+            )),
+            Some(ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED)
+        );
+        assert_eq!(
+            pause_refusal_code(&compaction_headroom_insufficient(10, Some(0))),
+            Some(COMPACTION_HEADROOM_INSUFFICIENT)
         );
     }
 
