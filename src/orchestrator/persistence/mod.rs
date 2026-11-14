@@ -18,6 +18,20 @@ pub(crate) use mock::{RecordingCall, RecordingPersister};
 
 pub type PersistenceResult<T> = std::result::Result<T, SandboxPersistenceError>;
 
+/// One `Paused` record the deferred-compaction worker may act on.
+///
+/// Carries no runtime state: the worker only needs the generation directory and
+/// the image config paths the encoded state names, and decoding the whole
+/// backend state per tick would be far more expensive than the pass itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PausedArtifactCandidate {
+    pub sandbox_id: SandboxId,
+    pub artifact_root: PathBuf,
+    /// Every image config the paused state names (`mem_image.json`, `rootfs/image.json`,
+    /// a drive's or volume's `image.json`). A descriptor lives beside its config.
+    pub config_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxPersistenceError {
     #[error("failed to {operation} {path}: {source}")]
@@ -75,6 +89,18 @@ where
     pub fn artifacts_root(&self) -> Option<PathBuf> {
         self.persister.artifacts_root()
     }
+
+    /// The `Paused` records the deferred-compaction worker may act on, with the
+    /// image config paths each one names.
+    ///
+    /// A fresh read per pass is what keeps the worker from touching a generation
+    /// a resume already moved: a record that is no longer `Paused` is simply not
+    /// returned.
+    pub async fn paused_artifact_candidates(
+        &self,
+    ) -> PersistenceResult<Vec<PausedArtifactCandidate>> {
+        self.persister.paused_artifact_candidates().await
+    }
 }
 
 #[async_trait]
@@ -122,6 +148,14 @@ pub trait SandboxPersister: Send + Sync {
     /// asks the persister, which is the only owner of the arrangement.
     fn artifacts_root(&self) -> Option<PathBuf> {
         None
+    }
+
+    /// The `Paused` records the deferred-compaction worker may act on.
+    ///
+    /// The default answers empty: a persister that keeps no records of its own
+    /// has nothing to defer, and the worker then has nothing to do.
+    async fn paused_artifact_candidates(&self) -> PersistenceResult<Vec<PausedArtifactCandidate>> {
+        Ok(Vec::new())
     }
 }
 
