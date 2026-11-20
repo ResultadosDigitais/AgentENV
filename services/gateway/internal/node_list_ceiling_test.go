@@ -111,10 +111,11 @@ func TestNodeListOmitsNodeCeilingContractWithoutMarginKey(t *testing.T) {
 	}
 }
 
-// The margin key declared with a reading that cannot produce the ceilings
-// publishes no marker at all: absent is the unknown the reader refuses, never
-// a marker over a guessed ceiling.
-func TestNodeListOmitsNodeCeilingContractOnUnknownReading(t *testing.T) {
+// The margin key declared with a reading that cannot produce the ceilings still
+// publishes the marker, with the named reason riding it: the scheduler refuses
+// this same node with capacity_unknown, and publishing nothing would let the
+// gateway state drift from the decision and look like the legacy path.
+func TestNodeListPublishesContractWithCapacityUnknownOnUnknownReading(t *testing.T) {
 	margin := uint64(8) << 30
 	percent := uint32(200)
 	server := newTestServer(t, observedNodeWithSnapshot(&schedulerv1.NodeSnapshot{
@@ -128,10 +129,58 @@ func TestNodeListOmitsNodeCeilingContractOnUnknownReading(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/nodes", nil)
 	response := httptest.NewRecorder()
 	authenticatedTestHandler(server).ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
 
 	node := decodeSingleNode(t, response.Body.Bytes())
-	admissionObject, _ := node["admission"].(map[string]any)
-	if _, ok := admissionObject["contract"]; ok {
-		t.Fatalf("contract must be absent when the reading is unknown: %v", admissionObject)
+	admissionObject, ok := node["admission"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing admission object: %v", node)
+	}
+	if got := admissionObject["contract"]; got != admission.ContractPerNodeCeilingV1 {
+		t.Fatalf("contract = %v, want %q", got, admission.ContractPerNodeCeilingV1)
+	}
+	if _, ok := admissionObject["ceilings"]; ok {
+		t.Fatalf("ceilings must be absent when the reading cannot produce them: %v", admissionObject)
+	}
+	if got := admissionObject["contractReason"]; got != admission.ReasonCapacityUnknown {
+		t.Fatalf("contractReason = %v, want %q", got, admission.ReasonCapacityUnknown)
+	}
+}
+
+// A complete reading without a configured CPU ceiling still yields no ceiling
+// pair: the marker is published with capacity_unknown rather than a half pair,
+// so the reader never trusts a number the scheduler could not compute.
+func TestNodeListPublishesContractWithCapacityUnknownWhenCPUCeilingUnconfigured(t *testing.T) {
+	margin := uint64(8) << 30
+	server := newTestServer(t, observedNodeWithSnapshot(&schedulerv1.NodeSnapshot{
+		Status:           schedulerv1.NodeStatus_NODE_STATUS_READY,
+		MemoryTotalBytes: 120925978624,
+		CpuCount:         14,
+	}), 5*time.Second, 4<<20, withNodeResourceLimit(&config.NodeResourceLimit{
+		MaxAllocatedMemoryMarginBytes: &margin,
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/nodes", nil)
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+
+	node := decodeSingleNode(t, response.Body.Bytes())
+	admissionObject, ok := node["admission"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing admission object: %v", node)
+	}
+	if got := admissionObject["contract"]; got != admission.ContractPerNodeCeilingV1 {
+		t.Fatalf("contract = %v, want %q", got, admission.ContractPerNodeCeilingV1)
+	}
+	if _, ok := admissionObject["ceilings"]; ok {
+		t.Fatalf("ceilings must be absent when the CPU ceiling is not computable: %v", admissionObject)
+	}
+	if got := admissionObject["contractReason"]; got != admission.ReasonCapacityUnknown {
+		t.Fatalf("contractReason = %v, want %q", got, admission.ReasonCapacityUnknown)
 	}
 }

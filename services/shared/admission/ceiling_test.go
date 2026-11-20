@@ -112,6 +112,29 @@ func TestIncludingPausedCeilingsVectors(t *testing.T) {
 	}
 }
 
+// The caller that publishes the per-node payload needs the applied contract and
+// the named reason together: with the margin declared and the memory total
+// missing the leaf reports Applied true plus capacity_unknown, so the caller
+// publishes the marker instead of dropping it, while the margin-absent path
+// reports no reason at all and stays the silent rollback.
+func TestIncludingPausedCeilingsAppliedReasonForUnknownReading(t *testing.T) {
+	margin := uint64(8) << 30
+	applied, reason := admission.IncludingPausedCeilingsOf(&config.NodeResourceLimit{
+		MaxAllocatedMemoryMarginBytes: &margin,
+	}, 0, 14)
+	if !applied.Applied {
+		t.Fatal("expected the per-node contract to be applied with the margin key declared")
+	}
+	if reason != admission.ReasonCapacityUnknown {
+		t.Fatalf("reason = %q, want %q", reason, admission.ReasonCapacityUnknown)
+	}
+
+	legacy, legacyReason := admission.IncludingPausedCeilingsOf(&config.NodeResourceLimit{}, 0, 14)
+	if legacy.Applied || legacyReason != "" {
+		t.Fatalf("legacy path applied=%v reason=%q, want false and no reason", legacy.Applied, legacyReason)
+	}
+}
+
 // The margin key decodes from the scheduler config JSON; the contract marker
 // and the named reason are the strings the ProductFactory ceiling reader
 // recognises.

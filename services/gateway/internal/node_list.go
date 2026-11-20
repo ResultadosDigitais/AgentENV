@@ -76,22 +76,37 @@ type nodeListAdmission struct {
 	ReservedCPU            uint32                   `json:"reservedCPU"`
 	Layers                 []nodeListAdmissionLayer `json:"layers"`
 	// Contract marks the per-node ceiling contract the payload was computed
-	// over, and Ceilings carries the pair. Both are omitted on the legacy path
-	// and when the reading cannot produce them, so a reader sees unknown
-	// instead of a guessed ceiling.
-	Contract string                     `json:"contract,omitempty"`
-	Ceilings *nodeListAdmissionCeilings `json:"ceilings,omitempty"`
+	// over, Ceilings carries the pair, and ContractReason names the reason the
+	// pair could not be computed. The marker is published whenever the margin
+	// key is declared; Ceilings and ContractReason are mutually exclusive, so a
+	// reader sees unknown instead of a guessed ceiling, and a reading that has
+	// no figures never looks like the legacy path.
+	Contract       string                     `json:"contract,omitempty"`
+	Ceilings       *nodeListAdmissionCeilings `json:"ceilings,omitempty"`
+	ContractReason string                     `json:"contractReason,omitempty"`
 }
 
-// nodeAdmissionCeilings derives the per-node contract marker from the same
-// shared leaf the scheduler decides on. It publishes nothing on the legacy
-// path or when either ceiling cannot be computed.
-func nodeAdmissionCeilings(snapshot *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (*nodeListAdmissionCeilings, bool) {
+// nodeAdmissionContract derives what /nodes publishes about the per-node
+// ceiling from the same shared leaf the scheduler decides on. With the margin
+// key declared the marker is always published: the ceilings ride it when the
+// node's own reading produces both, and the named reason rides it otherwise,
+// so an unreadable capacity is refused by the reader instead of falling back
+// to the legacy path. Without the margin key the legacy path publishes nothing.
+func nodeAdmissionContract(snapshot *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (string, *nodeListAdmissionCeilings, string) {
 	ceilings, reason := admission.IncludingPausedCeilingsOf(limit, snapshot.GetMemoryTotalBytes(), snapshot.GetCpuCount())
-	if reason != "" || !ceilings.Applied || !ceilings.MemoryKnown || !ceilings.CPUKnown {
-		return nil, false
+	if !ceilings.Applied {
+		return "", nil, ""
 	}
-	return &nodeListAdmissionCeilings{MemoryBytes: ceilings.MemoryBytes, CPUCores: ceilings.CPUCores}, true
+	if reason != "" {
+		return admission.ContractPerNodeCeilingV1, nil, reason
+	}
+	if ceilings.MemoryKnown && ceilings.CPUKnown {
+		return admission.ContractPerNodeCeilingV1, &nodeListAdmissionCeilings{
+			MemoryBytes: ceilings.MemoryBytes,
+			CPUCores:    ceilings.CPUCores,
+		}, ""
+	}
+	return admission.ContractPerNodeCeilingV1, nil, admission.ReasonCapacityUnknown
 }
 
 type nodeListItem struct {
@@ -198,9 +213,10 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 		// The marker rides the admission object the scheduler already
 		// publishes: it never invents an empty verdict only to carry it.
 		if publishedAdmission != nil {
-			if ceilings, ok := nodeAdmissionCeilings(snapshot, s.nodeResourceLimit); ok {
-				publishedAdmission.Contract = admission.ContractPerNodeCeilingV1
+			if contract, ceilings, reason := nodeAdmissionContract(snapshot, s.nodeResourceLimit); contract != "" {
+				publishedAdmission.Contract = contract
 				publishedAdmission.Ceilings = ceilings
+				publishedAdmission.ContractReason = reason
 			}
 		}
 
