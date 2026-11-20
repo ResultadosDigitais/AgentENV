@@ -371,7 +371,7 @@ func (s templateShape) lookupFailed() bool {
 // memoryLimitConfigured reports whether a memory allocation ceiling exists, so
 // the shape rule has something to enforce.
 func memoryLimitConfigured(limit *config.NodeResourceLimit) bool {
-	return limit != nil && limit.MaxMemoryAllocatedPercent != nil
+	return limit != nil && (limit.MaxMemoryAllocatedPercent != nil || limit.MaxAllocatedMemoryMarginBytes != nil)
 }
 
 // projectCreateShape applies the shape rule to the candidates. enforce drops
