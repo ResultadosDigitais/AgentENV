@@ -47,6 +47,35 @@ type NodeResourceLimit struct {
 	MaxMemoryUsedPercent      *uint32 `json:"max_memory_used_percent"`
 	MaxMemoryAllocatedPercent *uint32 `json:"max_memory_allocated_percent"` // can exceed 100 (overcommit)
 
+	// AdmissionMode selects which per-sandbox memory figure feeds
+	// max_memory_allocated_percent:
+	//   "nominal" (default/absent): sum of VM sizes (today's behavior).
+	//   "request": sum of memory requests (memory_request_mb, defaulting to the
+	//              VM size), plus the MaxMemoryLimitOvercommitRatio cap on the
+	//              sum of nominal limits.
+	//   "shadow":  decide exactly like "nominal" but evaluate "request" in
+	//              parallel, log divergences and count them in
+	//              agentenv_scheduler_admission_shadow_total.
+	// MaxMemoryUsedPercent (real host usage) is evaluated in every mode and is
+	// the backstop against host OOM when VMs grow towards their limits.
+	AdmissionMode *string `json:"admission_mode"`
+	// MaxMemoryLimitOvercommitRatio caps (sum of nominal VM sizes) /
+	// memory_total_bytes in "request" mode (and in the hypothetical "request"
+	// decision of "shadow" mode). Default 1.5. Ignored in "nominal" mode so
+	// that the default behavior is unchanged.
+	MaxMemoryLimitOvercommitRatio *float64 `json:"max_memory_limit_overcommit_ratio"`
+
+	// MaxDiskUsedPercent caps the real filesystem usage of DiskMountPoint.
+	// It is a usage ratio, so unlike the allocated limits it can never
+	// legitimately exceed 100. The check runs in every admission mode;
+	// Pausing a sandbox writes a chain of about one VM's worth of state to
+	// this filesystem, so a node near full loses VMs when a pause fails.
+	MaxDiskUsedPercent *uint32 `json:"max_disk_used_percent"`
+	// DiskMountPoint selects the heartbeat disk entry the disk limit reads,
+	// matched exactly against DiskMetric.mount_point. Defaults to
+	// DefaultDiskMountPoint when absent.
+	DiskMountPoint *string `json:"disk_mount_point"`
+
 	// Limits that apply to the sum of the active running set plus paused
 	// sandboxes. Paused sandboxes have released their VM-side CPU / memory
 	// but still occupy persisted state on the node, so operators may want a
@@ -55,6 +84,379 @@ type NodeResourceLimit struct {
 	MaxSandboxCountIncludingPaused         *uint32 `json:"max_sandbox_count_including_paused"`
 	MaxAllocatedCPUIncludingPaused         *uint32 `json:"max_allocated_cpu_including_paused"`
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
+
+	// MaxAllocatedMemoryMarginBytes turns the including-paused memory ceiling
+	// into a per-node one: the ceiling becomes min(declared cap, if any;
+	// memory_total_bytes - margin), recomputed from the node's own reading at
+	// admission time. Absent (the default) preserves the historical behaviour
+	// byte for byte and is the rollback path. A margin below 8 GiB is refused
+	// by the ceiling leaf, not honoured.
+	MaxAllocatedMemoryMarginBytes *uint64 `json:"max_allocated_memory_margin_bytes"`
+
+	// AdmissionLayers are the VM shapes whose admission is published per node
+	// by the scheduler and read by the gateway's /nodes response. When absent
+	// the default layers (8, 16, 32 and 64 GiB) apply. CPUCount is optional:
+	// the scheduler does not know the layer-to-vCPU map, so an absent value
+	// projects no extra CPU and the cpu reason reflects only the node's
+	// current CPU state.
+	AdmissionLayers []AdmissionLayer `json:"admission_layers"`
+	// MemoryCapacitySource selects the memory base the admission ceiling is
+	// computed over: "allocatable" (default) uses the Kubernetes node's
+	// status.allocatable.memory minus the runtime overhead; "total" is the
+	// kill switch that restores the historical memory_total math.
+	MemoryCapacitySource *string `json:"memory_capacity_source"`
+	// ShapeAdmission selects how the shape rule is applied. "on" (default)
+	// decides create and resume admission by the rule and publishes the
+	// per-layer verdict; "shadow" evaluates the rule and publishes the verdict
+	// and the shadow outcomes while deciding exactly like "off"; "off" is the
+	// kill switch that restores the pre-OPSAI-6200 routing and publishes
+	// nothing.
+	ShapeAdmission *string `json:"shape_admission"`
+	// MemoryUsedMeter selects the node memory figure max_memory_used_percent
+	// compares: "raw" (default) is memory_used_bytes, the cgroup
+	// memory.current including page cache; "working_set" is
+	// memory_working_set_bytes (memory.current minus inactive_file, the
+	// figure kubelet uses). A node that does not report the working set is
+	// evaluated on the raw figure and the fallback is logged.
+	MemoryUsedMeter *string `json:"memory_used_meter"`
+	// CrossNodeResume allows a paused sandbox rejected on its owner to resume
+	// on another admitted node. Off by default: moving a resume before the
+	// paused artifacts are cluster-readable loses the sandbox.
+	CrossNodeResume *bool `json:"cross_node_resume"`
+	// AdmissionReservation reserves, at decision time, the shape of every
+	// admitted create and resume until the gateway confirms its outcome.
+	// Default "on": absence of the key must not disable the correction.
+	AdmissionReservation *string `json:"admission_reservation"`
+	// AdmissionReservationTTL is how long a reservation keeps occupying node
+	// capacity: until the gateway settles it, a confirmed one is released on
+	// the first node snapshot produced after the confirmation, and the TTL is
+	// the backstop when that snapshot never arrives. Deployments should set it
+	// to gateway.request_timeout + AdmissionReservationTTLMargin; the default
+	// is AdmissionReservationTTLFor(DefaultGatewayRequestTimeout).
+	AdmissionReservationTTL *string `json:"admission_reservation_ttl"`
+}
+
+// AdmissionLayer is one VM shape whose admission the scheduler publishes.
+type AdmissionLayer struct {
+	MemoryGB uint64  `json:"memory_gb"`
+	CPUCount *uint32 `json:"cpu_count"`
+}
+
+// Admission modes accepted by NodeResourceLimit.AdmissionMode.
+const (
+	AdmissionModeNominal = "nominal"
+	AdmissionModeRequest = "request"
+	AdmissionModeShadow  = "shadow"
+
+	// DefaultMaxMemoryLimitOvercommitRatio applies when
+	// MaxMemoryLimitOvercommitRatio is unset.
+	DefaultMaxMemoryLimitOvercommitRatio = 1.5
+
+	// DefaultDiskMountPoint is the filesystem the disk limit reads when
+	// disk_mount_point is unset. Sandbox state, persisted paused sandboxes and
+	// the image cache all live on the node's /workspace volume.
+	DefaultDiskMountPoint = "/workspace"
+
+	// Memory capacity sources accepted by
+	// NodeResourceLimit.MemoryCapacitySource.
+	MemoryCapacitySourceAllocatable = "allocatable"
+	MemoryCapacitySourceTotal       = "total"
+
+	// Memory used meters accepted by NodeResourceLimit.MemoryUsedMeter.
+	MemoryUsedMeterRaw        = "raw"
+	MemoryUsedMeterWorkingSet = "working_set"
+
+	// Shape admission modes accepted by NodeResourceLimit.ShapeAdmission.
+	// "on" decides by the shape rule, "off" restores the pre-OPSAI-6200 routing
+	// and "shadow" evaluates the rule and records a verdict while deciding
+	// exactly like "off", so the rule can be measured for 24 h before it
+	// starts rejecting.
+	ShapeAdmissionOn     = "on"
+	ShapeAdmissionOff    = "off"
+	ShapeAdmissionShadow = "shadow"
+
+	// DefaultGatewayRequestTimeout is the gateway request timeout applied when
+	// gateway.request_timeout is absent.
+	DefaultGatewayRequestTimeout = 30 * time.Second
+
+	// AdmissionReservationTTLMargin is how much longer than the gateway
+	// request timeout a reservation is held. A cold 32 GiB create spends most
+	// of the request timeout pulling its image and booting; the margin covers
+	// that cold start, the settlement RPC and the heartbeat that reports the
+	// new sandbox, so a reservation never expires under a request still in
+	// flight.
+	AdmissionReservationTTLMargin = 60 * time.Second
+
+	// DefaultAdmissionReservationTTL applies when admission_reservation_ttl is
+	// absent. It is derived from the default request timeout plus the margin,
+	// so a slow create is not released while it still runs, and short enough
+	// that a lost gateway response stops consuming node capacity. A deployment
+	// that raises gateway.request_timeout must raise this key with it:
+	// ValidateAdmissionReservationTTL refuses a TTL at or below the timeout,
+	// and the deploy parity test enforces the full margin for the shipped
+	// configs.
+	DefaultAdmissionReservationTTL = DefaultGatewayRequestTimeout + AdmissionReservationTTLMargin
+)
+
+// AdmissionReservationTTLFor returns the reservation TTL that outlives a
+// gateway request timeout by AdmissionReservationTTLMargin.
+func AdmissionReservationTTLFor(requestTimeout time.Duration) time.Duration {
+	if requestTimeout <= 0 {
+		requestTimeout = DefaultGatewayRequestTimeout
+	}
+	return requestTimeout + AdmissionReservationTTLMargin
+}
+
+// DefaultAdmissionLayerMemoryGB is the set of VM shapes published per node
+// when admission_layers is absent.
+var DefaultAdmissionLayerMemoryGB = []uint64{8, 16, 32, 64}
+
+// ResolvedMemoryCapacitySource returns the configured memory capacity source,
+// defaulting to allocatable. Unknown values resolve to allocatable so a typo
+// cannot silently restore the total math; Validate rejects them at startup.
+func (l *NodeResourceLimit) ResolvedMemoryCapacitySource() string {
+	if l == nil || l.MemoryCapacitySource == nil {
+		return MemoryCapacitySourceAllocatable
+	}
+	switch source := strings.ToLower(strings.TrimSpace(*l.MemoryCapacitySource)); source {
+	case MemoryCapacitySourceTotal:
+		return MemoryCapacitySourceTotal
+	default:
+		return MemoryCapacitySourceAllocatable
+	}
+}
+
+// ResolvedMemoryUsedMeter returns the configured memory used meter,
+// defaulting to raw. Unknown values resolve to raw so a typo keeps the
+// historical figure; Validate rejects them at startup.
+func (l *NodeResourceLimit) ResolvedMemoryUsedMeter() string {
+	if l == nil || l.MemoryUsedMeter == nil {
+		return MemoryUsedMeterRaw
+	}
+	if strings.ToLower(strings.TrimSpace(*l.MemoryUsedMeter)) == MemoryUsedMeterWorkingSet {
+		return MemoryUsedMeterWorkingSet
+	}
+	return MemoryUsedMeterRaw
+}
+
+// ResolvedShapeAdmission returns "on", "off" or "shadow", defaulting to "on".
+// Unknown values resolve to "on" so a typo cannot silently disable the rule;
+// Validate rejects them at startup.
+func (l *NodeResourceLimit) ResolvedShapeAdmission() string {
+	if l == nil || l.ShapeAdmission == nil {
+		return ShapeAdmissionOn
+	}
+	switch strings.ToLower(strings.TrimSpace(*l.ShapeAdmission)) {
+	case ShapeAdmissionOff:
+		return ShapeAdmissionOff
+	case ShapeAdmissionShadow:
+		return ShapeAdmissionShadow
+	default:
+		return ShapeAdmissionOn
+	}
+}
+
+// ShapeAdmissionEnabled reports whether the shape rule decides admission
+// (create projection and resume gating). It is false in shadow mode, which
+// only observes the rule.
+func (l *NodeResourceLimit) ShapeAdmissionEnabled() bool {
+	return l.ResolvedShapeAdmission() == ShapeAdmissionOn
+}
+
+// ShapeAdmissionShadow reports whether the shape rule is evaluated only to
+// record a verdict while the decision keeps the "off" behavior.
+func (l *NodeResourceLimit) ShapeAdmissionShadow() bool {
+	return l.ResolvedShapeAdmission() == ShapeAdmissionShadow
+}
+
+// ShapeAdmissionObserved reports whether the shape rule is evaluated at all,
+// publishing the per-layer verdict and recording shadow outcomes. It is true
+// in "on" and "shadow", false in "off".
+func (l *NodeResourceLimit) ShapeAdmissionObserved() bool {
+	switch l.ResolvedShapeAdmission() {
+	case ShapeAdmissionOn, ShapeAdmissionShadow:
+		return true
+	default:
+		return false
+	}
+}
+
+// ResolvedAdmissionLayers returns the configured layers, or the 8/16/32/64 GiB
+// defaults when admission_layers is absent.
+func (l *NodeResourceLimit) ResolvedAdmissionLayers() []AdmissionLayer {
+	if l == nil || len(l.AdmissionLayers) == 0 {
+		layers := make([]AdmissionLayer, 0, len(DefaultAdmissionLayerMemoryGB))
+		for _, memoryGB := range DefaultAdmissionLayerMemoryGB {
+			layers = append(layers, AdmissionLayer{MemoryGB: memoryGB})
+		}
+		return layers
+	}
+	layers := make([]AdmissionLayer, len(l.AdmissionLayers))
+	copy(layers, l.AdmissionLayers)
+	return layers
+}
+
+// CrossNodeResumeEnabled reports whether a resume may move off its owner.
+func (l *NodeResourceLimit) CrossNodeResumeEnabled() bool {
+	return l != nil && l.CrossNodeResume != nil && *l.CrossNodeResume
+}
+
+// ResolvedAdmissionReservation returns "on" or "off", defaulting to "on".
+func (l *NodeResourceLimit) ResolvedAdmissionReservation() string {
+	if l == nil || l.AdmissionReservation == nil {
+		return ShapeAdmissionOn
+	}
+	if strings.ToLower(strings.TrimSpace(*l.AdmissionReservation)) == ShapeAdmissionOff {
+		return ShapeAdmissionOff
+	}
+	return ShapeAdmissionOn
+}
+
+// AdmissionReservationEnabled reports whether the in-flight reservation
+// ledger is on.
+func (l *NodeResourceLimit) AdmissionReservationEnabled() bool {
+	return l.ResolvedAdmissionReservation() == ShapeAdmissionOn
+}
+
+// ResolvedAdmissionReservationTTL returns the configured reservation TTL,
+// defaulting to DefaultAdmissionReservationTTL. An unparsable or non-positive
+// value also falls back to the default; Validate rejects it at startup so a
+// typo cannot go unnoticed.
+func (l *NodeResourceLimit) ResolvedAdmissionReservationTTL() time.Duration {
+	if l == nil || l.AdmissionReservationTTL == nil {
+		return DefaultAdmissionReservationTTL
+	}
+	ttl, err := time.ParseDuration(strings.TrimSpace(*l.AdmissionReservationTTL))
+	if err != nil || ttl <= 0 {
+		return DefaultAdmissionReservationTTL
+	}
+	return ttl
+}
+
+// ValidateAdmissionReservationTTL refuses a reservation TTL that does not
+// outlive the gateway request timeout. A TTL at or below request_timeout
+// expires while the gateway is still waiting for a cold 32 GiB create to pull
+// its image, so the reservation would stop projecting before the request it
+// protects settles and two creates could once again pass together.
+func (l *NodeResourceLimit) ValidateAdmissionReservationTTL(requestTimeout time.Duration) error {
+	if l == nil || l.AdmissionReservationTTL == nil {
+		return nil
+	}
+	ttl, err := time.ParseDuration(strings.TrimSpace(*l.AdmissionReservationTTL))
+	if err != nil {
+		return fmt.Errorf("scheduler.node_resource_limit.admission_reservation_ttl must be a duration, got %q", *l.AdmissionReservationTTL)
+	}
+	if requestTimeout <= 0 {
+		requestTimeout = DefaultGatewayRequestTimeout
+	}
+	if ttl <= requestTimeout {
+		return fmt.Errorf(
+			"scheduler.node_resource_limit.admission_reservation_ttl (%s) must exceed gateway.request_timeout (%s) so a cold create keeps its reservation until the gateway settles it",
+			ttl, requestTimeout,
+		)
+	}
+	return nil
+}
+
+// ResolvedAdmissionMode returns the configured mode, defaulting to nominal.
+// Unknown values resolve to nominal (fail-safe); Validate rejects them at
+// startup so a typo cannot go unnoticed.
+func (l *NodeResourceLimit) ResolvedAdmissionMode() string {
+	if l == nil || l.AdmissionMode == nil {
+		return AdmissionModeNominal
+	}
+	switch mode := strings.ToLower(strings.TrimSpace(*l.AdmissionMode)); mode {
+	case AdmissionModeRequest, AdmissionModeShadow:
+		return mode
+	default:
+		return AdmissionModeNominal
+	}
+}
+
+// ResolvedMaxMemoryLimitOvercommitRatio returns the configured ratio or the default.
+func (l *NodeResourceLimit) ResolvedMaxMemoryLimitOvercommitRatio() float64 {
+	if l == nil || l.MaxMemoryLimitOvercommitRatio == nil {
+		return DefaultMaxMemoryLimitOvercommitRatio
+	}
+	return *l.MaxMemoryLimitOvercommitRatio
+}
+
+// ResolvedDiskMountPoint returns the mount point the disk limit reads,
+// defaulting to DefaultDiskMountPoint when it is unset or blank.
+func (l *NodeResourceLimit) ResolvedDiskMountPoint() string {
+	if l == nil || l.DiskMountPoint == nil || strings.TrimSpace(*l.DiskMountPoint) == "" {
+		return DefaultDiskMountPoint
+	}
+	return strings.TrimSpace(*l.DiskMountPoint)
+}
+
+// Validate rejects unknown admission modes, non-positive ratios and disk
+// percentages above 100.
+func (l *NodeResourceLimit) Validate() error {
+	if l == nil {
+		return nil
+	}
+	if l.AdmissionMode != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.AdmissionMode)) {
+		case AdmissionModeNominal, AdmissionModeRequest, AdmissionModeShadow:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.admission_mode must be one of nominal, request, shadow, got %q", *l.AdmissionMode)
+		}
+	}
+	if l.MaxMemoryLimitOvercommitRatio != nil && !(*l.MaxMemoryLimitOvercommitRatio > 0) {
+		return errors.New("scheduler.node_resource_limit.max_memory_limit_overcommit_ratio must be greater than zero")
+	}
+	if l.MaxDiskUsedPercent != nil && *l.MaxDiskUsedPercent > 100 {
+		return fmt.Errorf("scheduler.node_resource_limit.max_disk_used_percent must be at most 100, got %d", *l.MaxDiskUsedPercent)
+	}
+	if l.MemoryCapacitySource != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.MemoryCapacitySource)) {
+		case MemoryCapacitySourceAllocatable, MemoryCapacitySourceTotal:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.memory_capacity_source must be one of allocatable, total, got %q", *l.MemoryCapacitySource)
+		}
+	}
+	if l.MemoryUsedMeter != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.MemoryUsedMeter)) {
+		case MemoryUsedMeterRaw, MemoryUsedMeterWorkingSet:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.memory_used_meter must be one of raw, working_set, got %q", *l.MemoryUsedMeter)
+		}
+	}
+	if l.ShapeAdmission != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.ShapeAdmission)) {
+		case ShapeAdmissionOn, ShapeAdmissionOff, ShapeAdmissionShadow:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.shape_admission must be one of on, off, shadow, got %q", *l.ShapeAdmission)
+		}
+	}
+	if l.AdmissionReservation != nil {
+		switch strings.ToLower(strings.TrimSpace(*l.AdmissionReservation)) {
+		case ShapeAdmissionOn, ShapeAdmissionOff:
+		default:
+			return fmt.Errorf("scheduler.node_resource_limit.admission_reservation must be one of on, off, got %q", *l.AdmissionReservation)
+		}
+	}
+	if l.AdmissionReservationTTL != nil {
+		ttl, err := time.ParseDuration(strings.TrimSpace(*l.AdmissionReservationTTL))
+		if err != nil {
+			return fmt.Errorf("scheduler.node_resource_limit.admission_reservation_ttl must be a duration, got %q", *l.AdmissionReservationTTL)
+		}
+		if ttl <= 0 {
+			return fmt.Errorf("scheduler.node_resource_limit.admission_reservation_ttl must be greater than zero, got %q", *l.AdmissionReservationTTL)
+		}
+	}
+	seenLayers := make(map[uint64]struct{}, len(l.AdmissionLayers))
+	for _, layer := range l.AdmissionLayers {
+		if layer.MemoryGB == 0 {
+			return errors.New("scheduler.node_resource_limit.admission_layers memory_gb must be greater than zero")
+		}
+		if _, duplicate := seenLayers[layer.MemoryGB]; duplicate {
+			return fmt.Errorf("scheduler.node_resource_limit.admission_layers has duplicate memory_gb %d", layer.MemoryGB)
+		}
+		seenLayers[layer.MemoryGB] = struct{}{}
+	}
+	return nil
 }
 
 type SchedulerConfig struct {
@@ -301,7 +703,7 @@ func defaultConfig(service string) Config {
 			HTTPListenAddr:      ":8080",
 			MetricsListenAddr:   ":9102",
 			SchedulerAddr:       "127.0.0.1:9090",
-			RequestTimeout:      30 * time.Second,
+			RequestTimeout:      DefaultGatewayRequestTimeout,
 			ForwardResponseSize: 4 << 20,
 			SandboxProxyDomains: []string{},
 		},
@@ -445,6 +847,12 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Scheduler.ArtifactStoreCapacity <= 0 {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")
+		}
+		if err := c.Scheduler.NodeResourceLimit.Validate(); err != nil {
+			return err
+		}
+		if err := c.Scheduler.NodeResourceLimit.ValidateAdmissionReservationTTL(c.Gateway.RequestTimeout); err != nil {
+			return err
 		}
 		switch strings.ToLower(strings.TrimSpace(c.Scheduler.Discovery.Mode)) {
 		case "static":
