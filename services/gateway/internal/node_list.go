@@ -7,6 +7,8 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/admission"
+	"agentenv/services/shared/config"
 )
 
 func nodeStatusToString(status schedulerv1.NodeStatus) string {
@@ -57,6 +59,14 @@ type nodeListAdmissionLayer struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// nodeListAdmissionCeilings is the including-paused ceiling pair computed from
+// the node's own reading. The ProductFactory ceiling reader looks for the
+// contract marker before trusting them.
+type nodeListAdmissionCeilings struct {
+	MemoryBytes uint64 `json:"memoryBytes"`
+	CPUCores    uint32 `json:"cpuCores"`
+}
+
 type nodeListAdmission struct {
 	AllocatableMemoryBytes uint64                   `json:"allocatableMemoryBytes"`
 	RuntimeOverheadBytes   uint64                   `json:"runtimeOverheadBytes"`
@@ -65,6 +75,23 @@ type nodeListAdmission struct {
 	ReservedMemoryBytes    uint64                   `json:"reservedMemoryBytes"`
 	ReservedCPU            uint32                   `json:"reservedCPU"`
 	Layers                 []nodeListAdmissionLayer `json:"layers"`
+	// Contract marks the per-node ceiling contract the payload was computed
+	// over, and Ceilings carries the pair. Both are omitted on the legacy path
+	// and when the reading cannot produce them, so a reader sees unknown
+	// instead of a guessed ceiling.
+	Contract string                     `json:"contract,omitempty"`
+	Ceilings *nodeListAdmissionCeilings `json:"ceilings,omitempty"`
+}
+
+// nodeAdmissionCeilings derives the per-node contract marker from the same
+// shared leaf the scheduler decides on. It publishes nothing on the legacy
+// path or when either ceiling cannot be computed.
+func nodeAdmissionCeilings(snapshot *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (*nodeListAdmissionCeilings, bool) {
+	ceilings, reason := admission.IncludingPausedCeilingsOf(limit, snapshot.GetMemoryTotalBytes(), snapshot.GetCpuCount())
+	if reason != "" || !ceilings.Applied || !ceilings.MemoryKnown || !ceilings.CPUKnown {
+		return nil, false
+	}
+	return &nodeListAdmissionCeilings{MemoryBytes: ceilings.MemoryBytes, CPUCores: ceilings.CPUCores}, true
 }
 
 type nodeListItem struct {
@@ -167,6 +194,16 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			})
 		}
 
+		publishedAdmission := mapNodeAdmission(observed.GetAdmission())
+		// The marker rides the admission object the scheduler already
+		// publishes: it never invents an empty verdict only to carry it.
+		if publishedAdmission != nil {
+			if ceilings, ok := nodeAdmissionCeilings(snapshot, s.nodeResourceLimit); ok {
+				publishedAdmission.Contract = admission.ContractPerNodeCeilingV1
+				publishedAdmission.Ceilings = ceilings
+			}
+		}
+
 		out = append(out, nodeListItem{
 			Version:           observed.GetVersion(),
 			Commit:            observed.GetCommit(),
@@ -182,7 +219,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			},
 			Status:       nodeStatusToString(snapshot.GetStatus()),
 			SandboxCount: snapshot.GetSandboxCount(),
-			Admission:    mapNodeAdmission(observed.GetAdmission()),
+			Admission:    publishedAdmission,
 			Metrics: nodeListMetrics{
 				AllocatedCPU:               snapshot.GetAllocatedCpu(),
 				AllocatedMemoryBytes:       snapshot.GetAllocatedMemoryBytes(),

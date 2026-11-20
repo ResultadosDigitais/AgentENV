@@ -17,6 +17,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -52,6 +53,11 @@ type ServerOptions struct {
 	DebugMode                bool
 	SandboxProxyDomains      []string
 	QueryOnlySchedulerClient schedulerv1.SchedulerClient
+	// NodeResourceLimit carries the scheduler's admission limits so /nodes can
+	// publish the per-node ceiling contract from the same reading the
+	// scheduler decides on. Nil (or without the margin key) keeps the payload
+	// exactly as it was.
+	NodeResourceLimit *config.NodeResourceLimit
 }
 
 type Server struct {
@@ -70,6 +76,7 @@ type Server struct {
 	sandboxProxyDomains []string
 	sandboxShapes       *sandboxShapeCache
 	templateShapes      *templateShapeCache
+	nodeResourceLimit   *config.NodeResourceLimit
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
@@ -99,6 +106,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		sandboxProxyDomains: sandboxProxyDomains,
 		sandboxShapes:       newSandboxShapeCache(),
 		templateShapes:      newTemplateShapeCache(nil),
+		nodeResourceLimit:   options.NodeResourceLimit,
 	}, nil
 }
 
