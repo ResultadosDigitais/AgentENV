@@ -11,15 +11,30 @@ pub struct MachineInfo {
     pub cpu_config_json: Option<String>,
 }
 
+/// Persisted shape of one paused sandbox on this node, reported in the
+/// heartbeat so the scheduler can project it before admitting a resume.
+#[derive(Clone, Debug)]
+pub struct PausedSandboxResources {
+    pub sandbox_id: SandboxId,
+    pub cpu_count: u32,
+    pub memory_bytes: u64,
+}
+
 /// Node-level metrics projected from orchestrator runtime counters and the
 /// latest sampled host snapshot.
 #[derive(Clone, Debug)]
 pub struct NodeMetricsSnapshot {
     pub allocated_cpu: u32,
     pub allocated_memory_bytes: u64,
+    /// Sum of effective memory requests of active sandboxes (see
+    /// `OrchestratorMetrics::requested_memory_bytes`).
+    pub requested_memory_bytes: u64,
     pub cpu_percent: u32,
     pub cpu_count: u32,
     pub memory_used_bytes: u64,
+    /// Runtime cgroup working set (memory.current minus inactive_file); see
+    /// `HostMetrics::memory_working_set_bytes`.
+    pub memory_working_set_bytes: Option<u64>,
     pub memory_total_bytes: u64,
     pub disks: Vec<DiskMetric>,
     /// CPU reservation of all paused sandboxes on the node, summed.
@@ -39,6 +54,8 @@ pub struct NodeSnapshot {
     pub node_id: String,
     pub service_instance_id: String,
     pub cluster_id: uuid::Uuid,
+    /// Named node pool from the node configuration; empty for a shared node.
+    pub pool: String,
     pub machine_info: MachineInfo,
     pub sandbox_count: u32,
     pub sandbox_ids: Vec<SandboxId>,
@@ -48,4 +65,6 @@ pub struct NodeSnapshot {
     pub sandbox_starting_count: u32,
     /// Number of sandboxes currently in the Paused state on this node.
     pub paused_sandbox_count: u32,
+    /// Shape of every paused sandbox whose resources are known.
+    pub paused_sandboxes: Vec<PausedSandboxResources>,
 }

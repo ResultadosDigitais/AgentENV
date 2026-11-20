@@ -8,7 +8,7 @@ storage-util = { path = "../util", features = ["io-uring"] }
 overlaybd = { path = "../overlaybd", features = ["io-uring"] }
 
 anyhow = "1.0"
-ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
+ublk-sys = { package = "libublk-rs-sys", version = "=0.1.0" }
 io-uring = "0.7.9"
 nix = { version = "0.30.1", features = ["event", "mman", "feature", "process", "fs"] }
 libc = "0.2.174"

@@ -19,7 +19,8 @@ use super::config::{
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
+    relocate_sealed_layer_for_rejected_pause, restack_snapshot_overlaybd_device,
+    restack_snapshot_overlaybd_rootfs, ChainLimits, RestackSnapshotDevice,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
@@ -33,12 +34,15 @@ use crate::cfg::ConfigManager;
 use crate::overlaybd::OverlaybdCompactOutput;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxCaptureError,
-    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxState, ResourceLimitPlan, ResourceLimitStatus,
+    SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
+use crate::sandbox::cpu_quota::{CpuQuota, SandboxCpuCgroup};
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
 use crate::sandbox::guest_volumes;
+use crate::sandbox::memory_containment::{MemoryContainment, SandboxMemoryCgroup};
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
@@ -153,6 +157,12 @@ fn reconcile_disk_rate_limiter(
     Ok(Box::new(rl))
 }
 
+/// The managed-snapshot base the *process-wide* config resolves to.
+///
+/// Test-only: it is the value a pause must not use to classify its own lowers
+/// (see [`FirecrackerSandbox::managed_snapshot_base_path`]), kept so a test can
+/// prove the two differ.
+#[cfg(test)]
 pub(super) fn managed_snapshot_base() -> PathBuf {
     ConfigManager::global_config()
         .firecracker
@@ -194,6 +204,40 @@ pub struct FirecrackerSandbox {
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Byte ceiling for this sandbox's paused artifact chain, resolved once when
+    /// the sandbox is built from `orchestrator.chain_bytes_ceiling` (`0`
+    /// disables the ceiling). The pause path takes it from here instead of
+    /// re-reading the global config at the leaf, so the single production value
+    /// stays in one place and a test can drive the pause path with its own
+    /// ceiling without mutating process-wide configuration.
+    chain_bytes_ceiling: u64,
+    /// Multiple of the guest rootfs disk that bounds the whole deduplicated
+    /// rootfs chain, resolved once when the sandbox is built from
+    /// `orchestrator.rootfs_chain_disk_multiple` (`0` disables the bound).
+    /// Only the rootfs restack receives it; drive, volume and memory chains keep
+    /// the absolute ceiling alone.
+    rootfs_chain_disk_multiple: u32,
+    /// Node-local artifact store the persister allocates paused generations
+    /// from, resolved once when the sandbox is built.
+    ///
+    /// The other directory whose layers this sandbox creates at runtime — its
+    /// own snapshot tree — is deliberately *not* stored here: the pause derives
+    /// it at pause time from the very value it builds its `output_dir` from, so
+    /// the root used for classification and the directory actually written
+    /// cannot diverge. Resolving it separately at build time is what classified
+    /// every adopted lower as immutable stable prefix on the KVM suite, where
+    /// the process-wide default pointed at a different home than the sandbox
+    /// actually paused into.
+    persisted_sandbox_store_root: PathBuf,
+    /// Holds the VMM process once its CPU time is capped below the VM's vCPU
+    /// count. Removed after the process exits.
+    cpu_cgroup: Option<SandboxCpuCgroup>,
+    /// The VM's own cgroup domain with `memory.max` at the VM shape and
+    /// `memory.high` below it, when memory containment is enabled on the node.
+    ///
+    /// Declared after `cpu_cgroup` so the threaded CPU child is removed before
+    /// the domain that contains it.
+    memory_cgroup: Option<SandboxMemoryCgroup>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -350,7 +394,10 @@ impl SandboxBackend for FirecrackerSandbox {
         artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
         let pause_result = match artifact_root {
-            Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root)
+            // A persisted pause (the card's path) may leave a byte-triggered
+            // compaction to the maintenance worker; the generation directory it
+            // writes is named by the record that becomes durable right after.
+            Some(artifact_root) => FirecrackerSandbox::pause_to_dir_deferring(self, artifact_root)
                 .await
                 .map(|(snapshot_config, _)| snapshot_config),
             None => FirecrackerSandbox::pause(self).await,
@@ -601,6 +648,42 @@ impl SandboxBackend for FirecrackerSandbox {
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
         self.current_custom_extension_params = params;
     }
+
+    async fn apply_resource_limits(&mut self, plan: &ResourceLimitPlan) -> Result<()> {
+        self.apply_cpu_quota(plan.cpu_quota())?;
+        let balloon_target_mib = plan.balloon_target_mib();
+        if let Err(error) = self
+            .fc_instance
+            .set_balloon_target(balloon_target_mib)
+            .await
+        {
+            if balloon_target_mib > 0 {
+                return Err(
+                    error.context("memory below the VM shape needs the VM's virtio-balloon device")
+                );
+            }
+            // A VM without a balloon already has its whole memory.
+            debug!(error = %format_args!("{error:#}"), "no balloon to deflate");
+        }
+        Ok(())
+    }
+
+    async fn resource_limit_status(&self) -> Result<ResourceLimitStatus> {
+        let balloon_target_mib = self.fc_instance.balloon_target_mib().await.ok();
+        let balloon_actual_mib = match balloon_target_mib {
+            Some(_) => self.fc_instance.balloon_actual_mib().await.ok(),
+            None => None,
+        };
+        let cpu_quota = match self.cpu_cgroup.as_ref() {
+            Some(cgroup) => cgroup.cpu_limit()?,
+            None => None,
+        };
+        Ok(ResourceLimitStatus {
+            balloon_target_mib,
+            balloon_actual_mib,
+            cpu_quota,
+        })
+    }
 }
 
 // ── SandboxExecutor impl ──────────────────────────────────────────────────────
@@ -693,6 +776,125 @@ impl FirecrackerSandbox {
             SandboxId::new(),
             snapshot.common.envd_access_token.clone(),
         )
+    }
+
+    /// Override the paused-chain byte ceiling for this sandbox.
+    ///
+    /// Production never calls this: [`FirecrackerSandbox::build`] fills the
+    /// ceiling from `orchestrator.chain_bytes_ceiling`, which stays the single
+    /// source of the production value. This exists so a caller that needs a
+    /// different ceiling for one sandbox — an integration test exercising the
+    /// compaction path cheaply, or a probe — can inject it without mutating
+    /// process-wide configuration or racing other sandboxes in the same process.
+    pub fn with_chain_bytes_ceiling(mut self, chain_bytes_ceiling: u64) -> Self {
+        self.chain_bytes_ceiling = chain_bytes_ceiling;
+        self
+    }
+
+    /// Override the rootfs chain disk multiple for this sandbox.
+    ///
+    /// Production never calls this: [`FirecrackerSandbox::build`] fills it from
+    /// `orchestrator.rootfs_chain_disk_multiple`, which stays the single source
+    /// of the production value. This exists so an integration test can exercise
+    /// the relative bound without mutating process-wide configuration.
+    pub fn with_rootfs_chain_disk_multiple(mut self, rootfs_chain_disk_multiple: u32) -> Self {
+        self.rootfs_chain_disk_multiple = rootfs_chain_disk_multiple;
+        self
+    }
+
+    /// The rootfs chain disk multiple this sandbox's pause enforces (`0` = off).
+    pub fn rootfs_chain_disk_multiple(&self) -> u32 {
+        self.rootfs_chain_disk_multiple
+    }
+
+    /// Override the node-local artifact store used as a runtime-owned root.
+    ///
+    /// Production never calls this: [`FirecrackerSandbox::build`] fills it from
+    /// `orchestrator.persisted_sandbox_store_path`. The sandbox's own snapshot
+    /// tree needs no override — the pause takes it from the root it writes into.
+    pub fn with_persisted_sandbox_store_root(mut self, root: PathBuf) -> Self {
+        self.persisted_sandbox_store_root = root;
+        self
+    }
+
+    /// Describe how this sandbox would classify each lower of a paused chain.
+    ///
+    /// Reports, per lower, whether the pause path treats it as runtime-owned
+    /// (therefore compactable) or as immutable stable prefix, together with the
+    /// roots in force. A byte ceiling that rejects a pause is otherwise
+    /// indistinguishable from one that simply had too little budget, and the
+    /// cause — a root that does not cover where the pause actually wrote — is
+    /// only visible in this classification.
+    pub fn describe_chain_classification(&self, image_config_path: &Path) -> Result<String> {
+        let image_config = overlaybd::config::load_image_config(image_config_path)
+            .with_context(|| format!("load image config {}", image_config_path.display()))?;
+        let pause_output_dir = image_config_path.parent().unwrap_or(image_config_path);
+        let roots = self.runtime_owned_roots(Some(pause_output_dir));
+        let mut out = format!(
+            "chain classification for {} ({} lowers), runtime-owned roots in force: {}\n",
+            image_config_path.display(),
+            image_config.lowers.len(),
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for (index, lower) in image_config.lowers.iter().enumerate() {
+            let path = Path::new(&lower.file);
+            let owned = super::overlaybd_snapshot::is_runtime_owned(path, &roots);
+            out.push_str(&format!(
+                "  lower[{index}] {} -> {}\n",
+                if lower.file.is_empty() {
+                    "<remote>".to_string()
+                } else {
+                    lower.file.clone()
+                },
+                if owned {
+                    "runtime-owned"
+                } else {
+                    "stable prefix"
+                }
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The bytes a pause of this snapshot would be charged by the chain ceiling.
+    ///
+    /// Returns `(reclaimable_bytes, stable_prefix_bytes)`: the first is what
+    /// `orchestrator.chain_bytes_ceiling` bounds — the runtime-owned lowers plus
+    /// the layer the next pause appends — and the second is the immutable prefix
+    /// it reports without charging, because every sandbox of the same image
+    /// shares those lowers. Computed by the production accounting with the roots
+    /// in force, so a caller never has to re-derive the classification and
+    /// disagree with the pause path.
+    pub fn chain_bytes_for_pause(&self, image_config_path: &Path) -> Result<(u64, u64)> {
+        let (reclaimable, stable_prefix, _) = self.chain_accounting_for_pause(image_config_path)?;
+        Ok((reclaimable, stable_prefix))
+    }
+
+    /// The `(reclaimable, shared_prefix, whole_chain)` byte parts of a pause.
+    ///
+    /// The third value is the deduplicated chain total the relative rootfs bound
+    /// judges and the per-generation `du` figure the card measures. Computed by
+    /// the production accounting, with the roots in force, so a caller never has
+    /// to re-derive the classification and disagree with the pause path.
+    pub fn chain_accounting_for_pause(&self, image_config_path: &Path) -> Result<(u64, u64, u64)> {
+        let image_config = overlaybd::config::load_image_config(image_config_path)
+            .with_context(|| format!("load image config {}", image_config_path.display()))?;
+        let pause_output_dir = image_config_path.parent().unwrap_or(image_config_path);
+        let roots = self.runtime_owned_roots(Some(pause_output_dir));
+        let accounting = super::overlaybd_snapshot::ChainByteAccounting::measure(
+            image_config.lowers,
+            None,
+            &roots,
+        );
+        Ok((
+            accounting.reclaimable_bytes,
+            accounting.stable_prefix_bytes,
+            accounting.total_bytes,
+        ))
     }
 
     /// The dedicated pack-recording memory device's id, when this sandbox was
@@ -965,10 +1167,30 @@ impl FirecrackerSandbox {
     }
 
     /// Pause the running sandbox and persist its snapshot artifacts into a caller-managed directory.
+    ///
+    /// Keeps every byte-triggered compaction inline. Callers that persist the
+    /// generation for a later resume use [`Self::pause_to_dir_deferring`].
     #[tracing::instrument(skip(self, snapshot_dir))]
     pub async fn pause_to_dir(
         &mut self,
         snapshot_dir: &Path,
+    ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
+        self.pause_to_dir_with_compaction(snapshot_dir, false).await
+    }
+
+    /// Pause into a persisted generation, leaving a byte-triggered compaction to
+    /// the maintenance worker when admission allows it.
+    pub async fn pause_to_dir_deferring(
+        &mut self,
+        snapshot_dir: &Path,
+    ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
+        self.pause_to_dir_with_compaction(snapshot_dir, true).await
+    }
+
+    async fn pause_to_dir_with_compaction(
+        &mut self,
+        snapshot_dir: &Path,
+        defer_compaction: bool,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
         if self.has_writable_persistent_volumes() {
@@ -984,11 +1206,20 @@ impl FirecrackerSandbox {
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
 
-        let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
+        let snapshot_result = self.snapshot_to_dir(snapshot_dir, defer_compaction).await;
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
-                Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
+                // A rejected pause still leaves the live runtime referencing
+                // layers written inside `snapshot_dir`: the rootfs, drive and
+                // volume restacks re-seal the old upper into a file under this
+                // directory and repoint the live config at it. Deleting the
+                // directory without first moving those layers out would free a
+                // file a running device still has open, so the cleanup is
+                // retention-aware: the layers the live configs name are moved to
+                // the sandbox's own snapshot tree first, and only then does the
+                // generation directory go.
+                self.cleanup_failed_snapshot_dir(snapshot_dir).await;
                 Err(err)
             }
         }
@@ -997,7 +1228,14 @@ impl FirecrackerSandbox {
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
+        defer_compaction: bool,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
+        // `snapshot_dir` is the exact directory this pause adopts its lowers
+        // into (`inherited-layers/` for memory, `rootfs/inherited-layers/` for
+        // the rootfs). Naming it as a runtime-owned root ties the classification
+        // to the directory actually written, instead of to a separately
+        // resolved tree that can point at another home.
+        let runtime_owned_roots = self.runtime_owned_roots(Some(snapshot_dir));
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
         // Local layers are always captured raw; when enabled, compression
         // happens once at publish time under `[snapshot.publish_compression]`.
@@ -1014,11 +1252,19 @@ impl FirecrackerSandbox {
             }
             LaunchMode::Fresh(_) => None,
         };
-        let mem_image_config = build_mem_snapshot_image_config(
+        let (mem_image_config, deferred_mem_compaction) = build_mem_snapshot_image_config(
             resume_mem_image_config_path,
             &mem_layer_path,
             snapshot_dir,
             OverlaybdCompactOutput::Raw,
+            ChainLimits {
+                reclaimable_ceiling: self.chain_bytes_ceiling,
+                // The relative bound is the rootfs chain's invariant; a memory
+                // chain has no guest disk to be a multiple of.
+                whole_chain_ceiling: 0,
+            },
+            &runtime_owned_roots,
+            defer_compaction,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -1034,6 +1280,13 @@ impl FirecrackerSandbox {
                 mem_image_config_path.display()
             )
         })?;
+        // Only after the config is durable: the worker swaps the config the
+        // descriptor names.
+        if let Some(descriptor) = deferred_mem_compaction.as_ref() {
+            descriptor.write(&crate::overlaybd::DeferredCompactionDescriptor::path_in(
+                snapshot_dir,
+            ))?;
+        }
 
         let mem_overlaybd_config = OverlaybdConfig {
             image_config_path: mem_image_config_path,
@@ -1056,17 +1309,29 @@ impl FirecrackerSandbox {
                 .rootfs_runtime
                 .as_ref()
                 .context("overlaybd snapshot requires an active ublk device")?;
+            // The relative bound is computed once from the guest disk the pause
+            // is capturing: a small, measured multiple of it, never the absolute
+            // ceiling that only bounds the reclaimable part.
+            let size = self
+                .snapshot_rootfs_virtual_size()
+                .context("persist rootfs virtual size for snapshot")?;
+            let rootfs_limits = ChainLimits {
+                reclaimable_ceiling: self.chain_bytes_ceiling,
+                whole_chain_ceiling: u64::from(self.rootfs_chain_disk_multiple)
+                    .saturating_mul(size),
+            };
             let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
                 &rootfs_runtime.device,
                 overlaybd_source.read_only,
                 &rootfs_runtime.image_config_path,
                 snapshot_dir,
+                rootfs_limits,
+                &runtime_owned_roots,
+                size,
+                defer_compaction,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
             (rootfs_image_path, size)
         } else {
             let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
@@ -1079,7 +1344,7 @@ impl FirecrackerSandbox {
             (rootfs_path, size)
         };
         let snapshot_extra_drives = self
-            .snapshot_extra_drives(snapshot_dir)
+            .snapshot_extra_drives(snapshot_dir, defer_compaction)
             .await
             .context("snapshot extra drives to persistent dir")?;
         let manifest_extra_drives = snapshot_extra_drives
@@ -1166,6 +1431,9 @@ impl FirecrackerSandbox {
             &dirty_ranges,
             &mem_overlaybd_dir,
             memory_output,
+            ConfigManager::global_config()
+                .memory_snapshot
+                .drop_page_cache_after_write,
         )
         .await
         .context("convert dirty memory ranges to overlaybd layer")
@@ -1211,6 +1479,11 @@ impl FirecrackerSandbox {
             envd.invalidate();
         }
         self.frozen_volume_mounts.clear();
+        // The VMM has exited, so its cgroups are empty and can go. The nested
+        // CPU cgroup goes first, because it must be empty before the per-VM
+        // memory domain that contains it can be removed.
+        self.cpu_cgroup = None;
+        self.memory_cgroup = None;
 
         self.resources.release(timeout).await?;
 
@@ -1290,9 +1563,70 @@ impl FirecrackerSandbox {
     }
 
     fn new_managed_persistent_snapshot_root(&self) -> Arc<PersistentSnapshotRootGuard> {
-        let sandbox_dir = self.id.to_string();
-        let root = managed_snapshot_base().join(sandbox_dir);
-        Arc::new(PersistentSnapshotRootGuard::new(root))
+        Arc::new(PersistentSnapshotRootGuard::new(
+            self.managed_snapshot_root_path(),
+        ))
+    }
+
+    /// The managed-snapshot base this sandbox pauses under.
+    ///
+    /// Taken from the sandbox's own launch work base — the same value
+    /// [`create_firecracker_work_dir`] places the VM's work directory under —
+    /// instead of the process-wide config. A resumed sandbox can carry a work
+    /// base that differs from whatever the global config resolves at this
+    /// moment (a test process whose home moved, a node reconfigured between
+    /// boots), and reading the global config here is exactly what made the
+    /// classification disagree with the directory the pause wrote into.
+    fn managed_snapshot_base_path(&self) -> PathBuf {
+        self.launch
+            .common()
+            .firecracker_work_base_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("aenv"))
+            .join("managed-snapshots")
+    }
+
+    /// The managed-snapshot directory this sandbox pauses into when it owns one.
+    ///
+    /// Single source for both the root guard the pause creates and the
+    /// runtime-owned classification, so the two can never name different trees.
+    fn managed_snapshot_root_path(&self) -> PathBuf {
+        self.managed_snapshot_base_path().join(self.id.to_string())
+    }
+
+    /// The snapshot tree this sandbox pauses into, whether it inherited one from
+    /// a parent snapshot or owns a per-sandbox directory.
+    ///
+    /// Derived from the launch state and the same root
+    /// [`Self::live_snapshot_root`] resolves, never from a second read of the
+    /// global config: the pause adopts its lowers under this tree, so a tree
+    /// named here that differs from the one the pause writes into classifies
+    /// every adopted lower as immutable stable prefix.
+    fn sandbox_snapshot_tree(&self) -> PathBuf {
+        if let Some(root) = &self.live_snapshot_root {
+            return root.path().to_path_buf();
+        }
+        match self.launch.managed_snapshot_root() {
+            Some(root) => root.path().to_path_buf(),
+            None => self.managed_snapshot_root_path(),
+        }
+    }
+
+    /// Directories whose overlaybd layers this sandbox's pauses create.
+    ///
+    /// `pause_output_dir` is this generation's snapshot directory; including it
+    /// means the lowers a pause adopts under `<output_dir>/inherited-layers`
+    /// stay runtime-owned whatever tree the caller chose for the pause, which
+    /// is exactly the pairing that has to hold for the ceiling to compact them.
+    fn runtime_owned_roots(&self, pause_output_dir: Option<&Path>) -> Vec<PathBuf> {
+        let mut roots = vec![
+            self.sandbox_snapshot_tree(),
+            self.persisted_sandbox_store_root.clone(),
+        ];
+        if let Some(dir) = pause_output_dir {
+            roots.push(dir.to_path_buf());
+        }
+        roots
     }
 
     async fn live_snapshot_root(&mut self) -> Result<Arc<PersistentSnapshotRootGuard>> {
@@ -1310,8 +1644,28 @@ impl FirecrackerSandbox {
 
     /// Best-effort cleanup of a caller-managed snapshot directory after a failed pause.
     ///
-    /// Removes the directory contents so the caller isn't left with a partially-written snapshot.
-    async fn cleanup_failed_snapshot_dir(path: &Path) {
+    /// Removes the directory contents so the caller isn't left with a partially-written snapshot,
+    /// but never frees a layer a still-live runtime config references. A restack
+    /// that succeeded before a later step failed leaves the live runtime pointing
+    /// at the sealed layer it wrote here; deleting the directory would then turn
+    /// a rejected pause into a sandbox whose device reads a deleted file. Every
+    /// such layer is moved into the sandbox's snapshot tree and the config
+    /// repointed before the directory goes, and if that move fails the directory
+    /// is kept rather than deleted — wasted bytes are recoverable, a dangling
+    /// live reference is not.
+    async fn cleanup_failed_snapshot_dir(&self, path: &Path) {
+        match self.retain_layers_referenced_by_runtime_configs(path).await {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(
+                    snapshot_dir = %path.display(),
+                    error = %format_args!("{error:#}"),
+                    "keeping the partially-written snapshot directory: a live runtime config \
+                     still references a layer inside it"
+                );
+                return;
+            }
+        }
         match tokio::fs::remove_dir_all(path).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1323,6 +1677,71 @@ impl FirecrackerSandbox {
                 );
             }
         }
+    }
+
+    /// Move every layer the live runtime configs reference under `path` into the
+    /// sandbox's snapshot tree, rewriting each config to the retained copy.
+    ///
+    /// Runs before the failed pause's directory is deleted, so the deletion only
+    /// ever frees layers nothing references. A config that cannot be loaded is
+    /// skipped with a warning — there is nothing of ours to repoint — but a layer
+    /// that cannot be retained fails the whole pass so the caller keeps the
+    /// directory instead of deleting a referenced file.
+    async fn retain_layers_referenced_by_runtime_configs(&self, path: &Path) -> Result<()> {
+        // A fresh directory per cleanup, not one shared for the sandbox's life:
+        // a retried pause restacks again and seals another layer under the same
+        // file name, and a shared directory would overwrite the copy an earlier
+        // retry already repointed a live config at.
+        let retained_dir = self
+            .sandbox_snapshot_tree()
+            .join("retained-layers")
+            .join(Uuid::now_v7().to_string());
+        for config_path in self.runtime_image_config_paths() {
+            let image_config = match overlaybd::config::load_image_config(&config_path) {
+                Ok(image_config) => image_config,
+                Err(error) => {
+                    warn!(
+                        config = %config_path.display(),
+                        error = %format_args!("{error:#}"),
+                        "failed to load a live runtime config while retaining layers from a \
+                         failed pause; nothing to repoint for it"
+                    );
+                    continue;
+                }
+            };
+            for lower in &image_config.lowers {
+                if lower.file.is_empty() {
+                    continue;
+                }
+                let lower_path = PathBuf::from(&lower.file);
+                let canonical =
+                    std::fs::canonicalize(&lower_path).unwrap_or_else(|_| lower_path.clone());
+                if !canonical.starts_with(path) {
+                    continue;
+                }
+                let retained = relocate_sealed_layer_for_rejected_pause(
+                    &config_path,
+                    &lower_path,
+                    &retained_dir,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "retain layer {} referenced by {} before deleting {}",
+                        lower_path.display(),
+                        config_path.display(),
+                        path.display()
+                    )
+                })?;
+                debug!(
+                    config = %config_path.display(),
+                    from = %lower_path.display(),
+                    to = %retained.display(),
+                    "retained a layer a failed pause wrote for a live runtime config"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1473,7 +1892,64 @@ impl FirecrackerSandbox {
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
             live_snapshot_root: None,
+            chain_bytes_ceiling: ConfigManager::global_config()
+                .orchestrator
+                .chain_bytes_ceiling,
+            rootfs_chain_disk_multiple: ConfigManager::global_config()
+                .orchestrator
+                .rootfs_chain_disk_multiple,
+            persisted_sandbox_store_root: super::overlaybd_snapshot::persisted_sandbox_store_root(),
+            cpu_cgroup: None,
+            memory_cgroup: None,
         })
+    }
+
+    /// Move the VMM into its own cgroup v2 domain with `memory.max` equal to
+    /// the VM shape and `memory.high` below it, so node memory pressure
+    /// throttles or kills one VM instead of evicting the shared pod.
+    ///
+    /// Does nothing when containment is disabled, or when startup could not
+    /// prepare the subtree on this node.
+    fn apply_memory_containment(&mut self, memory_max_bytes: u64) -> Result<()> {
+        let Some(containment) = MemoryContainment::global() else {
+            return Ok(());
+        };
+        let ratio = ConfigManager::global_config()
+            .memory_containment
+            .memory_high_ratio
+            .context("memory_containment.enabled needs memory_containment.memory_high_ratio")?;
+        let pid = self.fc_instance.pid()?;
+        let cgroup = containment.create(self.id, memory_max_bytes, ratio)?;
+        cgroup.attach(pid.as_raw().unsigned_abs())?;
+        self.memory_cgroup = Some(cgroup);
+        Ok(())
+    }
+
+    /// Cap the VMM at `cpus` vCPUs of CPU time, or lift the cap. The VMM moves
+    /// into its own cgroup the first time it is capped.
+    fn apply_cpu_quota(&mut self, cpus: Option<u32>) -> Result<()> {
+        if let Some(cgroup) = self.cpu_cgroup.as_ref() {
+            return cgroup.set_cpu_limit(cpus);
+        }
+        let Some(cpus) = cpus else {
+            return Ok(());
+        };
+        let quota = CpuQuota::global().context(
+            "CPU limits below the VM's vCPU count need the cgroup v2 CPU quota ([resize].cpu_quota), which is unavailable on this node",
+        )?;
+        let pid = self.fc_instance.pid()?;
+        // With memory containment the CPU cgroup nests inside the VM's memory
+        // domain, so both limits apply to the same VMM and nothing is left in
+        // a threaded root the container can no longer host.
+        let parent = self
+            .memory_cgroup
+            .as_ref()
+            .map(|cgroup| cgroup.path().to_path_buf());
+        let cgroup = quota.create(self.id, parent.as_deref())?;
+        cgroup.attach(pid.as_raw().unsigned_abs())?;
+        cgroup.set_cpu_limit(Some(cpus))?;
+        self.cpu_cgroup = Some(cgroup);
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, config))]
@@ -1571,6 +2047,10 @@ impl FirecrackerSandbox {
             add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
 
         self.spawn_firecracker(&config.common, &netns).await?;
+        let memory_max_bytes = u64::from(config.mem_size_mib)
+            .checked_mul(MIB)
+            .context("VM memory shape overflows bytes")?;
+        self.apply_memory_containment(memory_max_bytes)?;
         self.init_envd_instance(interaction_ip, &config.common);
 
         // ── Configure microVM: tools drive as rootfs + user image + extras ──
@@ -1648,6 +2128,8 @@ impl FirecrackerSandbox {
             let netns = self.allocate_network_slot()?.namespace_path();
             self.spawn_firecracker(&config.common, &netns).await?;
         }
+        // A restored VM's shape is the memory image it loads.
+        self.apply_memory_containment(config.mem_virtual_size)?;
         let slot = self
             .resources
             .network_slot
@@ -2228,7 +2710,8 @@ impl FirecrackerSandbox {
         // Paired with DAMON reclaim (kernel boot args): DAMON reclaims cold
         // pagecache pages inside the guest, and the balloon device reports the
         // resulting free pages to the host VMM so it can release physical memory.
-        self.fc_instance.set_balloon().await?;
+        // The same device later holds memory limits below the VM shape.
+        self.fc_instance.set_balloon(&config.balloon).await?;
 
         Ok(())
     }
@@ -2328,7 +2811,11 @@ impl FirecrackerSandbox {
         Ok(attachments)
     }
 
-    async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
+    async fn snapshot_extra_drives(
+        &self,
+        snapshot_dir: &Path,
+        defer_compaction: bool,
+    ) -> Result<Vec<ExtraDrive>> {
         let extra_drives = &self.launch.common().extra_drives;
         if extra_drives.is_empty() {
             return Ok(Vec::new());
@@ -2358,16 +2845,28 @@ impl FirecrackerSandbox {
                 || "snapshot.commit".to_owned(),
                 |_| format!("snapshot-{}.commit", Uuid::now_v7().simple()),
             );
-            let snapshot_image_config_path = restack_snapshot_overlaybd_device(
-                &runtime.device,
-                drive.read_only(),
-                &runtime.image_config_path,
-                &output_dir,
-                &snapshot_layer_file_name,
-                "drive",
-            )
-            .await
-            .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
+            // Drive layers are adopted under this drive's own output dir, so it
+            // joins the runtime-owned roots for the same reason the pause's
+            // snapshot dir does.
+            let runtime_owned_roots = self.runtime_owned_roots(Some(&output_dir));
+            let snapshot_image_config_path =
+                restack_snapshot_overlaybd_device(RestackSnapshotDevice {
+                    ublk_device: &runtime.device,
+                    read_only: drive.read_only(),
+                    live_runtime_image_config_path: &runtime.image_config_path,
+                    output_dir: &output_dir,
+                    snapshot_layer_file_name: &snapshot_layer_file_name,
+                    kind: "drive",
+                    limits: ChainLimits {
+                        reclaimable_ceiling: self.chain_bytes_ceiling,
+                        whole_chain_ceiling: 0,
+                    },
+                    runtime_owned_roots: &runtime_owned_roots,
+                    compaction_view_bytes: runtime.actual_virtual_size,
+                    defer_compaction,
+                })
+                .await
+                .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
             snapped.push(
                 drive
                     .with_image_config_path(snapshot_image_config_path)
@@ -2406,14 +2905,24 @@ impl FirecrackerSandbox {
                 continue;
             }
             let snapshot_layer_file_name = format!("snapshot-{}.commit", Uuid::now_v7().simple());
-            restack_snapshot_overlaybd_device(
-                &runtime.device,
-                false,
-                &runtime.image_config_path,
+            let runtime_owned_roots = self.runtime_owned_roots(Some(output_dir));
+            restack_snapshot_overlaybd_device(RestackSnapshotDevice {
+                ublk_device: &runtime.device,
+                read_only: false,
+                live_runtime_image_config_path: &runtime.image_config_path,
                 output_dir,
-                &snapshot_layer_file_name,
-                "volume",
-            )
+                snapshot_layer_file_name: &snapshot_layer_file_name,
+                kind: "volume",
+                limits: ChainLimits {
+                    reclaimable_ceiling: self.chain_bytes_ceiling,
+                    whole_chain_ceiling: 0,
+                },
+                runtime_owned_roots: &runtime_owned_roots,
+                compaction_view_bytes: runtime.actual_virtual_size,
+                // The freeze/seal path is a capture step with no paused record
+                // naming the generation, so its rewrite stays inline.
+                defer_compaction: false,
+            })
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
         }
@@ -2796,6 +3305,65 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// The roots used to classify a pause's lowers must follow the directory the
+    /// pause actually writes into, not the process-wide default.
+    ///
+    /// This is the KVM-suite shape: the test process's global config points the
+    /// managed-snapshot base at one home while the sandbox pauses into another
+    /// (`/tmp/aenv-test-<run>/home/firecracker-work/...`). When the roots were
+    /// resolved from the global config, every adopted lower looked like
+    /// immutable stable prefix, compaction only re-committed the newest
+    /// generation, and the byte ceiling eventually rejected the pause.
+    #[test]
+    fn runtime_owned_roots_follow_the_pause_tree_not_the_global_config() {
+        let root = TempDir::new().expect("tempdir");
+        // The sandbox's own firecracker work base, deliberately not the global
+        // one, exactly like a test process whose AENV_HOME_PATH differs from the
+        // managed-snapshot base the global config resolves.
+        let sandbox_work_base = root.path().join("home").join("firecracker-work");
+        let mut config = fresh_config();
+        config.common.firecracker_work_base_dir = Some(sandbox_work_base.clone());
+        let sandbox = FirecrackerSandbox::new(config).expect("sandbox");
+
+        let sandbox_tree = sandbox_work_base
+            .join("managed-snapshots")
+            .join(sandbox.sandbox_id().to_string());
+        let global_tree = managed_snapshot_base().join(sandbox.sandbox_id().to_string());
+        assert_ne!(
+            sandbox_tree, global_tree,
+            "the test must exercise a sandbox tree that differs from the global default"
+        );
+
+        // A pause writes generation `<uuid>/` under the sandbox's own tree.
+        let output_dir = sandbox_tree.join("0199a000-0000-7000-8000-000000000000");
+        let roots = sandbox.runtime_owned_roots(Some(&output_dir));
+
+        assert!(
+            roots.contains(&sandbox_tree),
+            "the sandbox's own snapshot tree must be a runtime-owned root: {roots:?}"
+        );
+        assert!(
+            roots.contains(&output_dir),
+            "the directory this pause writes into must be a runtime-owned root: {roots:?}"
+        );
+        assert!(
+            !roots.contains(&global_tree),
+            "the process-wide default must not be used to classify this pause: {roots:?}"
+        );
+
+        // The adopted lower lands under `<output_dir>/inherited-layers/`, which
+        // is what the pause rewrites when compaction has to merge it.
+        let adopted = output_dir
+            .join("inherited-layers")
+            .join("0000")
+            .join("mem.commit");
+        assert!(
+            adopted.starts_with(&sandbox_tree),
+            "an adopted lower must classify as runtime-owned, got {}",
+            adopted.display()
+        );
     }
 
     #[test]

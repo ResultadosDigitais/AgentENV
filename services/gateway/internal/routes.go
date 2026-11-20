@@ -25,6 +25,10 @@ const (
 	// ownerNewBuildConfirmed schedules a builder and binds the build ID the
 	// upstream returns in x-agentenv-build-id, which must equal {id}.
 	ownerNewBuildConfirmed
+	// ownerSandboxResume routes a resume through the scheduler's admission
+	// rule instead of the plain owner lookup, so a full owner defers or moves
+	// the sandbox before it is resumed.
+	ownerSandboxResume
 )
 
 type pathRoute struct {
@@ -41,13 +45,15 @@ var pathRoutes = []pathRoute{
 	{http.MethodDelete, "/sandboxes/{id}", ownerSandbox},
 	{http.MethodGet, "/sandboxes/{id}/metrics", ownerSandbox},
 	{http.MethodPost, "/sandboxes/{id}/pause", ownerSandbox},
-	{http.MethodPost, "/sandboxes/{id}/resume", ownerSandbox},
+	{http.MethodPost, "/sandboxes/{id}/resume", ownerSandboxResume},
 	{http.MethodPost, "/sandboxes/{id}/fork", ownerSandboxFork},
 	{http.MethodPost, "/sandboxes/{id}/connect", ownerSandbox},
 	{http.MethodPost, "/sandboxes/{id}/timeout", ownerSandbox},
 	{http.MethodPost, "/sandboxes/{id}/refreshes", ownerSandbox},
 	{http.MethodPost, "/sandboxes/{id}/snapshots", ownerSandbox},
 	{http.MethodPut, "/sandboxes/{id}/network", ownerSandbox},
+	{http.MethodGet, "/sandboxes/{id}/resources", ownerSandbox},
+	{http.MethodPatch, "/sandboxes/{id}/resources", ownerSandbox},
 	{http.MethodGet, "/sandboxes/{id}/custom-extension-params", ownerSandbox},
 	{http.MethodPatch, "/sandboxes/{id}/custom-extension-params", ownerSandbox},
 	{http.MethodGet, "/v2/sandboxes/{id}/logs", ownerSandbox},

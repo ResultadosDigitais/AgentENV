@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agentenv-scheduler-node-capacity
+subjects:
+  - kind: ServiceAccount
+    name: agentenv-scheduler
+    namespace: agentenv-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agentenv-scheduler-node-capacity

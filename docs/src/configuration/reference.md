@@ -32,6 +32,27 @@ Packaged runtime dependency versions and download URLs live in
 installed. User configuration should contain runtime behavior and explicit
 local path overrides, not the default dependency catalog.
 
+The `firecracker` and `kernel` catalog entries also carry a `sha256` pin per
+target architecture. Setup hashes the artifact while downloading it and fails
+closed when the digest differs: the temporary file is removed and nothing is
+installed. A `version` override selects different bytes and therefore disables
+the bundled pin; a `url` override alone keeps it, so a mirror must serve the
+same release. An entry without a pin for the current architecture also fails
+closed instead of downloading unverified.
+
+The scheduler image does not download build-time dependencies from GitHub
+releases. `deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml` stages
+`grpc_health_probe`, the pinned `firecracker` release tarball and the kernel
+once, verifies every file against `config/build_deps.lock.toml`, and publishes
+the `us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps`
+image. `deploy/docker/Dockerfile.scheduler` copies the probe from that image by
+digest and re-checks its `sha256` inside the build. To renew a pin, update the
+entry in both `config/build_deps.lock.toml` and `config/deps_manifest.toml`, run
+the Cloud Build command in that config's header, and commit the digest it
+prints. The `docker-compose` e2e still resolves these assets through this
+catalog at setup time; moving it to the reserve image is a follow-up that needs
+Workload Identity Federation for the GitHub runner.
+
 ## `[firecracker]`
 
 Firecracker VM binary and boot configuration.
@@ -278,6 +299,36 @@ Per-sandbox disk I/O limits, applied through Firecracker's virtio-blk rate limit
 | `iops` | integer | `0` | Sustained IOPS limit; `0` means unlimited |
 | `iops_burst` | integer | `0` | One-time IOPS burst, granted once when the VM starts. Consumed before the sustained bucket and never replenished. Requires `iops` |
 
+## `[machine.balloon]`
+
+The virtio-balloon device a VM gets when it first boots (cold starts and template builds). A VM restored from a snapshot keeps the device its snapshot was taken with, so a change reaches existing templates only after they are rebuilt. See [Sandbox Resources](../concepts/sandboxes/resources.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `deflate_on_oom` | boolean | `true` | Let the guest take balloon memory back under memory pressure. `true` makes a memory limit below the VM shape advisory; `false` enforces it, so a guest that outgrows the limit OOM-kills inside it |
+| `stats_polling_interval_s` | integer | `0` | Balloon statistics polling interval in seconds; `0` disables them. Without statistics the resources API reports the balloon target but not how much memory the balloon actually holds |
+
+## `[memory_containment]`
+
+One cgroup v2 domain per microVM. The memory controller only distributes to domain children and a cgroup that holds processes cannot delegate it, so startup moves the runtime's own processes into a leaf before preparing the subtree. If the node cannot provide it, the reason is logged and the runtime keeps the shared-pod behavior. See [Memory containment](../internals/memory-containment.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Give every VMM its own cgroup v2 domain with `memory.max` equal to the VM shape and `memory.high` below it, so node memory pressure throttles or kills one VM instead of evicting the runtime pod |
+| `memory_high_ratio` | number | unset | `memory.high` as a fraction of `memory.max`, strictly between 0 and 1. Required when `enabled` is true; the fraction is measured per node, so there is no default |
+
+## `[resize]`
+
+Per-sandbox CPU and memory inside the VM shape: `cpuCount`/`memoryMB` on snapshot-based creates and live resize through `PATCH /sandboxes/{sandboxID}/resources`. See [Sandbox Resources](../concepts/sandboxes/resources.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Accept per-sandbox resources below the VM shape and live resize |
+| `cpu_quota` | boolean | `true` | Enforce CPU limits below the VM shape with a cgroup v2 `cpu.max` quota on each VMM process. Needs a writable, delegated cgroup v2 hierarchy with the `cpu` controller; when setup fails at startup only memory can be resized |
+| `min_memory_mib` | integer | `512` | Smallest effective guest memory in MiB |
+| `max_cpu_allocated_percent` | integer | unset | Reject a resize that grows a sandbox when the CPUs allocated to running sandboxes would exceed this percentage of the node's CPUs |
+| `max_memory_allocated_percent` | integer | unset | Reject a resize that grows a sandbox when the memory allocated to running sandboxes would exceed this percentage of the node's memory |
+
 ## `[envd]`
 
 In-guest `envd` daemon settings.
@@ -319,6 +370,11 @@ Sandbox lifecycle management.
 | `default_sandbox_timeout_secs` | integer | `15` | Default keep-alive timeout for sandboxes |
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
 | `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |
+| `chain_bytes_ceiling` | integer (bytes) | `51539607552` (48 GiB) | Ceiling for the reclaimable part of one sandbox's paused artifact chain: its runtime-owned overlaybd generations plus the layer each pause appends. The image-derived stable prefix is reported but not charged, since every sandbox of an image shares those files. A pause that would exceed it does not pay the rewrite: when admission allows (see `deferred_compaction_max_concurrent` and `deferred_compaction_pending_bytes_budget`) it adopts the runtime-owned suffix into the generation and leaves a durable `deferred-compaction.json` beside the image config, and the maintenance worker compacts afterwards; otherwise it compacts the runtime-owned generations into one inline, as before. Either way the stale-generation sweep runs, and a reclaimable part that stays above the ceiling on the inline path fails with the recoverable `CHAIN_BYTES_CEILING_EXCEEDED`, the sandbox is resumed in place and keeps running and serving. A pre-flight that already fits skips the post-compaction rejection. `0` disables the ceiling, the pre-flight and the sweep. The default is provisional, derived from the OPSAI-5494 staging measurement. |
+| `rootfs_chain_disk_multiple` | integer | `2` | Relative bound for the whole deduplicated rootfs chain of one sandbox — its immutable stable prefix plus its runtime-owned generations — as a multiple of the guest rootfs disk. This is a second, independent bound, not a replacement: `chain_bytes_ceiling` protects the node's disk by capping the reclaimable part, while this one is the invariant that a 64 GiB guest disk cannot leave a 144 GiB chain behind. A pause over either bound compacts the runtime-owned suffix; after compaction the pause is refused with the recoverable `ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED` only when the whole chain is still above `multiple × disk`. Only `rootfs` sets this bound; drive, volume and memory chains keep the absolute ceiling alone. The pre-flight measures both bounds and never refuses. `0` disables the relative bound. The default `2` is the floor for admitting a fully allocated disk: the immutable prefix and one complete compacted generation can each approach the disk size, so `2 × disk` is the smallest multiple that does not refuse a legitimate pause. The incident of 05/11/2026 measured a 144 GB rootfs chain on a 64 GiB guest disk (2.25×), which this bound refuses and compacts; the three-or-more-cycle p50/p90/max distribution is recorded by the seven-day rollout check. Two times the disk admits `2 × 64 GiB = 128 GiB` for that disk, so the 48 GiB node budget is not reachable per sandbox while a full generation is live; that trade-off is deliberate and measured at rollout. |
+| `paused_artifact_reap` | string | `"off"` | Periodic sweep of `persisted_sandboxes/artifacts/` reclaiming a sandbox directory no record and no cluster list names any more: `off`, `report` (list and count only) or `enforce` (move to `artifacts/.trash/{epoch}/`, then delete after a second grace). A failed or unconfigured cluster list degrades a pass to a report. See [Orchestrator Persistence](../internals/persistence-artifact-inventory.md#orchestrator-persistence). |
+| `deferred_compaction_max_concurrent` | integer | `1` | How many paused-chain compactions the maintenance worker may run at the same time on this node. A pause whose byte bound is crossed leaves a durable descriptor and returns, so it no longer pays the rewrite; the worker executes at most this many per pass and counts the remainder as queued. A pause that finds this budget full compacts inline, with the same recoverable refusals as before. A parameter, never a kill switch: the boot refuses `0`. PROVISIONAL default `1`: the 13/11/2026 measurement rewrote 12 GiB per pause on a 32 GiB VM and a compaction holds its inputs and its output on disk at once. |
+| `deferred_compaction_pending_bytes_budget` | integer (bytes) | `103079215104` (96 GiB) | Transient bytes of deferred compactions this node may have pending (queued plus in flight); a pause whose compaction would cross it compacts inline. The transient bound of one entry is `compaction_transient_bytes`: the smaller of the device's virtual size and its inputs' allocated bytes, plus one eighth for index and metadata. PROVISIONAL default: two times the shipped 48 GiB ceiling — one output in flight plus one queued — from the OPSAI-5494 measurement. A parameter, never a kill switch: the boot refuses `0`. |
 
 ## `[pool]`
 
@@ -343,22 +399,20 @@ Component sections:
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
 | `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries up to the low watermark during server startup |
 | `[pool.firecracker]` | `fill_concurrency` | integer | `4` | Maximum number of warm Firecracker processes created concurrently by one maintenance refill batch |
+| `[pool.firecracker]` | `idle_ttl_secs` | integer | `600` | Seconds without warm-process acquisitions before the refill target decays back to the low watermark and excess warm processes are drained (`0` disables decay) |
 
-Validation rules:
-
-- `low_watermark <= high_watermark`
-- `[pool.firecracker].fill_concurrency > 0`
+Validation rules: `low_watermark <= high_watermark`, and `[pool.firecracker].fill_concurrency > 0`.
 
 ## `[node_identity]`
 
-Stable identity fields for this node. These values appear in node API responses
-and scheduler heartbeats.
+Stable identity fields for this node. These values appear in node API responses and scheduler heartbeats.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `node_id` | string | hostname-derived | Stable node identifier returned by the admin/node APIs |
 | `cluster_id` | string (UUID) | nil UUID | Logical cluster identifier included in node snapshots |
 | `service_instance_id` | string | generated UUID | Unique process/service instance identifier for the current node runtime |
+| `pool` | string | `""` | Named node pool reported in the scheduler heartbeat. Empty keeps the node shared: it only receives sandboxes that did not ask for a pool. A pooled node only receives sandboxes that ask for its pool, and a sandbox that asks for a pool never falls back to another pool or to the shared nodes |
 
 ## `[observability]`
 
@@ -430,7 +484,7 @@ Snapshot storage/build configuration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `local_cache_path` | string | `"$AENV_HOME/snapshot-local-cache"` | Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory. |
-| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"` and `"oss"` |
+| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"`, `"oss"` and `"gcs"` |
 | `p2p_enabled` | boolean | `true` | When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend. |
 
 Environment variable overrides:
@@ -471,7 +525,7 @@ looked up by consumers.
 ## `[snapshot.memory_startup_pack]`
 
 Optional startup-memory trace recording and best-effort prefetch for both
-`oss` and `posix_fs` repositories. It is disabled by default. Publishing never
+`oss`, `gcs` and `posix_fs` repositories. It is disabled by default. Publishing never
 waits for recording: a completed trace is encoded as a SHA-256-verified
 manifest and attached to the already committed snapshot. Snapshots without a
 descriptor, with a missing/corrupt manifest, or with a failed prefetch always
@@ -504,6 +558,23 @@ retaining the device lease until the read finishes. `O_DIRECT`
 configuration with device prefetch; this is not a claim that device page cache
 is bypassed. The configured I/O engine is never changed. OSS retains its existing
 physical-range planner and executor. Prefetch is not a correctness dependency.
+
+## `[snapshot.managed_layer_collect]`
+
+Collecting managed layers that no catalog record cites. A managed layer is
+content addressed and shared, so deleting a snapshot leaves its layers in the
+repository. `POST /admin/managed-layers/collect` sweeps them: `mode: report`
+lists and counts, `mode: enforce` deletes the uncited layers older than the
+grace period. Enforce needs `gateway_url` (below), because a layer a sandbox
+paused on another node still reads must stay cited.
+See
+[Managed Layer Collection](../internals/persistence-artifact-inventory.md#managed-layer-collection).
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Enables the endpoint. Disabled, it answers 409 and sweeps nothing. Enforce is refused until a report pass has run in the same server process. |
+| `grace_secs` | integer | `7200` | How old an uncited layer must be before enforce may delete it. A publish uploads its layers before it writes the record that cites them, so a newer uncited layer may belong to a publish in flight and always stays. |
+| `gateway_url` | string | unset | Base URL of the cluster gateway (for example `http://agentenv-gateway:8080`). The pass reads `GET /v2/sandboxes` from it, which fans out to every node, so a sandbox paused on another node keeps its source layers cited. Unset, the pass sees only this node: `report` still runs, `enforce` answers 409. |
 
 ## `[backend.posix_fs]`
 
@@ -551,6 +622,87 @@ bucket = "agentenv-snapshots"
 region = "auto"
 addressing_style = "virtual"
 ```
+
+## `[backend.gcs]`
+
+Google Cloud Storage snapshot repository configuration. This section is required when `snapshot.repository_backend = "gcs"`.
+
+The backend talks to Google Cloud Storage through its native JSON and XML APIs rather than the S3 interoperability API, so it needs no HMAC keys and has no endpoint or region. Exactly one way to authenticate must be chosen: `credential_path` (recommended), `allow_application_default_credentials = true`, or `allow_anonymous = true`. With none of them the backend refuses to start; it never picks an identity on its own.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `bucket` | string | none | Bucket name used for committed snapshot state |
+| `prefix` | string | empty | Optional object name prefix under the bucket |
+| `credential_path` | string | unset | Credential JSON file: a service-account key, or an `external_account` configuration for Workload Identity Federation (see [Kubernetes setup](#kubernetes-setup)). This is the only credential source consulted: the environment, the gcloud well-known file and the metadata server are all disabled, so a missing or unparsable file makes requests fail with `no valid credential found` instead of falling back to another identity. Cannot be combined with the other two options |
+| `allow_application_default_credentials` | boolean | `false` | Opt in to Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud well-known file, then the metadata server. Suitable for a single-tenant VM or a developer workstation. Do not use it where untrusted code can reach the metadata server (see below). Cannot be combined with the other two options |
+| `endpoint` | string | `https://storage.googleapis.com` | API endpoint override for emulators such as `fake-gcs-server`. Leave unset for Google Cloud Storage |
+| `allow_anonymous` | boolean | `false` | Send unauthenticated requests. For emulators and public buckets only. Cannot be combined with the other two options |
+| `cache_max_size_gb` | integer | `10` | Maximum size of the node-local artifact cache in GiB |
+
+Notes:
+
+- The service account needs `storage.objects.create`, `get`, `list` and `delete` on the bucket, for example through `roles/storage.objectAdmin`. The AgentENV server and the overlaybd runtime (which runs in the `uvm-ublk-daemon` process) obtain tokens independently, so both must be able to read the file at `credential_path` and everything it references. In a pod they are in the same container, so one file serves both; each refreshes its own tokens.
+- Both the snapshot repository client and the overlaybd runtime (`ossConfig.gcs` in the generated global config) read the bucket, so layers are loaded on demand directly from `gs://` objects.
+- Object names are kept to ASCII letters, digits, `-`, `_`, `.` and `/`; any other byte, such as the `:` of a `sha256:` digest, is stored as `~` and two uppercase hex digits (`sha256~3A...`). The mapping is applied and reversed by AgentENV, so it is visible only when browsing the bucket.
+- Google Cloud Storage cannot replace or delete an object only if it is unchanged, so writers of one shared document (catalog records, aliases, the build cache head) take a lease built from create-only objects under `locks/` instead of an ETag compare-and-swap. A holder that dies releases nothing; another node takes the lock over after 30 seconds. Each node measures the 30 seconds on its own monotonic clock, so nodes need no clock agreement.
+- Large layers, such as the memory layers of a snapshot, upload through the XML multipart API in 64 MiB parts, at most 8 at a time, which allows objects of about 625 GiB.
+
+```toml
+[snapshot]
+repository_backend = "gcs"
+
+[backend.gcs]
+bucket = "agentenv-snapshots"
+prefix = "prod/"
+credential_path = "/etc/agentenv/gcp/credential.json"
+```
+
+For a local emulator:
+
+```toml
+[backend.gcs]
+bucket = "agentenv-snapshots"
+endpoint = "http://127.0.0.1:4443"
+allow_anonymous = true
+```
+
+### Kubernetes setup
+
+Sandboxes are Firecracker guests that run in the same pod as the AgentENV server and share its network. Anything the pod can obtain from the GKE metadata server, including the identity that Workload Identity binds to the pod's Kubernetes service account, is therefore also reachable from guest code unless guest egress to the metadata server is blocked. A token with write access to the snapshot bucket must not be reachable that way, so do not use Application Default Credentials, node-attached service accounts or a Workload Identity annotation for this backend in a multi-tenant deployment.
+
+Instead, hand the pod a credential as a **file**, which a guest cannot read, using Workload Identity Federation with a projected service-account token:
+
+1. Create a workload identity pool and an OIDC provider for the cluster's issuer. Create a dedicated Google service account with `roles/storage.objectAdmin` on the snapshot bucket only, and allow the pool's principal to impersonate it (`roles/iam.workloadIdentityUser`).
+2. Project a token with an explicit audience (the provider's full resource name) into the pod, and mount it read-only:
+
+   ```yaml
+   volumes:
+     - name: gcp-token
+       projected:
+         sources:
+           - serviceAccountToken:
+               audience: //iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER
+               expirationSeconds: 3600
+               path: token
+   ```
+
+   mounted at `/var/run/secrets/gcp`. The kubelet rotates the file; AgentENV re-reads it on every token refresh.
+3. Mount a credential configuration (a ConfigMap is enough, it holds no secret) at `/etc/agentenv/gcp/credential.json`:
+
+   ```json
+   {
+     "type": "external_account",
+     "audience": "//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER",
+     "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+     "token_url": "https://sts.googleapis.com/v1/token",
+     "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/SNAPSHOTS_SA@PROJECT_ID.iam.gserviceaccount.com:generateAccessToken",
+     "credential_source": { "file": "/var/run/secrets/gcp/token" }
+   }
+   ```
+
+4. Set `credential_path = "/etc/agentenv/gcp/credential.json"`.
+
+The pod must be able to reach `sts.googleapis.com` and `iamcredentials.googleapis.com` as well as `storage.googleapis.com`. Keep the mounts out of the guests' reach (they are not part of any guest filesystem), and still restrict guest egress where you can.
 
 Other path override:
 
@@ -627,6 +779,7 @@ the default path on every startup.
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
 | `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
+| `drop_page_cache_after_write` | bool | `false` | After a memory snapshot layer is sealed, sync it and drop its page cache (`posix_fadvise(DONTNEED)`) so the snapshot write stops counting toward the runtime pod's working set. Adds an fsync to the pause path |
 
 ## `[memory_snapshot.background_download]`
 

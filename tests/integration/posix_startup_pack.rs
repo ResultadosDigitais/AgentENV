@@ -58,6 +58,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
                 resources: SandboxResources {
                     cpu_count,
                     memory_mib,
+                    memory_request_mib: None,
                     disk_size_mib: rootfs_bytes.div_ceil(1 << 20).try_into()?,
                 },
                 runtime_versions,

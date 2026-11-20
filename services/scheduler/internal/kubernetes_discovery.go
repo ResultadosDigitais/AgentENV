@@ -11,6 +11,7 @@ import (
 
 	"agentenv/services/shared/config"
 
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -29,8 +30,10 @@ type KubernetesDiscovery struct {
 	config                config.SchedulerDiscoveryKubernetesConfig
 	registry              *AtomicNodeRegistry
 	endpointSliceInformer cache.SharedIndexInformer
+	nodeInformer          cache.SharedIndexInformer
 	ignorePodInformer     cache.SharedIndexInformer
 	noSchedulePodInformer cache.SharedIndexInformer
+	capacity              *nodeCapacityIndex
 }
 
 func NewKubernetesDiscovery(
@@ -71,6 +74,10 @@ func NewKubernetesDiscovery(
 	)
 	endpointSliceInformer := endpointSliceFactory.Discovery().V1().EndpointSlices().Informer()
 
+	// Nodes are cluster-scoped: status.allocatable.memory lives on the node
+	// object, not on the pod. A read-only ClusterRole grants get/list/watch.
+	nodeInformer := informers.NewSharedInformerFactory(clientset, 0).Core().V1().Nodes().Informer()
+
 	var ignorePodInformer cache.SharedIndexInformer
 	if strings.TrimSpace(cfg.IgnorePodSelector) != "" {
 		ignorePodInformer = newPodSelectorInformer(clientset, cfg.Namespace, cfg.IgnorePodSelector)
@@ -85,14 +92,23 @@ func NewKubernetesDiscovery(
 		config:                cfg,
 		registry:              registry,
 		endpointSliceInformer: endpointSliceInformer,
+		nodeInformer:          nodeInformer,
 		ignorePodInformer:     ignorePodInformer,
 		noSchedulePodInformer: noSchedulePodInformer,
+		capacity:              newNodeCapacityIndex(),
 	}
 	addSyncEventHandler(endpointSliceInformer, discovery.syncFromStore)
+	addSyncEventHandler(nodeInformer, discovery.syncFromStore)
 	addSyncEventHandler(ignorePodInformer, discovery.syncFromStore)
 	addSyncEventHandler(noSchedulePodInformer, discovery.syncFromStore)
 
 	return discovery, nil
+}
+
+// Capacity implements NodeCapacityProvider for the pods discovered by this
+// discovery: pod name -> Kubernetes node -> status.allocatable.memory.
+func (d *KubernetesDiscovery) Capacity(nodeID string) (NodeCapacity, bool) {
+	return d.capacity.Capacity(nodeID)
 }
 
 func validateOptionalPodSelector(raw string, field string) error {
@@ -137,8 +153,9 @@ func addSyncEventHandler(informer cache.SharedIndexInformer, sync func()) {
 
 func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 	go d.endpointSliceInformer.Run(ctx.Done())
+	go d.nodeInformer.Run(ctx.Done())
 
-	cacheSyncs := []cache.InformerSynced{d.endpointSliceInformer.HasSynced}
+	cacheSyncs := []cache.InformerSynced{d.endpointSliceInformer.HasSynced, d.nodeInformer.HasSynced}
 	if d.ignorePodInformer != nil {
 		go d.ignorePodInformer.Run(ctx.Done())
 		cacheSyncs = append(cacheSyncs, d.ignorePodInformer.HasSynced)
@@ -175,6 +192,7 @@ func (d *KubernetesDiscovery) syncFromStore() {
 	active, lingering := nodesFromEndpointSliceObjects(objects, d.config)
 	active, lingering = d.filterNodesByPodLabels(active, lingering)
 	d.registry.Set(active, lingering)
+	d.syncCapacity(objects)
 
 	d.logger.Debug("scheduler refreshed kubernetes-discovered nodes",
 		zap.String("namespace", d.config.Namespace),
@@ -184,8 +202,30 @@ func (d *KubernetesDiscovery) syncFromStore() {
 	)
 }
 
+// syncCapacity refreshes pod -> Kubernetes node -> allocatable memory from the
+// informer stores.
+func (d *KubernetesDiscovery) syncCapacity(endpointObjects []interface{}) {
+	slices := make([]*discoveryv1.EndpointSlice, 0, len(endpointObjects))
+	for _, object := range endpointObjects {
+		if slice, ok := object.(*discoveryv1.EndpointSlice); ok && slice != nil {
+			slices = append(slices, slice)
+		}
+	}
+	nodeObjects := d.nodeInformer.GetStore().List()
+	nodes := make([]*corev1.Node, 0, len(nodeObjects))
+	for _, object := range nodeObjects {
+		if node, ok := object.(*corev1.Node); ok && node != nil {
+			nodes = append(nodes, node)
+		}
+	}
+	d.capacity.replace(podNodeNames(slices), allocatableMemoryFromNodes(nodes))
+}
+
 func (d *KubernetesDiscovery) cacheSynced() bool {
 	if d.endpointSliceInformer == nil || !d.endpointSliceInformer.HasSynced() {
+		return false
+	}
+	if d.nodeInformer == nil || !d.nodeInformer.HasSynced() {
 		return false
 	}
 	if d.ignorePodInformer != nil && !d.ignorePodInformer.HasSynced() {

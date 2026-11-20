@@ -2,6 +2,7 @@ mod launch_plan;
 mod metrics;
 mod persistence;
 mod proxy;
+mod resize;
 mod service;
 mod store;
 mod types;
@@ -9,13 +10,18 @@ mod types;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
-pub use metrics::OrchestratorMetrics;
+pub use metrics::{OrchestratorMetrics, PausedSandboxResources};
+pub use persistence::paused_store_cost::{MonthlyCost, PausedStoreCost};
 pub use persistence::{
-    DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
-    SandboxPersistenceError, SandboxPersister,
+    DisabledSandboxPersister, FileBackedSandboxPersister, PausedArtifactCandidate,
+    PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
+// Shared so the periodic reaper skips and expires exactly the directory the
+// boot path writes.
+pub(crate) use persistence::{QUARANTINE_DIR, QUARANTINE_TTL};
 pub use proxy::{ProxyLookupResult, ProxyTarget};
-pub use service::Orchestrator;
+pub use resize::{NodeCapacity, ResizePolicy, ResourceRequest};
+pub use service::{MemoryLimitState, Orchestrator, SandboxResourceStatus};
 pub use store::{
     InMemoryMetadataStore, MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata,
     SandboxTimeoutAction,
@@ -40,6 +46,7 @@ pub enum SandboxOperation {
     Fork,
     UpdateNetwork,
     PatchCustomExtensionParams,
+    ApplyResourceLimits,
     Stop,
 }
 
@@ -94,6 +101,15 @@ pub enum OrchestratorError {
         sandbox_id: SandboxId,
         timeout: String,
     },
+
+    /// The requested CPU/memory is invalid or cannot be provided by the VM
+    /// shape or this node; retrying the same request will not succeed.
+    #[error("unsupported sandbox resources: {0}")]
+    UnsupportedResources(String),
+
+    /// The node lacks free capacity for the requested growth right now.
+    #[error("insufficient node capacity: {0}")]
+    InsufficientCapacity(String),
 
     #[error("internal error: {0}")]
     InternalError(String),

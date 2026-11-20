@@ -111,6 +111,10 @@ impl VirtualFile for ProcessVmReader {
 mod tests {
     use super::*;
 
+    use std::num::NonZeroUsize;
+
+    use nix::sys::mman::{madvise, mmap_anonymous, munmap, MapFlags, MmapAdvise, ProtFlags};
+
     #[tokio::test]
     async fn reads_current_process_memory() -> Result<()> {
         let source = b"process-vm-reader";
@@ -125,6 +129,53 @@ mod tests {
             .await?;
         assert_eq!(read, source.len());
         assert_eq!(dst, source);
+
+        Ok(())
+    }
+
+    /// A page the guest wrote and the host later discarded reads back as zeros,
+    /// while an address that is no longer mapped fails the read. The pause
+    /// relies on that distinction: zeros mean "absent, record a zero segment"
+    /// and an error must abort instead of becoming a zero page.
+    #[tokio::test]
+    async fn discarded_page_reads_as_zero_and_unmapped_address_fails() -> Result<()> {
+        let page = 4096usize;
+        let mapping = unsafe {
+            mmap_anonymous(
+                None,
+                NonZeroUsize::new(page).unwrap(),
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE,
+            )?
+        };
+        let addr = mapping.cast::<u8>().as_ptr();
+        unsafe { std::ptr::write_bytes(addr, 0xAB, page) };
+
+        let reader = ProcessVmReader::new(Pid::this());
+        let mut buf = vec![0u8; page];
+        reader.read_at_into(addr as u64, &mut buf).await?;
+        assert!(
+            buf.iter().all(|&byte| byte == 0xAB),
+            "written page must read back its bytes"
+        );
+
+        unsafe { madvise(mapping, page, MmapAdvise::MADV_DONTNEED)? };
+        buf.fill(0xCD);
+        reader.read_at_into(addr as u64, &mut buf).await?;
+        assert!(
+            buf.iter().all(|&byte| byte == 0),
+            "a page the host discarded must read back as zeros"
+        );
+
+        unsafe { munmap(mapping, page)? };
+        let err = reader
+            .read_at(addr as u64, page)
+            .await
+            .expect_err("reading an unmapped address must fail, never return zeros");
+        assert!(
+            err.to_string().contains("process_vm_readv"),
+            "unexpected error: {err:#}"
+        );
 
         Ok(())
     }

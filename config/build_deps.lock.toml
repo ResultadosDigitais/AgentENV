@@ -1,0 +1,54 @@
+# Build-time dependency reserve (OPSAI-6696).
+#
+# The scheduler and gateway images must not download from GitHub releases at
+# build time: on 2026-11-09 anonymous and authenticated requests alike returned
+# HTTP 504 and the build failed. The files below are staged once into the OCI
+# image published by deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml, and
+# deploy/docker/Dockerfile.scheduler consumes it with
+# `COPY --from=<image>@<digest>`, so the bytes are immutable and every build
+# re-checks each sha256.
+#
+# Only linux/amd64 is published; the fork images run on amd64.
+#
+# To renew a pin: update the entry here and the matching x86_64 pin in
+# config/deps_manifest.toml, run the Cloud Build documented in
+# deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml, then commit the digest
+# it prints as image_digest. scripts/tests/verify-build-deps-pins.sh fails while
+# image_digest is still the zero placeholder, and the scheduler image build
+# fails closed instead of falling back to GitHub releases.
+
+image_repository = "us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps"
+image_tag = "v0.4.46-1.15.1-patch-v1"
+# Digest printed by the reserve build 89dd65d1 on 2026-11-11. The scheduler
+# Dockerfile pins the same value as BUILD_DEPS_DIGEST.
+image_digest = "sha256:8f2131306de394ab21b5ff9b2a519251dddee0718a28ed0587c64f3774fbcbdd"
+
+# grpc_health_probe v0.4.46, amd64. Same digest the scheduler Dockerfile
+# verified before the reserve existed.
+[[file]]
+name = "grpc_health_probe"
+dest = "grpc_health_probe"
+version = "v0.4.46"
+platform = "linux/amd64"
+url = "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.46/grpc_health_probe-linux-amd64"
+sha256 = "da81f8e285c7fc6002ed2dc33725494b9451abc6506352b789003903b6753af2"
+
+# Firecracker 1.15.1-patch-v1 release tarball, x86_64. The digest is the tarball
+# digest pinned in config/deps_manifest.toml [firecracker.kvm].
+[[file]]
+name = "firecracker"
+dest = "firecracker"
+version = "1.15.1-patch-v1"
+platform = "linux/amd64"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-1.15.1-patch-v1-x86_64.tgz"
+sha256 = "ac69af73ba5300332a9914397c8e81bdc6764711b5c190e6b8d748578bbae96b"
+
+# Kernel vmlinux-6.1.175, x86_64. The digest is the kernel digest pinned in
+# config/deps_manifest.toml [kernel.kvm].
+[[file]]
+name = "kernel"
+dest = "vmlinux"
+version = "vmlinux-6.1.175"
+platform = "linux/amd64"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/vmlinux-6.1.175-x86_64"
+sha256 = "cd7c5a06a2026a2d8a0cddf60b41a5d76a6ac025e54439eb3ee5c9e57a60c67b"

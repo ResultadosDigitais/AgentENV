@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 pub(crate) mod image;
 pub(crate) mod network;
+mod paused_artifact_reap;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::Config;
 pub use image::{
@@ -11,6 +13,7 @@ pub use image::{
 };
 pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
+pub use paused_artifact_reap::PausedArtifactReapMode;
 use serde::Deserialize;
 
 use crate::virtualization::VirtualizationMode;
@@ -106,6 +109,10 @@ pub struct AppConfig {
     #[config(nested)]
     pub machine: MachineConfig,
     #[config(nested)]
+    pub memory_containment: MemoryContainmentConfig,
+    #[config(nested)]
+    pub resize: ResizeConfig,
+    #[config(nested)]
     pub backend: BackendConfig,
     #[config(nested)]
     pub envd: EnvdConfig,
@@ -147,6 +154,7 @@ pub struct AppConfig {
 pub struct BackendConfig {
     pub posix_fs: Option<PosixFsBackendConfig>,
     pub oss: Option<OssBackendConfig>,
+    pub gcs: Option<GcsBackendConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -219,6 +227,12 @@ pub struct FirecrackerProcessPoolConfig {
     pub startup_prewarm: bool,
     #[config(default = 4usize)]
     pub fill_concurrency: usize,
+    /// Seconds without pool acquisitions before the geometric fill target
+    /// decays back to the low watermark and excess warm processes are drained.
+    /// 0 disables decay and keeps the fill target ratcheted for the process
+    /// lifetime.
+    #[config(default = 600u64)]
+    pub idle_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +329,66 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     #[config(nested)]
     pub disk_rate_limit: DiskRateLimitConfig,
+    #[config(nested)]
+    pub balloon: BalloonConfig,
+}
+
+/// The virtio-balloon device a VM gets when it first boots (cold starts and
+/// template builds). A VM restored from a snapshot keeps the device the
+/// snapshot was taken with, so changes here reach existing templates only
+/// after they are rebuilt.
+#[derive(Debug, Config, Clone)]
+pub struct BalloonConfig {
+    /// Let the guest take balloon memory back under memory pressure. `true`
+    /// makes a memory limit below the VM shape advisory; `false` enforces it,
+    /// so a guest that outgrows the limit OOM-kills inside it.
+    #[config(default = true)]
+    pub deflate_on_oom: bool,
+    /// Balloon statistics polling interval in seconds; `0` disables them.
+    /// Without statistics the resources API cannot report how much memory
+    /// the balloon actually holds.
+    #[config(default = 0u32)]
+    pub stats_polling_interval_s: u32,
+}
+
+/// One cgroup v2 domain per microVM, so memory pressure on a node throttles or
+/// kills a single VM instead of evicting the runtime pod that holds all of
+/// them.
+#[derive(Debug, Config, Clone)]
+pub struct MemoryContainmentConfig {
+    /// Move every VMM into its own cgroup v2 domain with `memory.max` equal to
+    /// the VM shape and `memory.high` below it. Needs a delegated cgroup v2
+    /// hierarchy where the container may create domain sub-cgroups; startup
+    /// logs the reason and continues without containment when it is not.
+    #[config(default = false)]
+    pub enabled: bool,
+    /// `memory.high` as a fraction of `memory.max`, strictly between 0 and 1.
+    /// Required when `enabled` is true: the fraction has to be measured on the
+    /// node, so there is deliberately no default.
+    pub memory_high_ratio: Option<f64>,
+}
+
+/// Per-sandbox resources inside the VM shape: `cpuCount`/`memoryMB` on
+/// snapshot-based creates and live resize through
+/// `PATCH /sandboxes/{sandboxID}/resources`.
+#[derive(Debug, Config, Clone)]
+pub struct ResizeConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Enforce CPU limits below the VM shape with a cgroup v2 `cpu.max` quota
+    /// on each VMM process. Needs a writable, delegated cgroup v2 hierarchy
+    /// with the `cpu` controller; without one, only memory can be resized.
+    #[config(default = true)]
+    pub cpu_quota: bool,
+    /// Smallest effective guest memory in MiB a sandbox may be given.
+    #[config(default = 512u32)]
+    pub min_memory_mib: u32,
+    /// Reject a resize that grows a sandbox when the CPUs allocated to the
+    /// node's running sandboxes would exceed this percentage of its CPUs.
+    pub max_cpu_allocated_percent: Option<u32>,
+    /// Reject a resize that grows a sandbox when the memory allocated to the
+    /// node's running sandboxes would exceed this percentage of its memory.
+    pub max_memory_allocated_percent: Option<u32>,
 }
 
 #[derive(Debug, Config, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -361,6 +435,44 @@ pub struct SnapshotConfig {
     pub publish_compression: SnapshotPublishCompressionConfig,
     #[config(nested)]
     pub memory_startup_pack: SnapshotStartupPackConfig,
+    #[config(nested)]
+    pub managed_layer_collect: SnapshotManagedLayerCollectConfig,
+}
+
+/// Collecting managed layers that no record cites.
+///
+/// The pass deletes content-addressed layers, and a layer cannot be recreated
+/// without its origin, so it is off unless an operator turns it on and runs a
+/// report first.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotManagedLayerCollectConfig {
+    /// Whether the admin collection endpoint runs at all. Disabled, it answers
+    /// 409 and sweeps nothing.
+    #[config(default = false, env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED")]
+    pub enabled: bool,
+    /// How old an uncited layer must be before enforce may delete it. This
+    /// covers one publication, which uploads its layers before it writes the
+    /// record that cites them: a layer uploaded moments ago and not cited yet
+    /// belongs to a publication in flight. Measured on staging from a golden's
+    /// first layer upload to its record commit; see
+    /// `docs/src/internals/persistence-artifact-inventory.md`.
+    #[config(
+        default = 7200u64,
+        env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS"
+    )]
+    pub grace_secs: u64,
+    /// Base URL of the cluster gateway, used to list the sandboxes of every
+    /// node. The collector must keep a layer cited when a sandbox paused on
+    /// *another* node still reads it, and a node can only see its own
+    /// sandboxes, so the pass reads the gateway's aggregated list.
+    ///
+    /// Unset, the pass cannot prove which layers the other nodes use: enforce is
+    /// refused and only a report runs.
+    #[config(
+        env = "AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL",
+        parse_env = parse_trimmed_string
+    )]
+    pub gateway_url: Option<String>,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -452,6 +564,37 @@ pub struct OssBackendConfig {
     pub cache_max_size_gb: Option<u64>,
 }
 
+/// Google Cloud Storage snapshot repository. Exactly one way to authenticate
+/// must be chosen: `credential_path`, `allow_anonymous`, or the explicit
+/// opt-in `allow_application_default_credentials`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GcsBackendConfig {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    /// Credential JSON file: a service-account key, or an `external_account`
+    /// (Workload Identity Federation) configuration. A file that is missing or
+    /// unparsable fails requests; it never falls back to another source.
+    #[serde(alias = "credentialPath", alias = "credential-path")]
+    pub credential_path: Option<String>,
+    /// API endpoint override for emulators such as fake-gcs-server. Unset
+    /// selects `https://storage.googleapis.com`.
+    pub endpoint: Option<String>,
+    /// Send unauthenticated requests: emulators and public buckets only.
+    #[serde(default, alias = "allowAnonymous", alias = "allow-anonymous")]
+    pub allow_anonymous: bool,
+    /// Resolve Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`,
+    /// the gcloud well-known file, then the metadata server. Off by default
+    /// because the metadata server hands its identity to everything that
+    /// shares the host's or pod's network.
+    #[serde(
+        default,
+        alias = "allowApplicationDefaultCredentials",
+        alias = "allow-application-default-credentials"
+    )]
+    pub allow_application_default_credentials: bool,
+    pub cache_max_size_gb: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotImageStoragePolicy {
@@ -465,6 +608,7 @@ pub enum SnapshotImageStoragePolicy {
 pub enum SnapshotRepositoryBackendKind {
     PosixFs,
     Oss,
+    Gcs,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -533,6 +677,11 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
+    /// After a memory snapshot layer is sealed, sync it and drop its page cache
+    /// (`posix_fadvise(DONTNEED)`) so the snapshot write does not stay in the
+    /// runtime pod's working set. Off keeps today's behavior.
+    #[config(default = false)]
+    pub drop_page_cache_after_write: bool,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -633,6 +782,14 @@ pub struct NodeIdentityConfig {
     pub cluster_id: Option<String>,
     #[config(env = "AENV_SERVICE_INSTANCE_ID")]
     pub service_instance_id: Option<String>,
+    /// Named node pool reported in the scheduler heartbeat. Empty means the
+    /// node is shared: it only receives sandboxes that did not ask for a pool.
+    #[config(
+        default = "",
+        env = "AENV_NODE_POOL",
+        parse_env = parse_trimmed_string
+    )]
+    pub pool: String,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -654,6 +811,60 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
+
+    /// Ceiling, in bytes, for the reclaimable part of the paused artifact chain
+    /// of a single sandbox: its runtime-owned overlaybd generations plus the
+    /// layer each pause appends. The image-derived stable prefix is reported by
+    /// the rejection but never charged, because every sandbox of an image points
+    /// at the same node-local files. A pause whose reclaimable part would push
+    /// past this value compacts the runtime-owned suffix into one complete
+    /// generation (and reclaims unreferenced files from stale generations). `0`
+    /// disables both the ceiling and the reclaim sweep. PROVISIONAL default:
+    /// 48 GiB comes from the OPSAI-5494 staging measurement of 29/10/2026; the
+    /// node-by-node rollout re-measures compaction wall clock and may adjust it.
+    #[config(default = 51539607552u64, env = "AENV_CHAIN_BYTES_CEILING")]
+    pub chain_bytes_ceiling: u64,
+
+    /// Multiple of the guest rootfs disk that bounds the whole deduplicated
+    /// rootfs chain of a single sandbox — its immutable stable prefix plus its
+    /// runtime-owned generations. The absolute `chain_bytes_ceiling` above only
+    /// judges the reclaimable part; this relative bound is the invariant that
+    /// keeps one sandbox's rootfs chain from growing past a small, measured
+    /// multiple of the disk it reports to the guest. A pause over the bound
+    /// compacts the runtime-owned suffix and refuses recoverably only when the
+    /// whole chain is still above it. `0` disables the bound. Default `2`: two
+    /// times the disk is the mathematical floor for admitting a fully allocated
+    /// disk, because the immutable prefix and one complete generation can each
+    /// approach the disk size.
+    #[config(default = 2u32, env = "AENV_ROOTFS_CHAIN_DISK_MULTIPLE")]
+    pub rootfs_chain_disk_multiple: u32,
+
+    /// Paused-artifact sweep kill switch; see [`PausedArtifactReapMode`].
+    #[config(default = "off", env = "AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP")]
+    pub paused_artifact_reap: PausedArtifactReapMode,
+
+    /// How many paused-chain compactions the maintenance worker may run at the
+    /// same time on this node. A pause that finds the budget full compacts
+    /// inline instead of queueing more work, so this is a hard ceiling and never
+    /// a kill switch: the boot refuses `0`. PROVISIONAL default `1`: the
+    /// 13/11/2026 measurement rewrote 12 GiB per pause on a 32 GiB VM and a
+    /// compaction needs its inputs and its output on disk at once, so one
+    /// in-flight rewrite per node is what the measured headroom sustains.
+    #[config(default = 1usize, env = "AENV_DEFERRED_COMPACTION_MAX_CONCURRENT")]
+    pub deferred_compaction_max_concurrent: usize,
+
+    /// Transient bytes of deferred compactions this node may have pending
+    /// (queued plus in flight). A pause whose compaction would cross it compacts
+    /// inline. The boot refuses `0`. PROVISIONAL default 103079215104 (96 GiB):
+    /// two times the shipped 48 GiB `chain_bytes_ceiling` — one compaction's
+    /// output in flight plus one queued behind it — derived from the same
+    /// OPSAI-5494 measurement. `compaction_transient_bytes` bounds each entry by
+    /// the device's virtual size and its inputs' allocated bytes.
+    #[config(
+        default = 103079215104u64,
+        env = "AENV_DEFERRED_COMPACTION_PENDING_BYTES_BUDGET"
+    )]
+    pub deferred_compaction_pending_bytes_budget: u64,
 }
 
 /// Custom extension service integration.
@@ -727,6 +938,8 @@ impl_config_default!(
     SandboxConfig,
     VolumeConfig,
     MachineConfig,
+    BalloonConfig,
+    ResizeConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
     SnapshotPublishCompressionConfig,
@@ -883,6 +1096,9 @@ impl AppConfig {
             high_watermark: self.pool.high_watermark,
             maintenance_enabled: pool.enabled && pool.maintenance_enabled,
             startup_prewarm: pool.startup_prewarm,
+            // The network slot pool holds no processes; keep its historical
+            // ratchet behavior without idle decay.
+            idle_ttl: None,
         }
     }
 
@@ -900,6 +1116,7 @@ impl AppConfig {
             // reusable device shape is image/size dependent.
             maintenance_enabled: false,
             startup_prewarm: pool.startup_prewarm,
+            idle_ttl: None,
         })
     }
 
@@ -916,6 +1133,7 @@ impl AppConfig {
                 high_watermark: self.pool.high_watermark,
                 maintenance_enabled: pool.maintenance_enabled,
                 startup_prewarm: pool.startup_prewarm,
+                idle_ttl: (pool.idle_ttl_secs > 0).then(|| Duration::from_secs(pool.idle_ttl_secs)),
             },
             fill_concurrency: pool.fill_concurrency,
         })
@@ -1031,6 +1249,7 @@ impl AppConfig {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }
         self.validate_memory_snapshot_options()?;
+        self.validate_memory_containment()?;
         if self.ublk.overlaybd.remote_io_workers == 0 {
             bail!("invalid ublk.overlaybd config: remote_io_workers must be > 0");
         }
@@ -1039,6 +1258,25 @@ impl AppConfig {
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
+        self.validate_deferred_compaction()?;
+        Ok(())
+    }
+
+    /// The deferred-compaction knobs are parameters, never switches: `0` in
+    /// either one would silently turn the deferral off, so the boot refuses it.
+    fn validate_deferred_compaction(&self) -> Result<()> {
+        if self.orchestrator.deferred_compaction_max_concurrent == 0 {
+            bail!(
+                "orchestrator.deferred_compaction_max_concurrent must be greater than 0; \
+                 the pause must always have a concurrency budget"
+            );
+        }
+        if self.orchestrator.deferred_compaction_pending_bytes_budget == 0 {
+            bail!(
+                "orchestrator.deferred_compaction_pending_bytes_budget must be greater than 0; \
+                 a zero budget would silently disable deferred compaction"
+            );
+        }
         Ok(())
     }
 
@@ -1137,6 +1375,25 @@ impl AppConfig {
         if self.virtualization_mode == VirtualizationMode::Pvm {
             bail!(
                 "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
+            );
+        }
+        Ok(())
+    }
+
+    /// The per-VM `memory.high` fraction is measured per node, so enabling
+    /// containment without it would force the code to invent a number.
+    fn validate_memory_containment(&self) -> Result<()> {
+        let containment = &self.memory_containment;
+        if !containment.enabled {
+            return Ok(());
+        }
+        let ratio = containment.memory_high_ratio.context(
+            "memory_containment.enabled requires memory_containment.memory_high_ratio \
+             (0 < ratio < 1), measured on the node",
+        )?;
+        if !(ratio.is_finite() && ratio > 0.0 && ratio < 1.0) {
+            bail!(
+                "memory_containment.memory_high_ratio must be strictly between 0 and 1, got {ratio}"
             );
         }
         Ok(())
@@ -1719,6 +1976,37 @@ mod tests {
     }
 
     #[test]
+    fn validate_memory_containment_requires_a_measured_ratio() {
+        let mut config = AppConfig {
+            memory_containment: MemoryContainmentConfig {
+                enabled: true,
+                memory_high_ratio: None,
+            },
+            ..Default::default()
+        };
+        assert!(config.validate_memory_containment().is_err());
+
+        for invalid in [0.0, 1.0, -0.5, 1.5, f64::NAN, f64::INFINITY] {
+            config.memory_containment.memory_high_ratio = Some(invalid);
+            assert!(
+                config.validate_memory_containment().is_err(),
+                "ratio {invalid} must be rejected"
+            );
+        }
+
+        config.memory_containment.memory_high_ratio = Some(0.9);
+        config
+            .validate_memory_containment()
+            .expect("a measured ratio in (0, 1) is valid");
+
+        config.memory_containment.enabled = false;
+        config.memory_containment.memory_high_ratio = None;
+        config
+            .validate_memory_containment()
+            .expect("disabled containment needs no ratio");
+    }
+
+    #[test]
     fn validate_rejects_zero_memory_snapshot_download_concurrency() {
         let mut config = AppConfig::default();
         config.memory_snapshot.background_download.concurrency = 0;
@@ -1911,6 +2199,245 @@ mod tests {
             config.resolved_overlaybd_oci_converter_id(),
             "overlaybd-oci:test-version:agentenv-cache-v1"
         );
+    }
+
+    /// `chain_bytes_ceiling` is bound to its own env var, ships the provisional
+    /// 48 GiB default, and accepts `0` as the documented disabled value.
+    #[test]
+    fn chain_bytes_ceiling_default_env_binding_and_disabled_value() -> Result<()> {
+        fn find_leaf(
+            meta: &confique::meta::Meta,
+            prefix: &str,
+            wanted: &str,
+        ) -> Option<(Option<&'static str>, Option<confique::meta::Expr>)> {
+            for field in meta.fields {
+                let path = if prefix.is_empty() {
+                    field.name.to_string()
+                } else {
+                    format!("{prefix}.{}", field.name)
+                };
+                match field.kind {
+                    confique::meta::FieldKind::Leaf { env, kind } => {
+                        if path == wanted {
+                            let default = match kind {
+                                confique::meta::LeafKind::Required { default } => default,
+                                confique::meta::LeafKind::Optional => None,
+                            };
+                            return Some((env, default));
+                        }
+                    }
+                    confique::meta::FieldKind::Nested { meta } => {
+                        if let Some(found) = find_leaf(meta, &path, wanted) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let (env, default) = find_leaf(&AppConfig::META, "", "orchestrator.chain_bytes_ceiling")
+            .expect("orchestrator.chain_bytes_ceiling must exist in the schema");
+        assert_eq!(
+            env,
+            Some("AENV_CHAIN_BYTES_CEILING"),
+            "the knob must be overridable by its own documented env var"
+        );
+        assert_eq!(
+            default,
+            Some(confique::meta::Expr::Integer(confique::meta::Integer::U64(
+                48 * 1024 * 1024 * 1024
+            ))),
+            "the default must be the provisional 48 GiB ceiling in bytes"
+        );
+
+        // The shipped config file carries the same value, so a node reading
+        // `config/default.toml` and a node relying on the schema default agree.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert_eq!(
+            config.config().orchestrator.chain_bytes_ceiling,
+            48 * 1024 * 1024 * 1024
+        );
+
+        // `0` is a legal value: it is the kill switch, not a validation error.
+        let temp = tempdir()?;
+        let disabled_path = temp.path().join("disabled.toml");
+        std::fs::write(&disabled_path, "[orchestrator]\nchain_bytes_ceiling = 0\n")?;
+        let disabled = ConfigManager::new_from_path(&disabled_path)?;
+        assert_eq!(disabled.config().orchestrator.chain_bytes_ceiling, 0);
+        Ok(())
+    }
+
+    /// The two deferred-compaction knobs ship the provisional defaults, are
+    /// overridable by their own env vars, and refuse `0` at boot.
+    #[test]
+    fn deferred_compaction_parameters_ship_their_defaults_and_refuse_zero() -> Result<()> {
+        use confique::meta::{Expr, FieldKind, Integer, LeafKind};
+
+        fn find_leaf(
+            meta: &confique::meta::Meta,
+            prefix: &str,
+            wanted: &str,
+        ) -> Option<(Option<&'static str>, Option<Expr>)> {
+            for field in meta.fields {
+                let path = if prefix.is_empty() {
+                    field.name.to_string()
+                } else {
+                    format!("{prefix}.{}", field.name)
+                };
+                match field.kind {
+                    FieldKind::Leaf { env, kind } => {
+                        if path == wanted {
+                            let default = match kind {
+                                LeafKind::Required { default } => default,
+                                LeafKind::Optional => None,
+                            };
+                            return Some((env, default));
+                        }
+                    }
+                    FieldKind::Nested { meta } => {
+                        if let Some(found) = find_leaf(meta, &path, wanted) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let (env, default) = find_leaf(
+            &AppConfig::META,
+            "",
+            "orchestrator.deferred_compaction_max_concurrent",
+        )
+        .expect("orchestrator.deferred_compaction_max_concurrent must exist");
+        assert_eq!(env, Some("AENV_DEFERRED_COMPACTION_MAX_CONCURRENT"));
+        assert_eq!(
+            default,
+            Some(Expr::Integer(Integer::Usize(1))),
+            "the provisional concurrency default is one compaction per node"
+        );
+
+        let (env, default) = find_leaf(
+            &AppConfig::META,
+            "",
+            "orchestrator.deferred_compaction_pending_bytes_budget",
+        )
+        .expect("orchestrator.deferred_compaction_pending_bytes_budget must exist");
+        assert_eq!(env, Some("AENV_DEFERRED_COMPACTION_PENDING_BYTES_BUDGET"));
+        assert_eq!(
+            default,
+            Some(Expr::Integer(Integer::U64(103_079_215_104))),
+            "the provisional budget is two times the shipped 48 GiB ceiling"
+        );
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shipped = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        let orchestrator = &shipped.config().orchestrator;
+        assert_eq!(orchestrator.deferred_compaction_max_concurrent, 1);
+        assert_eq!(
+            orchestrator.deferred_compaction_pending_bytes_budget,
+            103_079_215_104
+        );
+
+        // A parameter, never a kill switch: both zero values are refused.
+        let temp = tempdir()?;
+        for (key, value) in [
+            ("deferred_compaction_max_concurrent", "0"),
+            ("deferred_compaction_pending_bytes_budget", "0"),
+        ] {
+            let path = temp.path().join(format!("{key}.toml"));
+            std::fs::write(&path, format!("[orchestrator]\n{key} = {value}\n"))?;
+            assert!(
+                ConfigManager::new_from_path(&path).is_err(),
+                "{key} = {value} must be refused at boot"
+            );
+        }
+        Ok(())
+    }
+
+    /// `rootfs_chain_disk_multiple` is bound to its own env var, ships the
+    /// measured default of 2, and accepts `0` as the documented kill switch.
+    #[test]
+    fn rootfs_chain_disk_multiple_default_env_binding_and_disabled_value() -> Result<()> {
+        fn find_leaf(
+            meta: &confique::meta::Meta,
+            prefix: &str,
+            wanted: &str,
+        ) -> Option<(Option<&'static str>, Option<confique::meta::Expr>)> {
+            for field in meta.fields {
+                let path = if prefix.is_empty() {
+                    field.name.to_string()
+                } else {
+                    format!("{prefix}.{}", field.name)
+                };
+                match field.kind {
+                    confique::meta::FieldKind::Leaf { env, kind } => {
+                        if path == wanted {
+                            let default = match kind {
+                                confique::meta::LeafKind::Required { default } => default,
+                                confique::meta::LeafKind::Optional => None,
+                            };
+                            return Some((env, default));
+                        }
+                    }
+                    confique::meta::FieldKind::Nested { meta } => {
+                        if let Some(found) = find_leaf(meta, &path, wanted) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let (env, default) = find_leaf(
+            &AppConfig::META,
+            "",
+            "orchestrator.rootfs_chain_disk_multiple",
+        )
+        .expect("orchestrator.rootfs_chain_disk_multiple must exist in the schema");
+        assert_eq!(
+            env,
+            Some("AENV_ROOTFS_CHAIN_DISK_MULTIPLE"),
+            "the knob must be overridable by its own documented env var"
+        );
+        assert!(
+            default.is_some(),
+            "the schema must carry a default, not require the knob"
+        );
+
+        // The schema default and the shipped config file must agree.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shipped = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert_eq!(
+            shipped.config().orchestrator.rootfs_chain_disk_multiple,
+            2,
+            "the measured default multiple is 2"
+        );
+        let temp = tempdir()?;
+        let schema_path = temp.path().join("schema-default.toml");
+        std::fs::write(&schema_path, "[orchestrator]\n")?;
+        let schema_default = ConfigManager::new_from_path(&schema_path)?;
+        assert_eq!(
+            schema_default
+                .config()
+                .orchestrator
+                .rootfs_chain_disk_multiple,
+            2,
+            "the schema default must be the measured multiple"
+        );
+
+        // `0` is a legal value: it is the kill switch, not a validation error.
+        let disabled_path = temp.path().join("disabled-multiple.toml");
+        std::fs::write(
+            &disabled_path,
+            "[orchestrator]\nrootfs_chain_disk_multiple = 0\n",
+        )?;
+        let disabled = ConfigManager::new_from_path(&disabled_path)?;
+        assert_eq!(disabled.config().orchestrator.rootfs_chain_disk_multiple, 0);
+        Ok(())
     }
 
     #[test]

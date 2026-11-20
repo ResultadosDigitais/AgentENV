@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agentenv-scheduler-node-capacity
+rules:
+  # Read-only: the admission rule reads status.allocatable.memory from the
+  # cluster-scoped Node. No secrets and no write verbs.
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch

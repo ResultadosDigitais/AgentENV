@@ -37,6 +37,20 @@ var (
 		},
 		[]string{"strategy"},
 	)
+	schedulerAdmissionShadow = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_admission_shadow_total",
+			Help: "Per-node memory admission comparisons in shadow mode by outcome (agree, request_would_reject, request_would_admit).",
+		},
+		[]string{"outcome"},
+	)
+	schedulerDiskAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_disk_admission_total",
+			Help: "Per-node disk admission outcomes by outcome (within_limit, over_limit, mount_missing). Counted once per node with a heartbeat.",
+		},
+		[]string{"outcome"},
+	)
 	schedulerObservedNodes = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "agentenv_scheduler_observed_nodes",
@@ -44,7 +58,77 @@ var (
 		},
 		[]string{"status"},
 	)
+	schedulerCapacitySource = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_capacity_source_total",
+			Help: "Per-node admission memory base by source (allocatable, total). Counted once per node per admission evaluation.",
+		},
+		[]string{"source"},
+	)
+	schedulerNodeAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_node_admission_total",
+			Help: "Published per-layer admission verdicts by layer, admitted and reason (none when admitted).",
+		},
+		[]string{"layer", "admitted", "reason"},
+	)
+	schedulerResumeAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_resume_admission_total",
+			Help: "Resume admission outcomes by outcome (owner, moved, deferred, disabled, error).",
+		},
+		[]string{"outcome"},
+	)
+	schedulerAdmissionReservation = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_admission_reservation_total",
+			Help: "Admission reservations by outcome (reserved, confirmed, settled, released, expired).",
+		},
+		[]string{"outcome"},
+	)
+	schedulerShapeAdmission = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_shape_admission_total",
+			Help: "Shape admission verdicts by kind (create, resume), outcome (admit, would_reject, would_reject_all, would_defer, would_move, unknown_shape) and reason.",
+		},
+		[]string{"kind", "outcome", "reason"},
+	)
 )
+
+// Shape admission kinds, outcomes and reasons. The closed sets keep the
+// metric label cardinality bounded and make every consumer switch exhaustive.
+const (
+	shapeKindCreate = "create"
+	shapeKindResume = "resume"
+
+	shapeOutcomeAdmit          = "admit"
+	shapeOutcomeWouldReject    = "would_reject"
+	shapeOutcomeWouldRejectAll = "would_reject_all"
+	shapeOutcomeWouldDefer     = "would_defer"
+	shapeOutcomeWouldMove      = "would_move"
+	shapeOutcomeUnknownShape   = "unknown_shape"
+
+	shapeReasonNone                 = "none"
+	shapeReasonUnknownShape         = "unknown_shape"
+	shapeReasonUnknownTemplateShape = "unknown_template_shape"
+)
+
+func recordShapeAdmission(kind, outcome, reason string) {
+	if reason == "" {
+		reason = shapeReasonNone
+	}
+	schedulerShapeAdmission.WithLabelValues(kind, outcome, reason).Inc()
+}
+
+func recordAdmissionReservation(outcome string) {
+	schedulerAdmissionReservation.WithLabelValues(outcome).Inc()
+}
+
+func recordAdmissionReservationCount(outcome string, count int) {
+	if count > 0 {
+		schedulerAdmissionReservation.WithLabelValues(outcome).Add(float64(count))
+	}
+}
 
 func MetricsUnaryInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -109,6 +193,10 @@ func schedulerRPCLabel(fullMethod string) string {
 		return "GetNode"
 	case "UnregisterNode":
 		return "UnregisterNode"
+	case "ScheduleResume":
+		return "ScheduleResume"
+	case "SettleAdmission":
+		return "SettleAdmission"
 	default:
 		return ""
 	}
@@ -120,6 +208,8 @@ func schedulerStrategyLabel(strategy string) string {
 		return "round_robin"
 	case "random":
 		return "random"
+	case "least_loaded":
+		return "least_loaded"
 	default:
 		return "unknown"
 	}

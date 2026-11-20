@@ -387,6 +387,7 @@ impl ObservabilityReporter {
             service_instance_id: snapshot.service_instance_id,
             version: snapshot.version,
             commit: snapshot.commit,
+            pool: snapshot.pool,
             machine_info: Some(scheduler::MachineInfo {
                 cpu_family: snapshot.machine_info.cpu_family,
                 cpu_model: snapshot.machine_info.cpu_model,
@@ -401,6 +402,7 @@ impl ObservabilityReporter {
                 cpu_percent: snapshot.metrics.cpu_percent,
                 cpu_count: snapshot.metrics.cpu_count,
                 memory_used_bytes: snapshot.metrics.memory_used_bytes,
+                memory_working_set_bytes: snapshot.metrics.memory_working_set_bytes,
                 memory_total_bytes: snapshot.metrics.memory_total_bytes,
                 disks: snapshot
                     .metrics
@@ -422,6 +424,7 @@ impl ObservabilityReporter {
                 paused_sandbox_count: snapshot.paused_sandbox_count,
                 paused_allocated_cpu: snapshot.metrics.paused_allocated_cpu,
                 paused_allocated_memory_bytes: snapshot.metrics.paused_allocated_memory_bytes,
+                requested_memory_bytes: snapshot.metrics.requested_memory_bytes,
             }),
             sandbox_ids: snapshot
                 .sandbox_ids
@@ -432,6 +435,15 @@ impl ObservabilityReporter {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
             }),
+            paused_sandboxes: snapshot
+                .paused_sandboxes
+                .into_iter()
+                .map(|paused| scheduler::PausedSandboxResources {
+                    sandbox_id: paused.sandbox_id.to_string(),
+                    cpu_count: paused.cpu_count,
+                    memory_bytes: paused.memory_bytes,
+                })
+                .collect(),
         }
     }
 
@@ -598,5 +610,160 @@ mod tests {
             !err.is::<HeartbeatNodeNotConfigured>(),
             "generic errors must not be mistaken for HeartbeatNodeNotConfigured"
         );
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_maps_paused_sandbox_shapes() {
+        let sandbox_id = crate::types::SandboxId::new();
+        let snapshot = crate::observability::NodeSnapshot {
+            version: "0.2.4".to_string(),
+            commit: "abc123".to_string(),
+            node_id: "node-a".to_string(),
+            service_instance_id: "svc-a".to_string(),
+            cluster_id: uuid::Uuid::new_v4(),
+            pool: "spot".to_string(),
+            machine_info: crate::observability::MachineInfo {
+                cpu_family: "6".to_string(),
+                cpu_model: "158".to_string(),
+                cpu_model_name: "Intel".to_string(),
+                cpu_architecture: "x86_64".to_string(),
+                cpu_config_json: None,
+            },
+            sandbox_count: 0,
+            sandbox_ids: vec![sandbox_id],
+            metrics: crate::observability::NodeMetricsSnapshot {
+                allocated_cpu: 0,
+                allocated_memory_bytes: 0,
+                requested_memory_bytes: 0,
+                cpu_percent: 0,
+                cpu_count: 8,
+                memory_used_bytes: 0,
+                memory_working_set_bytes: None,
+                memory_total_bytes: 128 * 1024 * 1024 * 1024,
+                disks: Vec::new(),
+                paused_allocated_cpu: 4,
+                paused_allocated_memory_bytes: 16 * 1024 * 1024 * 1024,
+            },
+            create_successes: 0,
+            create_fails: 0,
+            sandbox_starting_count: 0,
+            paused_sandbox_count: 1,
+            paused_sandboxes: vec![crate::observability::PausedSandboxResources {
+                sandbox_id,
+                cpu_count: 4,
+                memory_bytes: 16 * 1024 * 1024 * 1024,
+            }],
+        };
+
+        let req = ObservabilityReporter::build_heartbeat_request(snapshot, 123, None);
+        assert_eq!(req.pool, "spot");
+        assert_eq!(req.paused_sandboxes.len(), 1);
+        assert_eq!(req.paused_sandboxes[0].sandbox_id, sandbox_id.to_string());
+        assert_eq!(req.paused_sandboxes[0].cpu_count, 4);
+        assert_eq!(
+            req.paused_sandboxes[0].memory_bytes,
+            16 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_keeps_paused_list_empty_when_none() {
+        let snapshot = crate::observability::NodeSnapshot {
+            version: String::new(),
+            commit: String::new(),
+            node_id: "node-a".to_string(),
+            service_instance_id: "svc-a".to_string(),
+            cluster_id: uuid::Uuid::new_v4(),
+            pool: String::new(),
+            machine_info: crate::observability::MachineInfo {
+                cpu_family: String::new(),
+                cpu_model: String::new(),
+                cpu_model_name: String::new(),
+                cpu_architecture: String::new(),
+                cpu_config_json: None,
+            },
+            sandbox_count: 0,
+            sandbox_ids: Vec::new(),
+            metrics: crate::observability::NodeMetricsSnapshot {
+                allocated_cpu: 0,
+                allocated_memory_bytes: 0,
+                requested_memory_bytes: 0,
+                cpu_percent: 0,
+                cpu_count: 0,
+                memory_used_bytes: 0,
+                memory_working_set_bytes: None,
+                memory_total_bytes: 0,
+                disks: Vec::new(),
+                paused_allocated_cpu: 0,
+                paused_allocated_memory_bytes: 0,
+            },
+            create_successes: 0,
+            create_fails: 0,
+            sandbox_starting_count: 0,
+            paused_sandbox_count: 0,
+            paused_sandboxes: Vec::new(),
+        };
+
+        let req = ObservabilityReporter::build_heartbeat_request(snapshot, 0, None);
+        assert!(req.paused_sandboxes.is_empty());
+    }
+
+    fn snapshot_with_memory(working_set: Option<u64>) -> crate::observability::NodeSnapshot {
+        crate::observability::NodeSnapshot {
+            version: String::new(),
+            commit: String::new(),
+            node_id: "node-a".to_string(),
+            service_instance_id: "svc-a".to_string(),
+            cluster_id: uuid::Uuid::new_v4(),
+            pool: String::new(),
+            machine_info: crate::observability::MachineInfo {
+                cpu_family: String::new(),
+                cpu_model: String::new(),
+                cpu_model_name: String::new(),
+                cpu_architecture: String::new(),
+                cpu_config_json: None,
+            },
+            sandbox_count: 0,
+            sandbox_ids: Vec::new(),
+            metrics: crate::observability::NodeMetricsSnapshot {
+                allocated_cpu: 0,
+                allocated_memory_bytes: 0,
+                requested_memory_bytes: 0,
+                cpu_percent: 0,
+                cpu_count: 0,
+                memory_used_bytes: 250000,
+                memory_working_set_bytes: working_set,
+                memory_total_bytes: 1000000,
+                disks: Vec::new(),
+                paused_allocated_cpu: 0,
+                paused_allocated_memory_bytes: 0,
+            },
+            create_successes: 0,
+            create_fails: 0,
+            sandbox_starting_count: 0,
+            paused_sandbox_count: 0,
+            paused_sandboxes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_carries_working_set_next_to_raw_used() {
+        let req = ObservabilityReporter::build_heartbeat_request(
+            snapshot_with_memory(Some(200000)),
+            0,
+            None,
+        );
+        let snapshot = req.snapshot.expect("snapshot");
+        assert_eq!(snapshot.memory_used_bytes, 250000);
+        assert_eq!(snapshot.memory_working_set_bytes, Some(200000));
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_leaves_unknown_working_set_absent() {
+        let req =
+            ObservabilityReporter::build_heartbeat_request(snapshot_with_memory(None), 0, None);
+        let snapshot = req.snapshot.expect("snapshot");
+        assert_eq!(snapshot.memory_used_bytes, 250000);
+        assert_eq!(snapshot.memory_working_set_bytes, None);
     }
 }
