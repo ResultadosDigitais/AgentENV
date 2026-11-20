@@ -7,6 +7,8 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/admission"
+	"agentenv/services/shared/config"
 )
 
 func nodeStatusToString(status schedulerv1.NodeStatus) string {
@@ -57,6 +59,14 @@ type nodeListAdmissionLayer struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// nodeListAdmissionCeilings is the including-paused ceiling pair computed from
+// the node's own reading. The ProductFactory ceiling reader looks for the
+// contract marker before trusting them.
+type nodeListAdmissionCeilings struct {
+	MemoryBytes uint64 `json:"memoryBytes"`
+	CPUCores    uint32 `json:"cpuCores"`
+}
+
 type nodeListAdmission struct {
 	AllocatableMemoryBytes uint64                   `json:"allocatableMemoryBytes"`
 	RuntimeOverheadBytes   uint64                   `json:"runtimeOverheadBytes"`
@@ -65,6 +75,38 @@ type nodeListAdmission struct {
 	ReservedMemoryBytes    uint64                   `json:"reservedMemoryBytes"`
 	ReservedCPU            uint32                   `json:"reservedCPU"`
 	Layers                 []nodeListAdmissionLayer `json:"layers"`
+	// Contract marks the per-node ceiling contract the payload was computed
+	// over, Ceilings carries the pair, and ContractReason names the reason the
+	// pair could not be computed. The marker is published whenever the margin
+	// key is declared; Ceilings and ContractReason are mutually exclusive, so a
+	// reader sees unknown instead of a guessed ceiling, and a reading that has
+	// no figures never looks like the legacy path.
+	Contract       string                     `json:"contract,omitempty"`
+	Ceilings       *nodeListAdmissionCeilings `json:"ceilings,omitempty"`
+	ContractReason string                     `json:"contractReason,omitempty"`
+}
+
+// nodeAdmissionContract derives what /nodes publishes about the per-node
+// ceiling from the same shared leaf the scheduler decides on. With the margin
+// key declared the marker is always published: the ceilings ride it when the
+// node's own reading produces both, and the named reason rides it otherwise,
+// so an unreadable capacity is refused by the reader instead of falling back
+// to the legacy path. Without the margin key the legacy path publishes nothing.
+func nodeAdmissionContract(snapshot *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (string, *nodeListAdmissionCeilings, string) {
+	ceilings, reason := admission.IncludingPausedCeilingsOf(limit, snapshot.GetMemoryTotalBytes(), snapshot.GetCpuCount())
+	if !ceilings.Applied {
+		return "", nil, ""
+	}
+	if reason != "" {
+		return admission.ContractPerNodeCeilingV1, nil, reason
+	}
+	if ceilings.MemoryKnown && ceilings.CPUKnown {
+		return admission.ContractPerNodeCeilingV1, &nodeListAdmissionCeilings{
+			MemoryBytes: ceilings.MemoryBytes,
+			CPUCores:    ceilings.CPUCores,
+		}, ""
+	}
+	return admission.ContractPerNodeCeilingV1, nil, admission.ReasonCapacityUnknown
 }
 
 type nodeListItem struct {
@@ -167,6 +209,22 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			})
 		}
 
+		publishedAdmission := mapNodeAdmission(observed.GetAdmission())
+		// The marker rides the admission object the scheduler already
+		// publishes: it never invents an empty verdict only to carry it.
+		if publishedAdmission != nil {
+			if contract, ceilings, reason := nodeAdmissionContract(snapshot, s.nodeResourceLimit); contract != "" {
+				publishedAdmission.Contract = contract
+				publishedAdmission.Ceilings = ceilings
+				// ContractReason names why the pair could not be computed, so it
+				// is written only when there is one; with known ceilings the
+				// field stays empty instead of carrying an empty reason.
+				if reason != "" {
+					publishedAdmission.ContractReason = reason
+				}
+			}
+		}
+
 		out = append(out, nodeListItem{
 			Version:           observed.GetVersion(),
 			Commit:            observed.GetCommit(),
@@ -182,7 +240,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			},
 			Status:       nodeStatusToString(snapshot.GetStatus()),
 			SandboxCount: snapshot.GetSandboxCount(),
-			Admission:    mapNodeAdmission(observed.GetAdmission()),
+			Admission:    publishedAdmission,
 			Metrics: nodeListMetrics{
 				AllocatedCPU:               snapshot.GetAllocatedCpu(),
 				AllocatedMemoryBytes:       snapshot.GetAllocatedMemoryBytes(),

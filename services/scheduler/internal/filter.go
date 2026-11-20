@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/admission"
 	"agentenv/services/shared/config"
 )
 
@@ -62,17 +63,24 @@ const (
 	limitMaxSandboxCountIncludingPaused    = "max_sandbox_count_including_paused"
 	limitMaxAllocatedCPUIncludingPaused    = "max_allocated_cpu_including_paused"
 	limitMaxAllocatedMemoryIncludingPaused = "max_allocated_memory_bytes_including_paused"
+	limitMaxAllocatedMemoryMargin          = "max_allocated_memory_margin_bytes"
 )
 
 // Admission reason codes. This is a closed set: a published verdict carries
-// one of these five strings or no reason at all. The order below is also the
-// precedence order of the published layer verdict.
+// one of these strings or no reason at all. The order below is also the
+// precedence order of the published layer verdict. capacity_unknown is the
+// named refusal when the per-node ceiling cannot be computed; it is a string,
+// so the published reason needs no proto change.
 const (
 	ReasonMemoryAllocated = "memory_allocated"
 	ReasonMemoryUsed      = "memory_used"
 	ReasonCPU             = "cpu"
 	ReasonStarting        = "starting"
 	ReasonDisk            = "disk"
+	// ReasonCapacityUnknown is the named refusal when the per-node ceiling
+	// cannot be computed from the snapshot (or the configured margin is below
+	// the floor). Shared with the publication so both read the same string.
+	ReasonCapacityUnknown = admission.ReasonCapacityUnknown
 )
 
 // LayerVerdict is the admission decision for one VM shape on one node.
@@ -145,9 +153,9 @@ func EvaluateShapeAdmission(n RichNode, memoryBytes uint64, cpuCount uint32, lim
 		return true, ""
 	}
 	capacity, _ := capacityMemoryBytes(n.Snapshot, n.Capacity, limit)
-	if capacity == 0 {
-		return true, ""
-	}
+	// capacityViolation decides the zero-capacity case: it keeps the historical
+	// fail-open on the legacy path and refuses by name once the per-node
+	// ceiling is declared.
 	reason := capacityViolation(projectSnapshotForShape(n.Snapshot, memoryBytes, cpuCount), limit, capacity)
 	return reason == "", reason
 }
@@ -161,11 +169,8 @@ func EvaluateLayerAdmission(n RichNode, layer config.AdmissionLayer, limit *conf
 		return verdict
 	}
 	capacity, _ := capacityMemoryBytes(n.Snapshot, n.Capacity, limit)
-	if capacity == 0 {
-		// No memory base to evaluate: keep the historical fail-open for a
-		// node that never reported memory.
-		return verdict
-	}
+	// No memory base keeps the historical fail-open unless the per-node
+	// ceiling is declared, in which case capacityViolation refuses by name.
 	if reason := capacityViolation(projectSnapshotForLayer(n.Snapshot, layer), limit, capacity); reason != "" {
 		verdict.Admitted = false
 		verdict.Reason = reason
@@ -195,7 +200,18 @@ func EvaluateNodeAdmission(n RichNode, limit *config.NodeResourceLimit) []LayerV
 // against an already-projected snapshot. It returns an empty string when the
 // shape is admitted.
 func capacityViolation(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit, capacity uint64) string {
-	if limit == nil || s == nil || capacity == 0 {
+	if limit == nil || s == nil {
+		return ""
+	}
+	// The per-node including-paused ceilings are the only rule that can decide
+	// from an unreadable snapshot: refuse by name instead of failing open.
+	ceilings, ceilingReason := admission.IncludingPausedCeilingsOf(limit, s.GetMemoryTotalBytes(), s.GetCpuCount())
+	if ceilingReason != "" {
+		return ceilingReason
+	}
+	// Without a memory base the historical fail-open stays, unless the margin
+	// key is declared and the ceilings above were computed.
+	if capacity == 0 && !ceilings.Applied {
 		return ""
 	}
 	if _, _, over := memoryAllocatedCheck(s, limit, capacity, s.GetAllocatedMemoryBytes()); over {
@@ -216,6 +232,24 @@ func capacityViolation(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLi
 	if limit.MaxDiskUsedPercent != nil {
 		if _, _, evaluated, over := diskUsage(s, limit); evaluated && over {
 			return ReasonDisk
+		}
+	}
+	// The including-paused ceilings sit last in the published order so the
+	// projection of a create sees the paused reservations too (today the
+	// projection only reads the active set). Only the per-node contract adds
+	// them here; the legacy path keeps the preview exactly as it was.
+	if ceilings.Applied {
+		if ceilings.CPUKnown {
+			total := s.GetAllocatedCpu() + s.GetPausedAllocatedCpu()
+			if total > ceilings.CPUCores {
+				return ReasonCPU
+			}
+		}
+		if ceilings.MemoryKnown {
+			total := s.GetAllocatedMemoryBytes() + s.GetPausedAllocatedMemoryBytes()
+			if total > ceilings.MemoryBytes {
+				return ReasonMemoryAllocated
+			}
 		}
 	}
 	return ""
@@ -422,16 +456,28 @@ func limitViolated(n RichNode, limit *config.NodeResourceLimit) (LimitViolation,
 			return numericViolation(limitMaxSandboxCountIncludingPaused, uint64(total), uint64(*limit.MaxSandboxCountIncludingPaused)), true
 		}
 	}
-	if limit.MaxAllocatedCPUIncludingPaused != nil {
+	// The CPU and memory ceilings come from the one shared leaf: with the
+	// margin key absent it returns the declared caps unchanged (the historical
+	// comparison), and with it present it returns the per-node ceiling. An
+	// unreadable capacity after activation refuses the node by name instead of
+	// letting it be placed.
+	ceilings, ceilingReason := admission.IncludingPausedCeilingsOf(limit, s.GetMemoryTotalBytes(), s.GetCpuCount())
+	if ceilingReason != "" {
+		return LimitViolation{
+			Limit:  limitMaxAllocatedMemoryMargin,
+			Detail: "reason=" + ceilingReason,
+		}, true
+	}
+	if ceilings.CPUKnown {
 		total := s.GetAllocatedCpu() + s.GetPausedAllocatedCpu()
-		if total > *limit.MaxAllocatedCPUIncludingPaused {
-			return numericViolation(limitMaxAllocatedCPUIncludingPaused, uint64(total), uint64(*limit.MaxAllocatedCPUIncludingPaused)), true
+		if total > ceilings.CPUCores {
+			return numericViolation(limitMaxAllocatedCPUIncludingPaused, uint64(total), uint64(ceilings.CPUCores)), true
 		}
 	}
-	if limit.MaxAllocatedMemoryBytesIncludingPaused != nil {
+	if ceilings.MemoryKnown {
 		total := s.GetAllocatedMemoryBytes() + s.GetPausedAllocatedMemoryBytes()
-		if total > *limit.MaxAllocatedMemoryBytesIncludingPaused {
-			return numericViolation(limitMaxAllocatedMemoryIncludingPaused, total, *limit.MaxAllocatedMemoryBytesIncludingPaused), true
+		if total > ceilings.MemoryBytes {
+			return numericViolation(limitMaxAllocatedMemoryIncludingPaused, total, ceilings.MemoryBytes), true
 		}
 	}
 	return LimitViolation{}, false
