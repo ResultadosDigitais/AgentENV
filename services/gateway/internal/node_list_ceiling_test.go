@@ -85,6 +85,11 @@ func TestNodeListPublishesNodeCeilingContract(t *testing.T) {
 	if got := ceilings["cpuCores"]; got != float64(28) {
 		t.Fatalf("ceilings.cpuCores = %v", got)
 	}
+	// A known ceiling pair carries no reason: the field is written only when
+	// the pair could not be computed.
+	if _, ok := admissionObject["contractReason"]; ok {
+		t.Fatalf("contractReason must be absent when the ceilings are known: %v", admissionObject)
+	}
 }
 
 // Without the margin key the payload keeps the historical shape: no contract

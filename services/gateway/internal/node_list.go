@@ -216,7 +216,12 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			if contract, ceilings, reason := nodeAdmissionContract(snapshot, s.nodeResourceLimit); contract != "" {
 				publishedAdmission.Contract = contract
 				publishedAdmission.Ceilings = ceilings
-				publishedAdmission.ContractReason = reason
+				// ContractReason names why the pair could not be computed, so it
+				// is written only when there is one; with known ceilings the
+				// field stays empty instead of carrying an empty reason.
+				if reason != "" {
+					publishedAdmission.ContractReason = reason
+				}
 			}
 		}
 
