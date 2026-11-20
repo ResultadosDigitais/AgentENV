@@ -1,0 +1,93 @@
+{
+  "provenance": "OPSAI-6922 plan rev7 p-1 (monorepo PR #10521, merge b2207815) — scripts/__tests__/fixtures/agentenv-admission-ceiling-vectors.json. Values transcribed from the approved plan and the 19/11/2026 node reading quoted on the card; the monorepo file itself was not readable from this sandbox, so no number here was re-measured or invented.",
+  "marginBytes": 8589934592,
+  "minMarginBytes": 8589934592,
+  "maxCpuAllocatedPercent": 200,
+  "legacyMemoryCapBytes": 121332826112,
+  "legacyCpuCapCores": 32,
+  "vectors": [
+    {
+      "name": "measured-node-19-11-112.62gib-14vcpu",
+      "detail": "The 19/11 reading on the card: 120925978624 bytes (115324 MiB, the same figure the runtime pod reports) and 14 vCPUs. The 8 GiB margin leaves 107132 MiB, and 14 x 200% floors at 28 cores.",
+      "memoryTotalBytes": 120925978624,
+      "cpuCount": 14,
+      "wantMemoryCeilingBytes": 112336044032,
+      "wantCpuCeilingCores": 28
+    },
+    {
+      "name": "n2-highmem-16-125.8gib-16vcpu",
+      "detail": "128819 MiB (125.8 GiB) and 16 vCPUs from the 05/11 measurement used by filter_capacity_test.go; 117.8 GiB and 32 cores.",
+      "memoryTotalBytes": 135076511744,
+      "cpuCount": 16,
+      "wantMemoryCeilingBytes": 126486577152,
+      "wantCpuCeilingCores": 32
+    },
+    {
+      "name": "same-node-altered-reading-118gib",
+      "detail": "The same size of node reporting 118 GiB must follow the altered reading: 110 GiB.",
+      "memoryTotalBytes": 126701535232,
+      "cpuCount": 16,
+      "wantMemoryCeilingBytes": 118111600640,
+      "wantCpuCeilingCores": 32
+    },
+    {
+      "name": "total-below-margin-floors-at-zero",
+      "detail": "A total smaller than the margin produces a zero ceiling, never a negative one.",
+      "memoryTotalBytes": 4294967296,
+      "cpuCount": 16,
+      "wantMemoryCeilingBytes": 0,
+      "wantCpuCeilingCores": 32
+    },
+    {
+      "name": "absent-memory-total-is-capacity-unknown",
+      "detail": "The margin key is declared and the snapshot carries no memory total: capacity_unknown, never legacy and never a fail-open.",
+      "memoryTotalBytes": 0,
+      "cpuCount": 16,
+      "wantReason": "capacity_unknown"
+    },
+    {
+      "name": "absent-cpu-count-is-capacity-unknown",
+      "detail": "The margin key is declared and the snapshot carries no CPU count: capacity_unknown.",
+      "memoryTotalBytes": 135076511744,
+      "cpuCount": 0,
+      "wantReason": "capacity_unknown"
+    },
+    {
+      "name": "margin-below-floor-is-refused",
+      "detail": "A margin below 8 GiB is a floor, not a preference: the leaf refuses it with capacity_unknown.",
+      "memoryTotalBytes": 135076511744,
+      "cpuCount": 16,
+      "marginBytes": 4294967296,
+      "wantReason": "capacity_unknown"
+    },
+    {
+      "name": "legacy-cap-squeezes-the-large-node",
+      "detail": "121332826112 bytes (113 GiB) enters only as min: it squeezes the 117.8 GiB ceiling of the 125.8 GiB node down to 113 GiB.",
+      "memoryTotalBytes": 135076511744,
+      "cpuCount": 16,
+      "applyLegacyCaps": true,
+      "wantMemoryCeilingBytes": 121332826112,
+      "wantCpuCeilingCores": 32
+    },
+    {
+      "name": "legacy-cap-is-inert-on-the-measured-node",
+      "detail": "The same 113 GiB cap never raises the 104.62 GiB ceiling of the measured node.",
+      "memoryTotalBytes": 120925978624,
+      "cpuCount": 14,
+      "applyLegacyCaps": true,
+      "wantMemoryCeilingBytes": 112336044032,
+      "wantCpuCeilingCores": 28
+    },
+    {
+      "name": "contract-absent-negative-control",
+      "detail": "Negative control for accidental activation: with the margin key absent the leaf stays on the legacy path, Applied is false and the declared caps behave as today.",
+      "memoryTotalBytes": 120925978624,
+      "cpuCount": 14,
+      "marginAbsent": true,
+      "applyLegacyCaps": true,
+      "wantApplied": false,
+      "wantMemoryCeilingBytes": 121332826112,
+      "wantCpuCeilingCores": 32
+    }
+  ]
+}

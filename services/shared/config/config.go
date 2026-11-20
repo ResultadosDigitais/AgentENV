@@ -85,6 +85,14 @@ type NodeResourceLimit struct {
 	MaxAllocatedCPUIncludingPaused         *uint32 `json:"max_allocated_cpu_including_paused"`
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
 
+	// MaxAllocatedMemoryMarginBytes turns the including-paused memory ceiling
+	// into a per-node one: the ceiling becomes min(declared cap, if any;
+	// memory_total_bytes - margin), recomputed from the node's own reading at
+	// admission time. Absent (the default) preserves the historical behaviour
+	// byte for byte and is the rollback path. A margin below 8 GiB is refused
+	// by the ceiling leaf, not honoured.
+	MaxAllocatedMemoryMarginBytes *uint64 `json:"max_allocated_memory_margin_bytes"`
+
 	// AdmissionLayers are the VM shapes whose admission is published per node
 	// by the scheduler and read by the gateway's /nodes response. When absent
 	// the default layers (8, 16, 32 and 64 GiB) apply. CPUCount is optional:
