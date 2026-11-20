@@ -73,7 +73,7 @@ func (f ceilingFixtures) limitFor(vector ceilingVector) *config.NodeResourceLimi
 
 func ceilingNode(vector ceilingVector) RichNode {
 	return RichNode{
-		Node:     Node{ID: vector.Name},
+		Node: Node{ID: vector.Name},
 		Snapshot: &schedulerv1.NodeSnapshot{
 			MemoryTotalBytes: vector.MemoryTotalBytes,
 			CpuCount:         vector.CPUCount,
@@ -171,14 +171,14 @@ func TestNodeCeilingLegacyPathIsUnchanged(t *testing.T) {
 	node := memNode("legacy", 100*gib, 30*gib, 0, 0)
 	node.Snapshot.CpuCount = 8
 	node.Snapshot.PausedAllocatedMemoryBytes = 21 * gib // 51 GiB including paused > 50 GiB
-	node.Snapshot.PausedAllocatedCpu = 1               // 1 core including paused <= 4
+	node.Snapshot.PausedAllocatedCpu = 1                // 1 core including paused <= 4
 
 	if got := FilterByResourceLimit([]RichNode{node}, limit); len(got) != 0 {
 		t.Fatalf("legacy declared cap must still reject, got %v", got)
 	}
 
 	node.Snapshot.PausedAllocatedMemoryBytes = 20 * gib // exactly 50 GiB
-	node.Snapshot.AllocatedCpu = 4                     // 5 cores including paused > 4
+	node.Snapshot.AllocatedCpu = 4                      // 5 cores including paused > 4
 	if got := FilterByResourceLimit([]RichNode{node}, limit); len(got) != 0 {
 		t.Fatalf("legacy declared cpu cap must still reject, got %v", got)
 	}
