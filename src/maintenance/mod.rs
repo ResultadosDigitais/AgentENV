@@ -25,6 +25,7 @@ pub use live_sandboxes::{
 pub use managed_layers::{
     collect_managed_layers, LiveSandboxes, ManagedLayerCollectFailure, ManagedLayerCollectMode,
     ManagedLayerCollectReport, ManagedLayerCollectRequest, ManagedLayerCollectorError,
+    REPORT_RECEIPT_TTL,
 };
 pub use paused_artifacts::{
     sweep, ArtifactSweepFailure, ArtifactSweepReport, ArtifactVerdict, KeepReason, LocalSandbox,

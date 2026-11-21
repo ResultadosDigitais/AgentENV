@@ -26,6 +26,14 @@ pub enum DocumentKey {
     ImageTag(ImageTag),
     /// The record of one imageOnly build.
     ImageBuild(SnapshotId),
+    /// One managed-layer collection report receipt, named by the opaque token
+    /// the report returned.
+    ///
+    /// It lives outside `managed-layers/` on purpose: a collection pass that
+    /// listed its own receipt as a layer would count it unreadable and could
+    /// never run a clean enforce again. The token is only ever produced by
+    /// `uuid::Uuid::parse_str`, so a key can never escape this prefix.
+    ManagedLayerCollectReceipt(String),
 }
 
 /// A validated `sha256:<hex>` image digest. Only [`DocumentKey::image`]
@@ -54,6 +62,9 @@ impl DocumentKey {
             Self::Image(digest) => format!("{IMAGES_PREFIX}{}.json", digest.0),
             Self::ImageTag(tag) => format!("{}{}.json", image_tags_prefix(tag.name()), tag.tag()),
             Self::ImageBuild(id) => format!("{IMAGE_BUILDS_PREFIX}{id}.json"),
+            Self::ManagedLayerCollectReceipt(token) => {
+                format!("{MANAGED_LAYER_COLLECT_RECEIPTS_PREFIX}{token}.json")
+            }
         }
     }
 
@@ -80,7 +91,9 @@ impl DocumentKey {
             Self::Image(digest) => format!("{IMAGES_PREFIX}{}.lock", digest.0),
             Self::ImageTag(tag) => format!("{}{}.lock", image_tags_prefix(tag.name()), tag.tag()),
             Self::ImageBuild(id) => format!("{IMAGE_BUILDS_PREFIX}{id}.lock"),
-            Self::BuildLog(_) => format!("{}.lock", self.path()),
+            Self::BuildLog(_) | Self::ManagedLayerCollectReceipt(_) => {
+                format!("{}.lock", self.path())
+            }
         }
     }
 }
@@ -114,6 +127,7 @@ const IMAGES_PREFIX: &str = "images/descriptions/";
 const IMAGE_TAGS_PREFIX: &str = "images/tags/";
 const IMAGE_BUILDS_PREFIX: &str = "images/builds/";
 const SNAPSHOT_RECORDS_PREFIX: &str = "catalog/records/";
+const MANAGED_LAYER_COLLECT_RECEIPTS_PREFIX: &str = "maintenance/managed-layer-collect/receipts/";
 
 /// Documents that are listed together, in ID order.
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +136,8 @@ pub enum DocumentCollection {
     SnapshotRecords,
     /// Every published image description, named by its digest.
     ImageDescriptions,
+    /// Every managed-layer collection report receipt, named by its token.
+    ManagedLayerCollectReceipts,
 }
 
 impl DocumentCollection {
@@ -131,6 +147,7 @@ impl DocumentCollection {
             Self::VolumeRecords => VOLUME_RECORDS_PREFIX,
             Self::SnapshotRecords => SNAPSHOT_RECORDS_PREFIX,
             Self::ImageDescriptions => IMAGES_PREFIX,
+            Self::ManagedLayerCollectReceipts => MANAGED_LAYER_COLLECT_RECEIPTS_PREFIX,
         }
     }
 
@@ -141,15 +158,19 @@ impl DocumentCollection {
             Self::VolumeRecords => Some(DocumentKey::VolumeRecord(id.to_owned())),
             Self::SnapshotRecords => SnapshotId::parse(id).ok().map(DocumentKey::SnapshotRecord),
             Self::ImageDescriptions => DocumentKey::image(id).ok(),
+            Self::ManagedLayerCollectReceipts => {
+                Some(DocumentKey::ManagedLayerCollectReceipt(id.to_owned()))
+            }
         }
     }
 
     /// Extracts the ID from a file name under [`Self::prefix`].
     pub(crate) fn id_from_file_name(self, file_name: &str) -> Option<&str> {
         match self {
-            Self::VolumeRecords | Self::SnapshotRecords | Self::ImageDescriptions => {
-                file_name.strip_suffix(".json")
-            }
+            Self::VolumeRecords
+            | Self::SnapshotRecords
+            | Self::ImageDescriptions
+            | Self::ManagedLayerCollectReceipts => file_name.strip_suffix(".json"),
         }
     }
 }

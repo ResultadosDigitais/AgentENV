@@ -3730,6 +3730,12 @@ pub struct ManagedLayerCollectReport {
     #[serde(rename = "reclaimedBytes")]
     pub reclaimed_bytes: u64,
 
+    /// The opaque token a report pass leaves for exactly one enforce pass. Present only on a report that persisted its receipt. It is a secret: never log it, and never store it anywhere but its own receipt.
+    #[serde(rename = "reportToken")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_token: Option<String>,
+
     /// Present when the pass counted but deleted nothing even in enforce mode, naming why. A live sandbox whose source left the catalog downgrades the pass.
     #[serde(rename = "downgradedReason")]
     #[validate(custom(function = "check_xss_string"))]
@@ -3768,6 +3774,7 @@ impl ManagedLayerCollectReport {
             unknown_layers,
             deleted_layers,
             reclaimed_bytes,
+            report_token: None,
             downgraded_reason: None,
             failures: None,
         }
@@ -3799,6 +3806,9 @@ impl std::fmt::Display for ManagedLayerCollectReport {
             Some(self.deleted_layers.to_string()),
             Some("reclaimedBytes".to_string()),
             Some(self.reclaimed_bytes.to_string()),
+            self.report_token.as_ref().map(|report_token| {
+                ["reportToken".to_string(), report_token.to_string()].join(",")
+            }),
             self.downgraded_reason.as_ref().map(|downgraded_reason| {
                 [
                     "downgradedReason".to_string(),
@@ -3838,6 +3848,7 @@ impl std::str::FromStr for ManagedLayerCollectReport {
             pub unknown_layers: Vec<u64>,
             pub deleted_layers: Vec<u64>,
             pub reclaimed_bytes: Vec<u64>,
+            pub report_token: Vec<String>,
             pub downgraded_reason: Vec<String>,
             pub failures: Vec<Vec<models::ManagedLayerCollectFailure>>,
         }
@@ -3881,6 +3892,8 @@ impl std::str::FromStr for ManagedLayerCollectReport {
                     "deletedLayers" => intermediate_rep.deleted_layers.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     #[allow(clippy::redundant_clone)]
                     "reclaimedBytes" => intermediate_rep.reclaimed_bytes.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "reportToken" => intermediate_rep.report_token.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     #[allow(clippy::redundant_clone)]
                     "downgradedReason" => intermediate_rep.downgraded_reason.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     "failures" => return std::result::Result::Err("Parsing a container in this style is not supported in ManagedLayerCollectReport".to_string()),
@@ -3948,6 +3961,7 @@ impl std::str::FromStr for ManagedLayerCollectReport {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "reclaimedBytes missing in ManagedLayerCollectReport".to_string())?,
+            report_token: intermediate_rep.report_token.into_iter().next(),
             downgraded_reason: intermediate_rep.downgraded_reason.into_iter().next(),
             failures: intermediate_rep.failures.into_iter().next(),
         })
@@ -4008,6 +4022,12 @@ pub struct ManagedLayerCollectRequest {
     #[validate(range(min = 0u64))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grace_seconds: Option<u64>,
+
+    /// The opaque token the report pass of the same sweep returned. An enforce requires it and consumes the receipt it names, so one report authorizes exactly one enforce; the report pass ignores it. The receipt lives in the repository, outside `managed-layers/`, and expires after a short window. It is a secret: never log it.
+    #[serde(rename = "reportToken")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_token: Option<String>,
 }
 
 impl ManagedLayerCollectRequest {
@@ -4016,6 +4036,7 @@ impl ManagedLayerCollectRequest {
         ManagedLayerCollectRequest {
             mode,
             grace_seconds: None,
+            report_token: None,
         }
     }
 }
@@ -4029,6 +4050,9 @@ impl std::fmt::Display for ManagedLayerCollectRequest {
             // Skipping mode in query parameter serialization
             self.grace_seconds.as_ref().map(|grace_seconds| {
                 ["graceSeconds".to_string(), grace_seconds.to_string()].join(",")
+            }),
+            self.report_token.as_ref().map(|report_token| {
+                ["reportToken".to_string(), report_token.to_string()].join(",")
             }),
         ];
 
@@ -4053,6 +4077,7 @@ impl std::str::FromStr for ManagedLayerCollectRequest {
         struct IntermediateRep {
             pub mode: Vec<models::ManagedLayerCollectMode>,
             pub grace_seconds: Vec<u64>,
+            pub report_token: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4083,6 +4108,10 @@ impl std::str::FromStr for ManagedLayerCollectRequest {
                     "graceSeconds" => intermediate_rep.grace_seconds.push(
                         <u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "reportToken" => intermediate_rep.report_token.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing ManagedLayerCollectRequest".to_string(),
@@ -4103,6 +4132,7 @@ impl std::str::FromStr for ManagedLayerCollectRequest {
                 .next()
                 .ok_or_else(|| "mode missing in ManagedLayerCollectRequest".to_string())?,
             grace_seconds: intermediate_rep.grace_seconds.into_iter().next(),
+            report_token: intermediate_rep.report_token.into_iter().next(),
         })
     }
 }

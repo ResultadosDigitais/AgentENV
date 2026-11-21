@@ -1789,9 +1789,11 @@ components:
       type: string
       enum: [report, enforce]
       description: >-
-        `report` lists and counts without deleting anything; `enforce` deletes
-        the uncited layers older than the grace period. Enforce is refused
-        until a report has run in this server process.
+        `report` lists and counts without deleting anything and returns the
+        `reportToken` an enforce consumes; `enforce` deletes the uncited layers
+        older than the grace period, after accepting the receipt that token
+        names. Enforce is refused without a valid, unexpired, unused receipt
+        from a clean report pass.
 
     ManagedLayerCollectRequest:
       required:
@@ -1807,6 +1809,14 @@ components:
             Overrides the configured grace period for this pass, in seconds. An
             uncited layer younger than this is kept: a publish uploads its
             layers before it writes the record that cites them.
+        reportToken:
+          type: string
+          description: >-
+            The opaque token the report pass of the same sweep returned. An
+            enforce requires it and consumes the receipt it names, so one report
+            authorizes exactly one enforce; the report pass ignores it. The
+            receipt lives in the repository, outside `managed-layers/`, and
+            expires after a short window. It is a secret: never log it.
 
     ManagedLayerCollectReport:
       required:
@@ -1865,6 +1875,12 @@ components:
           type: integer
           format: uint64
           description: Bytes actually removed. Always zero in report mode.
+        reportToken:
+          type: string
+          description: >-
+            The opaque token a report pass leaves for exactly one enforce pass.
+            Present only on a report that persisted its receipt. It is a secret:
+            never log it, and never store it anywhere but its own receipt.
         downgradedReason:
           type: string
           description: >-
@@ -3457,6 +3473,13 @@ paths:
         refuses to run at all while
         `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED` is false.
 
+        A report pass returns a `reportToken` and persists the receipt it names
+        in the repository, outside `managed-layers/`, under the same lock. An
+        enforce pass requires that token, accepts the receipt only while it
+        exists, has not expired and is clean, reclassifies the whole bucket under
+        the lock and consumes the receipt. The two calls may therefore land on
+        different nodes; one report authorizes exactly one enforce.
+
         The citation set is the whole cluster, not this node: the aggregate of
         `GET /v2/sandboxes` on the gateway configured by
         `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL`, because a sandbox
@@ -3490,9 +3513,10 @@ paths:
         "409":
           description: >-
             The pass is disabled on this node, another pass holds the lock,
-            enforce was requested before a report ran in this process, or
-            enforce was requested without a cluster gateway URL to list the
-            sandboxes of every node.
+            enforce was requested without a valid report receipt (missing,
+            unknown, already consumed, expired, or issued by a report that was
+            not clean), or enforce was requested without a cluster gateway URL to
+            list the sandboxes of every node.
           content:
             application/json:
               schema:
