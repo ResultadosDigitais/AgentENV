@@ -8,8 +8,9 @@ mod layout;
 pub use build_cache::{BuildCacheState, BuildCacheStore};
 pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{
-    BlobBody, BlobLocation, DocumentChange, DocumentUpdate, LayerRole, PublishPolicy, Repository,
+    BlobBody, BlobLocation, DocumentChange, DocumentUpdate, LayerRole, MaintenanceLock,
+    ManagedLayerObject, PublishPolicy, Repository, MAINTENANCE_LOCK_STALE_AFTER,
 };
 pub(crate) use layer_config::{managed_layer_config, materialize_volume_backing};
-pub(crate) use layout::is_valid_volume_component;
+pub(crate) use layout::{is_valid_volume_component, maintenance_lock_key};
 pub use layout::{BlobKey, DocumentCollection, DocumentKey, SnapshotFile};

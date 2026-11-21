@@ -205,3 +205,42 @@ func TestBuildScheduleHintColdSandboxOversizedBodyStreams(t *testing.T) {
 		t.Fatalf("restored body length = %d, want %d", len(body), len(reqBody))
 	}
 }
+
+// The pool is a placement directive parsed from the create body and carried on
+// the hint for every create path.
+func TestBuildScheduleHintCarriesPool(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{"sandboxes", "/sandboxes", `{"templateID":"tmpl","pool":"spot"}`},
+		{"v2 sandboxes", "/v2/sandboxes", `{"templateID":"tmpl","pool":"spot"}`},
+		{"cold sandbox", "/sandboxes-cold", `{"image":"ubuntu:24.04","pool":"spot"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newHintRequest(t, http.MethodPost, tc.path, tc.body)
+			hint, err := buildScheduleHint(r)
+			if err != nil {
+				t.Fatalf("buildScheduleHint returned error: %v", err)
+			}
+			if got := hint.GetPool(); got != "spot" {
+				t.Fatalf("pool = %q, want spot", got)
+			}
+		})
+	}
+}
+
+// A create that omits the pool keeps the empty pool, which only matches the
+// shared nodes.
+func TestBuildScheduleHintWithoutPoolKeepsEmpty(t *testing.T) {
+	r := newHintRequest(t, http.MethodPost, "/sandboxes", `{"templateID":"tmpl"}`)
+	hint, err := buildScheduleHint(r)
+	if err != nil {
+		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if got := hint.GetPool(); got != "" {
+		t.Fatalf("pool = %q, want empty", got)
+	}
+}

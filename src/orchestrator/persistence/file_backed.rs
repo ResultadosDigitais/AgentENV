@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -9,7 +11,10 @@ use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use super::{
+    PausedArtifactCandidate, PersistenceResult, SandboxPersistenceError, SandboxPersister,
+};
+use crate::cfg::ConfigManager;
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
@@ -18,6 +23,145 @@ use crate::virtualization::VirtualizationMode;
 
 const RECORD_VERSION: u32 = 1;
 const RECORD_DB_DIR: &str = "records.db";
+/// Allocation unit reported by `st_blocks`, matching the chain measurement in
+/// `sandbox::firecracker::overlaybd_snapshot`.
+const ALLOCATION_BLOCK_SIZE: u64 = 512;
+
+/// The directory, inside the artifacts root, that holds a generation boot found
+/// without a record.
+///
+/// It is crate-visible so the reaper and the boot path cannot drift on the
+/// name: the boot path writes here and the reaper must skip and expire exactly
+/// this directory.
+pub(crate) const QUARANTINE_DIR: &str = ".quarantine";
+
+/// How long a quarantined generation is kept before the reaper may delete it.
+///
+/// A constant, not a config key, for the same reason as `ARTIFACT_GRACE` and
+/// `TRASH_GRACE`: an operator turning enforce on is the explicit decision, and
+/// the window only has to outlive the longest investigation that could still
+/// find the record. It is enforced by the reaper in enforce mode only; the boot
+/// path never deletes.
+pub(crate) const QUARANTINE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Graceful-shutdown state, handed to a persister instead of read from a
+/// process-wide static.
+///
+/// While it is set, `persist_paused` stops reclaiming bytes from stale
+/// generations: shutdown persists every running sandbox as `Paused` and the
+/// machine is about to stop, so reclaiming there can only slow the shutdown
+/// down and risks deleting an artifact a not-yet-persisted sandbox still needs
+/// paths to.
+///
+/// It is injected because a process-wide read makes one holder's shutdown
+/// silently change the behavior of every other persister in the process - and
+/// `cargo test` runs the tests of one binary in parallel threads. Production
+/// keeps exactly one handle for the process ([`process_shutdown_signal`],
+/// set by [`begin_graceful_shutdown`]); each test builds its own.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ShutdownSignal {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ShutdownSignal {
+    /// A signal that starts out not shut down.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enter graceful shutdown. Idempotent; a real shutdown never leaves it.
+    pub(crate) fn begin(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The one shutdown handle production shares: the orchestrator starts the
+/// shutdown and every persister built by [`FileBackedSandboxPersister::new`]
+/// observes it.
+static PROCESS_SHUTDOWN: std::sync::OnceLock<ShutdownSignal> = std::sync::OnceLock::new();
+
+fn process_shutdown_signal() -> ShutdownSignal {
+    PROCESS_SHUTDOWN.get_or_init(ShutdownSignal::new).clone()
+}
+
+/// Mark the process as being in graceful shutdown, so `persist_paused` stops
+/// reclaiming bytes from stale generations.
+pub(crate) fn begin_graceful_shutdown() {
+    process_shutdown_signal().begin();
+}
+
+/// What `load_all` decided about one paused record. Every branch of the load
+/// path ends in exactly one of these, so the "nothing was lost" acceptance is a
+/// query over `agentenv_paused_sandbox_load_total` instead of a log read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadOutcome {
+    /// The runtime state decoded here and its artifacts are on this node.
+    LoadedFromLocal,
+    /// The record was readable but this node holds no resumable runtime state
+    /// for it (incompatible virtualization mode). It stays listed as `Paused`
+    /// and its artifacts are kept.
+    RetainedWithoutRuntimeState,
+    /// The artifacts of a sandbox no record on this node names. They are moved
+    /// to `artifacts/.quarantine/{epoch}/` and kept: the record may be on
+    /// another node, lost in an eviction, or never written.
+    QuarantinedNoRecord,
+    /// The record or its artifacts cannot be used by this node. It is deleted.
+    Discarded,
+}
+
+impl LoadOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadedFromLocal => "loaded_from_local",
+            Self::RetainedWithoutRuntimeState => "retained_unreachable",
+            Self::QuarantinedNoRecord => "quarantined_no_record",
+            Self::Discarded => "discarded",
+        }
+    }
+
+    /// Records the outcome. Label values come from this closed set; a sandbox ID
+    /// is never a label value, because its cardinality is unbounded.
+    fn record(self) {
+        metrics::counter!(
+            "agentenv_paused_sandbox_load_total",
+            "outcome" => self.as_str(),
+        )
+        .increment(1);
+    }
+}
+
+/// The per-outcome tally of one `load_all` pass.
+///
+/// One call per decided record keeps the metric and the summary log line from
+/// drifting apart: a branch cannot count without also emitting.
+#[derive(Default)]
+struct LoadOutcomes {
+    loaded_from_local: usize,
+    retained_unreachable: usize,
+    quarantined: usize,
+    discarded: usize,
+    /// Generations the boot path could not move to quarantine. They stay where
+    /// they are, so this is a warning field, never a loss: nothing is deleted
+    /// on that branch.
+    quarantine_failed: usize,
+}
+
+impl LoadOutcomes {
+    fn observe(&mut self, outcome: LoadOutcome) {
+        outcome.record();
+        match outcome {
+            LoadOutcome::LoadedFromLocal => self.loaded_from_local += 1,
+            LoadOutcome::RetainedWithoutRuntimeState => self.retained_unreachable += 1,
+            LoadOutcome::QuarantinedNoRecord => self.quarantined += 1,
+            LoadOutcome::Discarded => self.discarded += 1,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,22 +181,28 @@ struct PersistedPausedRecord {
 }
 
 impl PersistedPausedRecord {
-    fn into_metadata<F>(mut self, factory: &F) -> PersistenceResult<SandboxMetadata>
+    /// Metadata for this record with its runtime state decoded by `factory`.
+    ///
+    /// Borrows the record so a decode failure can still fall back to
+    /// [`Self::into_metadata_without_runtime_state`]: the failure may mean the
+    /// artifacts live on another node, not that the record is junk.
+    fn decode_runtime_metadata<F>(&self, factory: &F) -> PersistenceResult<SandboxMetadata>
     where
         F: SandboxBackendFactory,
     {
         ensure_supported_version(self.version)?;
 
         let paused_state = factory
-            .decode_paused_state(self.artifact_root, self.state)
+            .decode_paused_state(self.artifact_root.clone(), self.state.clone())
             .map_err(|source| SandboxPersistenceError::InvalidRecord {
                 reason: "failed to decode paused sandbox state".to_string(),
                 source: Some(source),
             })?;
-        self.metadata.state = SandboxState::Paused;
-        self.metadata.paused_state = Some(paused_state);
+        let mut metadata = self.metadata.clone();
+        metadata.state = SandboxState::Paused;
+        metadata.paused_state = Some(paused_state);
 
-        Ok(self.metadata)
+        Ok(metadata)
     }
 
     fn into_metadata_without_runtime_state(mut self) -> SandboxMetadata {
@@ -72,6 +222,46 @@ fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
     Ok(record)
 }
 
+/// Every string in `value` that names a paused image config.
+///
+/// The deferred worker needs the directory of each config (`mem_image.json`,
+/// `rootfs/image.json`, a drive's or volume's `image.json`) because the work
+/// order lives beside it, and a volume's directory sits outside the artifact
+/// root. Scanning the encoded state for those names keeps the worker free of
+/// backend-specific field knowledge: the record is the single source of which
+/// configs a generation has.
+fn image_config_paths(value: &Value) -> Vec<PathBuf> {
+    fn walk(value: &Value, found: &mut Vec<PathBuf>) {
+        match value {
+            Value::String(text) => {
+                let path = Path::new(text);
+                let is_config = matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("image.json") | Some("mem_image.json")
+                );
+                if is_config && !found.iter().any(|existing| existing == path) {
+                    found.push(path.to_path_buf());
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, found);
+                }
+            }
+            Value::Object(fields) => {
+                for item in fields.values() {
+                    walk(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
+    walk(value, &mut found);
+    found
+}
+
 fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
     if version == RECORD_VERSION {
         Ok(())
@@ -87,6 +277,13 @@ pub struct FileBackedSandboxPersister {
     root: PathBuf,
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
+    /// Mirrors `orchestrator.chain_bytes_ceiling`: `0` disables both the ceiling
+    /// and the stale-generation sweep, restoring the unbounded behavior.
+    chain_bytes_ceiling: u64,
+    /// Whether a graceful shutdown is in progress. Injected rather than read
+    /// from a static so a shutdown in one persister cannot change the behavior
+    /// of another persister in the same process.
+    shutdown: ShutdownSignal,
     db: OnceCell<LocalKvStore>,
 }
 
@@ -96,13 +293,20 @@ impl FileBackedSandboxPersister {
             root,
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
+            chain_bytes_ceiling: ConfigManager::global_config()
+                .orchestrator
+                .chain_bytes_ceiling,
+            shutdown: process_shutdown_signal(),
             db: OnceCell::new(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(root: PathBuf) -> Self {
-        Self::new(root, VirtualizationMode::Kvm)
+        // A test gets its own shutdown handle: the process-wide one would make
+        // one test's shutdown change every other test's behavior, since the
+        // tests of one binary run in parallel threads.
+        Self::new(root, VirtualizationMode::Kvm).with_shutdown_signal(ShutdownSignal::new())
     }
 
     pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
@@ -110,16 +314,270 @@ impl FileBackedSandboxPersister {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_chain_bytes_ceiling(mut self, chain_bytes_ceiling: u64) -> Self {
+        self.chain_bytes_ceiling = chain_bytes_ceiling;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_shutdown_signal(mut self, shutdown: ShutdownSignal) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    /// Remove only genuinely unreferenced bytes from generations older than the
+    /// record that just became durable.
+    ///
+    /// Each pause writes a new generation whose files are hardlinks of the
+    /// previous ones, so freeing an old generation's directory releases nothing
+    /// while a newer generation still links its files. What does accumulate is
+    /// the part no retained generation reaches: a file whose every link lives in
+    /// the swept (stale) generation set. Counting a link count of 1 was only the
+    /// single-generation case of that rule; an inode hardlinked between two
+    /// stale generations and no longer referenced by the newest one stayed
+    /// forever because its link count was 2. The first pass therefore counts the
+    /// entries per `(dev, ino)` across the swept set, and a file is deleted only
+    /// when its `nlink` equals that observed count. A larger `nlink` means
+    /// another link lives outside the set — in the newest generation, a fork
+    /// child's directory or a live runtime — so the file is kept. `artifact_root`
+    /// itself is never touched, and neither is a non-regular file.
+    async fn sweep_stale_generations(
+        &self,
+        artifact_root: &Path,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<()> {
+        if self.chain_bytes_ceiling == 0 || self.shutdown.is_shutdown() {
+            return Ok(());
+        }
+        let sandbox_root = self.sandbox_artifact_root(sandbox_id);
+        let mut entries = match fs::read_dir(&sandbox_root).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "scan paused sandbox generations",
+                    &sandbox_root,
+                    source,
+                ));
+            }
+        };
+        let mut stale_generations = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan paused sandbox generations", &sandbox_root, source)
+        })? {
+            let generation = entry.path();
+            if generation == artifact_root {
+                continue;
+            }
+            let file_type = entry.file_type().await.map_err(|source| {
+                SandboxPersistenceError::io(
+                    "inspect paused sandbox generation",
+                    &generation,
+                    source,
+                )
+            })?;
+            if file_type.is_dir() {
+                stale_generations.push(generation);
+            }
+        }
+        if stale_generations.is_empty() {
+            return Ok(());
+        }
+
+        // First pass: how many links each inode has inside the swept set.
+        let mut links_in_swept_set = HashMap::new();
+        for generation in &stale_generations {
+            Self::count_links_in_directory(generation, &mut links_in_swept_set).await?;
+        }
+
+        let mut reclaimed_bytes = 0u64;
+        for generation in &stale_generations {
+            reclaimed_bytes = reclaimed_bytes.saturating_add(
+                Self::sweep_unlinked_files(generation, &mut links_in_swept_set).await?,
+            );
+        }
+        if reclaimed_bytes > 0 {
+            metrics::counter!("agentenv_paused_sandbox_chain_reclaimed_bytes_total")
+                .increment(reclaimed_bytes);
+            debug!(
+                sandbox_id = %sandbox_id,
+                reclaimed_bytes,
+                artifact_root = %artifact_root.display(),
+                "reclaimed unreferenced bytes from stale paused sandbox generations"
+            );
+        }
+        Ok(())
+    }
+
+    /// Count the regular-file entries per `(dev, ino)` under one stale
+    /// generation, so the sweep can tell an inode whose every link is in the
+    /// swept set from one another generation or runtime still reaches.
+    async fn count_links_in_directory(
+        directory: &Path,
+        counts: &mut HashMap<(u64, u64), u64>,
+    ) -> PersistenceResult<()> {
+        let mut entries = match fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "scan stale paused sandbox generation",
+                    directory,
+                    source,
+                ));
+            }
+        };
+        while let Some(entry) = entries.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan stale paused sandbox generation", directory, source)
+        })? {
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "inspect stale paused sandbox artifact",
+                        &path,
+                        source,
+                    ));
+                }
+            };
+            if metadata.is_dir() {
+                Box::pin(Self::count_links_in_directory(&path, counts)).await?;
+            } else if metadata.is_file() {
+                *counts.entry((metadata.dev(), metadata.ino())).or_insert(0) += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete regular files under `generation` whose every link lives in the
+    /// swept set, then remove every directory the deletions left empty, deepest
+    /// first, up to and including `generation` itself. Returns freed bytes.
+    async fn sweep_unlinked_files(
+        generation: &Path,
+        links_in_swept_set: &mut HashMap<(u64, u64), u64>,
+    ) -> PersistenceResult<u64> {
+        let (reclaimed, emptied) = Self::sweep_directory(generation, links_in_swept_set).await?;
+        if emptied {
+            Self::remove_emptied_directory(generation).await?;
+        }
+        Ok(reclaimed)
+    }
+
+    /// Depth-first sweep of one directory: every child is resolved before the
+    /// directory itself, so a parent is only reported empty after its children
+    /// have been removed. Returns freed bytes and whether `directory` ended up
+    /// empty (which the caller turns into a removal).
+    async fn sweep_directory(
+        directory: &Path,
+        links_in_swept_set: &mut HashMap<(u64, u64), u64>,
+    ) -> PersistenceResult<(u64, bool)> {
+        let mut entries = match fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, true)),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "scan stale paused sandbox generation",
+                    directory,
+                    source,
+                ));
+            }
+        };
+        let mut reclaimed = 0u64;
+        let mut emptied = true;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan stale paused sandbox generation", directory, source)
+        })? {
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "inspect stale paused sandbox artifact",
+                        &path,
+                        source,
+                    ));
+                }
+            };
+            if metadata.is_dir() {
+                let (child_reclaimed, child_emptied) =
+                    Box::pin(Self::sweep_directory(&path, links_in_swept_set)).await?;
+                reclaimed = reclaimed.saturating_add(child_reclaimed);
+                if child_emptied {
+                    Self::remove_emptied_directory(&path).await?;
+                } else {
+                    emptied = false;
+                }
+                continue;
+            }
+            // Only regular files whose every link lives in the swept set are
+            // unreferenced. A symlink, socket or device may be something a live
+            // runtime still points at, so it is left alone as well.
+            if !metadata.is_file() {
+                emptied = false;
+                continue;
+            }
+            let inode = (metadata.dev(), metadata.ino());
+            let links_seen = links_in_swept_set.get(&inode).copied().unwrap_or(0);
+            if metadata.nlink() != links_seen {
+                emptied = false;
+                continue;
+            }
+            let allocated = metadata.blocks().saturating_mul(ALLOCATION_BLOCK_SIZE);
+            match fs::remove_file(&path).await {
+                Ok(()) => {
+                    reclaimed = reclaimed.saturating_add(allocated);
+                    // The removal already dropped `nlink` for the sibling links
+                    // this sweep is about to visit; decrement the observed count
+                    // in lockstep so the next stale link is still recognized as
+                    // fully inside the swept set. Without this a second stale
+                    // link would see `nlink == 1` against `links_seen == 2` and
+                    // the inode would never be freed.
+                    if let Some(seen) = links_in_swept_set.get_mut(&inode) {
+                        *seen = seen.saturating_sub(1);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(seen) = links_in_swept_set.get_mut(&inode) {
+                        *seen = seen.saturating_sub(1);
+                    }
+                }
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "remove unreferenced stale paused sandbox artifact",
+                        &path,
+                        source,
+                    ));
+                }
+            }
+        }
+        Ok((reclaimed, emptied))
+    }
+
+    async fn remove_emptied_directory(directory: &Path) -> PersistenceResult<()> {
+        match fs::remove_dir(directory).await {
+            Ok(()) => Ok(()),
+            // A concurrent writer may have re-created an entry between the scan
+            // and the removal; the next pause sweeps again.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            Err(source) => Err(SandboxPersistenceError::io(
+                "remove emptied stale paused sandbox generation",
+                directory,
+                source,
+            )),
+        }
+    }
+
     fn records_db_path(&self) -> PathBuf {
         self.root.join(RECORD_DB_DIR)
     }
 
-    fn artifacts_root(&self) -> PathBuf {
-        self.root.join("artifacts")
-    }
-
     fn sandbox_artifact_root(&self, sandbox_id: &SandboxId) -> PathBuf {
-        self.artifacts_root().join(sandbox_id.to_string())
+        self.root.join("artifacts").join(sandbox_id.to_string())
     }
 
     async fn db(&self) -> PersistenceResult<LocalKvStore> {
@@ -186,6 +644,13 @@ impl FileBackedSandboxPersister {
         }
     }
 
+    /// Drops a record this node can never use: the bytes are not a paused
+    /// record at all, or a resumed record was abandoned mid-flight.
+    ///
+    /// Deliberately *not* used for a record whose runtime state fails to decode:
+    /// that failure is also what a node with missing artifacts looks like, and
+    /// deleting it is the step that turns a pod swap into permanent loss. Such a
+    /// record is retained by [`Self::retain_unusable_record`] instead.
     async fn cleanup_invalid_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "cleaning up invalid paused sandbox record");
         self.remove_record(sandbox_id).await?;
@@ -193,11 +658,50 @@ impl FileBackedSandboxPersister {
         Ok(())
     }
 
+    /// Keeps a record whose runtime state could not be decoded here, so a retry
+    /// — on a node that does hold its artifacts, or here once they arrive — can
+    /// still resume it. The record is reported, never silently dropped.
+    ///
+    /// Retention is not unbounded, and the sweep that bounds it is deliberately
+    /// *not* the orphan sweep: that one only reclaims a sandbox whose record is
+    /// gone, so counting on it would let a retained record keep its artifacts
+    /// forever. Retention is bounded instead by two things this branch can see:
+    /// the record still being replaced on the next successful pause of the same
+    /// sandbox, and the operator-facing counter plus log line below, which is what
+    /// the seven-day acceptance watches. Reclaiming a retained record on a timer
+    /// is a separate decision, because a timer that is too short destroys exactly
+    /// the record this branch exists to save.
+    fn retain_unusable_record(&self, sandbox_id: &SandboxId, error: &SandboxPersistenceError) {
+        warn!(
+            sandbox_id = %sandbox_id,
+            artifacts = %self.sandbox_artifact_root(sandbox_id).display(),
+            error = %error,
+            "retaining paused sandbox record whose runtime state is unavailable on this node"
+        );
+    }
+
+    /// Moves, and never deletes, every generation no retained record names.
+    ///
+    /// A directory under `artifacts/{sandbox_id}` with no record is not proof
+    /// that the sandbox is gone: the record can be on another node, lost when a
+    /// pod was evicted between `allocate_artifact_root` and `persist_paused`,
+    /// or discarded by an earlier boot while the bytes stayed. The old branch
+    /// deleted it, which is what turned a recreated pod on the same node into
+    /// permanent loss. The generation is renamed to
+    /// `artifacts/.quarantine/{epoch}/{sandbox_id}` instead, where it keeps its
+    /// bytes and only an explicit decision (the reaper's TTL in enforce mode, or
+    /// a control-plane delete) removes it.
+    ///
+    /// A rename that fails logs the id and both paths and is counted; startup
+    /// must not be blocked by one unreadable entry, and this branch contains no
+    /// reachable delete.
     async fn cleanup_orphan_artifacts(
         &self,
         retained_sandbox_ids: &HashSet<SandboxId>,
+        now: SystemTime,
+        outcomes: &mut LoadOutcomes,
     ) -> PersistenceResult<()> {
-        let artifacts_root = self.artifacts_root();
+        let artifacts_root = self.root.join("artifacts");
         let mut entries = match fs::read_dir(&artifacts_root).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -224,6 +728,9 @@ impl FileBackedSandboxPersister {
                 continue;
             }
 
+            // The quarantine and trash directories are never sandbox ids; their
+            // names do not parse as one, so this check is also what keeps the
+            // sweep from renaming its own destination.
             let Some(sandbox_id) = entry
                 .file_name()
                 .to_str()
@@ -232,18 +739,126 @@ impl FileBackedSandboxPersister {
                 continue;
             };
 
-            if !retained_sandbox_ids.contains(&sandbox_id) {
-                info!(
-                    sandbox_id = %sandbox_id,
-                    artifacts = %entry.path().display(),
-                    "removing orphaned paused sandbox artifacts"
-                );
-                Self::remove_artifact_root(&entry.path()).await?;
+            if retained_sandbox_ids.contains(&sandbox_id) {
+                continue;
+            }
+
+            let from = entry.path();
+            let destination = self
+                .root
+                .join("artifacts")
+                .join(QUARANTINE_DIR)
+                .join(epoch_seconds(now).to_string())
+                .join(sandbox_id.to_string());
+            match Self::quarantine_artifacts(&from, &destination).await {
+                Ok(()) => {
+                    outcomes.observe(LoadOutcome::QuarantinedNoRecord);
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        from = %from.display(),
+                        to = %destination.display(),
+                        reason = "no_record",
+                        "quarantined paused sandbox artifacts whose record this node does not have"
+                    );
+                }
+                Err(error) => {
+                    // Nothing is deleted on failure: the generation stays in
+                    // `artifacts/`, and the next boot retries the move.
+                    outcomes.quarantine_failed += 1;
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        from = %from.display(),
+                        to = %destination.display(),
+                        error = %error,
+                        "failed to quarantine paused sandbox artifacts whose record this node does not have"
+                    );
+                }
             }
         }
 
         Ok(())
     }
+
+    /// Renames one generation directory into the quarantine, creating the epoch
+    /// parent first. A rename, never a copy: a generation is multi-GiB and boot
+    /// must not walk it.
+    async fn quarantine_artifacts(from: &Path, destination: &Path) -> PersistenceResult<()> {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await.map_err(|source| {
+                SandboxPersistenceError::io(
+                    "create paused sandbox artifact quarantine",
+                    parent,
+                    source,
+                )
+            })?;
+        }
+        fs::rename(from, destination).await.map_err(|source| {
+            SandboxPersistenceError::io("quarantine paused sandbox artifacts", from, source)
+        })
+    }
+
+    /// Removes a control-plane-deleted sandbox's artifacts from the quarantine.
+    ///
+    /// A sandbox deleted while its generation sat in quarantine has no record
+    /// and no `artifacts/{id}` directory, so without this the bytes would wait
+    /// for the TTL even though the delete was explicit. Everything not
+    /// quarantined keeps the existing behavior.
+    async fn remove_quarantined_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        let quarantine_root = self.root.join("artifacts").join(QUARANTINE_DIR);
+        let mut epochs = match fs::read_dir(&quarantine_root).await {
+            Ok(epochs) => epochs,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "read paused sandbox quarantine",
+                    &quarantine_root,
+                    source,
+                ));
+            }
+        };
+        while let Some(epoch) = epochs.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan paused sandbox quarantine", &quarantine_root, source)
+        })? {
+            let metadata = match fs::symlink_metadata(epoch.path()).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "inspect paused sandbox quarantine",
+                        epoch.path(),
+                        source,
+                    ));
+                }
+            };
+            // Only a real epoch directory is inspected; a symlink is never
+            // followed, and a regular file is not a quarantine layout.
+            if !metadata.is_dir() {
+                continue;
+            }
+            let candidate = epoch.path().join(sandbox_id.to_string());
+            match fs::symlink_metadata(&candidate).await {
+                Ok(metadata) if metadata.is_dir() => {
+                    Self::remove_artifact_root(&candidate).await?;
+                }
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxPersistenceError::io(
+                        "inspect quarantined paused sandbox artifacts",
+                        &candidate,
+                        source,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn epoch_seconds(now: SystemTime) -> u64 {
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -258,6 +873,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         })?;
         let mut sandboxes = Vec::new();
         let mut retained_artifacts = HashSet::new();
+        let mut outcomes = LoadOutcomes::default();
 
         for (key, bytes) in records {
             let sandbox_id_from_key = std::str::from_utf8(&key)
@@ -270,6 +886,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
                     if let Some(sandbox_id) = sandbox_id_from_key {
                         let _ = self.remove_record(&sandbox_id).await;
                     }
+                    outcomes.observe(LoadOutcome::Discarded);
                     continue;
                 }
             };
@@ -278,6 +895,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             if record.lifecycle == PersistedPausedLifecycle::Resuming {
                 warn!(sandbox_id = %sandbox_id, "discarding paused sandbox record left in resuming state");
                 self.cleanup_invalid_record(&sandbox_id).await?;
+                outcomes.observe(LoadOutcome::Discarded);
                 continue;
             }
 
@@ -290,26 +908,36 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 );
                 retained_artifacts.insert(sandbox_id);
                 sandboxes.push(record.into_metadata_without_runtime_state());
+                outcomes.observe(LoadOutcome::RetainedWithoutRuntimeState);
                 continue;
             }
 
-            match record.into_metadata(factory) {
+            match record.decode_runtime_metadata(factory) {
                 Ok(metadata) => {
                     retained_artifacts.insert(sandbox_id);
                     sandboxes.push(metadata);
+                    outcomes.observe(LoadOutcome::LoadedFromLocal);
                 }
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, error = %err, "discarding unusable paused sandbox record");
-                    self.cleanup_invalid_record(&sandbox_id).await?;
+                    self.retain_unusable_record(&sandbox_id, &err);
+                    retained_artifacts.insert(sandbox_id);
+                    sandboxes.push(record.into_metadata_without_runtime_state());
+                    outcomes.observe(LoadOutcome::RetainedWithoutRuntimeState);
                 }
             }
         }
 
-        self.cleanup_orphan_artifacts(&retained_artifacts).await?;
+        self.cleanup_orphan_artifacts(&retained_artifacts, SystemTime::now(), &mut outcomes)
+            .await?;
 
         info!(
             loaded = sandboxes.len(),
             retained = retained_artifacts.len(),
+            loaded_from_local = outcomes.loaded_from_local,
+            retained_unreachable = outcomes.retained_unreachable,
+            discarded = outcomes.discarded,
+            quarantined = outcomes.quarantined,
+            quarantine_failed = outcomes.quarantine_failed,
             "loaded paused sandbox records"
         );
 
@@ -367,8 +995,24 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let result = self.put_record(&record).await;
         if result.is_err() {
             let _ = Self::remove_artifact_root(artifact_root).await;
+            return result;
         }
-        result
+        // The sweep runs only after the new record is durable: until then the
+        // previous generation is the one a restart would resume from. A sweep
+        // failure must not fail the pause, which already succeeded durably, but
+        // it is reported as a warning with the sandbox id instead of being
+        // swallowed.
+        if let Err(error) = self
+            .sweep_stale_generations(artifact_root, &metadata.id)
+            .await
+        {
+            warn!(
+                sandbox_id = %metadata.id,
+                error = %error,
+                "failed to reclaim unreferenced bytes from stale paused sandbox generations"
+            );
+        }
+        Ok(())
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -394,7 +1038,46 @@ impl SandboxPersister for FileBackedSandboxPersister {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
         self.remove_record(sandbox_id).await?;
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
+        // A control-plane delete is the explicit decision the quarantine waits
+        // for; without this the bytes would sit there until the TTL.
+        self.remove_quarantined_artifacts(sandbox_id).await?;
         Ok(())
+    }
+
+    fn artifacts_root(&self) -> Option<PathBuf> {
+        Some(self.root.join("artifacts"))
+    }
+
+    async fn paused_artifact_candidates(&self) -> PersistenceResult<Vec<PausedArtifactCandidate>> {
+        let records = self.db().await?.entries().await.map_err(|source| {
+            SandboxPersistenceError::store("scan paused sandbox records", source)
+        })?;
+        let mut candidates = Vec::new();
+        for (key, bytes) in records {
+            let record = match decode_record(&bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    // A record `load_all` would discard cannot name a generation
+                    // anyone may resume, so the worker skips it instead of
+                    // acting on a directory that is about to be quarantined.
+                    debug!(
+                        record_key = %String::from_utf8_lossy(&key),
+                        error = %error,
+                        "deferred compaction skipped an invalid paused record"
+                    );
+                    continue;
+                }
+            };
+            if record.lifecycle != PersistedPausedLifecycle::Paused {
+                continue;
+            }
+            candidates.push(PausedArtifactCandidate {
+                sandbox_id: record.metadata.id,
+                artifact_root: record.artifact_root,
+                config_paths: image_config_paths(&record.state),
+            });
+        }
+        Ok(candidates)
     }
 }
 
@@ -463,6 +1146,57 @@ mod tests {
         }
     }
 
+    /// Stands in for a node that holds the runtime artifacts of some paused
+    /// sandboxes and not others: decode succeeds only for the artifact roots
+    /// this node was given and fails the way the real factory fails when the
+    /// runtime is elsewhere.
+    ///
+    /// [`MockBackendFactory`] cannot express that: it decodes every payload
+    /// into [`MockSnapshot`], so a record is never unavailable under it.
+    struct PartialRuntimeFactory {
+        decodable_roots: Vec<PathBuf>,
+    }
+
+    impl SandboxBackendFactory for PartialRuntimeFactory {
+        fn build(
+            &self,
+            _build_spec: FreshSandboxBuildSpec,
+            _launch_config: SandboxLaunchConfig,
+        ) -> Result<Box<dyn SandboxBackend>> {
+            unreachable!("persister tests only decode state")
+        }
+
+        fn build_from_snapshot(
+            &self,
+            _snapshot: &RunnableSnapshot,
+            _launch_config: SandboxLaunchConfig,
+        ) -> Result<Box<dyn SandboxBackend>> {
+            unreachable!("persister tests only decode state")
+        }
+
+        fn build_from_paused_state(
+            &self,
+            _sandbox_id: SandboxId,
+            _state: &dyn PausedSandboxState,
+            _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
+        ) -> Result<Box<dyn SandboxBackend>> {
+            unreachable!("persister tests only decode state")
+        }
+
+        fn decode_paused_state(
+            &self,
+            artifact_root: PathBuf,
+            _state: Value,
+        ) -> Result<Arc<dyn PausedSandboxState>> {
+            anyhow::ensure!(
+                self.decodable_roots.contains(&artifact_root),
+                "runtime state is not available on this node: {}",
+                artifact_root.display()
+            );
+            Ok(Arc::new(MockSnapshot))
+        }
+    }
+
     fn paused_state(root: &Path) -> Arc<dyn PausedSandboxState> {
         std::fs::create_dir_all(root).expect("create test artifact root");
         Arc::new(MockSnapshot)
@@ -489,6 +1223,30 @@ mod tests {
             .persist_paused(&metadata, Some(snapshot_root), paused_state.as_ref())
             .await?;
         Ok((sandbox_id, paused_state))
+    }
+
+    /// Persists one paused record whose artifact root is a real generation
+    /// directory under `artifacts/{sandbox_id}/`, as a pause leaves it.
+    async fn persist_test_record_with_generation(
+        persister: &FileBackedSandboxPersister,
+        sandbox_id: SandboxId,
+    ) -> anyhow::Result<SandboxId> {
+        let artifact_root = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("allocate artifact root");
+        std::fs::write(artifact_root.join("vm_state.bin"), b"generation bytes")?;
+        let paused_state = paused_state(&artifact_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            virtualization_mode: persister.virtualization_mode,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+            .await?;
+        Ok(sandbox_id)
     }
 
     async fn has_record(
@@ -692,6 +1450,440 @@ mod tests {
         Ok(())
     }
 
+    /// Number of generation directories retained under one sandbox's artifact
+    /// root, sorted so the assertion does not depend on directory order.
+    fn generation_dirs(sandbox_root: &Path) -> Vec<PathBuf> {
+        let mut generations: Vec<PathBuf> = std::fs::read_dir(sandbox_root)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.expect("read generation entry").path())
+                    .filter(|path| path.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        generations.sort();
+        generations
+    }
+
+    #[tokio::test]
+    async fn persist_paused_reclaims_unreferenced_bytes_from_stale_generations(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..10 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("file-backed persister allocates an artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            // A generation-private artifact with a single link, exactly what
+            // each pause accumulates: nothing else references it once its own
+            // generation stops being the record's.
+            std::fs::write(artifact_root.join("private.commit"), vec![0xABu8; 4096])?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        let artifact_root = roots.last().expect("ten generations").clone();
+        let generations = generation_dirs(&sandbox_root);
+        assert!(
+            generations.len() <= 2,
+            "ten pauses must not leave one generation each: {generations:?}"
+        );
+        assert!(
+            generations.contains(&artifact_root),
+            "the sweep must never remove the generation the current record references"
+        );
+        assert!(
+            artifact_root.join("private.commit").exists(),
+            "the current generation keeps its artifacts"
+        );
+        for stale in &roots[..roots.len() - 1] {
+            assert!(
+                !stale.exists(),
+                "a stale generation emptied by the sweep must be removed: {}",
+                stale.display()
+            );
+        }
+
+        // The record still loads and points at the surviving generation.
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, metadata.id);
+        Ok(())
+    }
+
+    /// A file that a fork child or a resumed VM still references by path must
+    /// survive the sweep even after its own generation stops being current.
+    #[tokio::test]
+    async fn persist_paused_sweep_keeps_a_fork_childs_hardlinked_artifact() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+
+        // The first generation holds the artifact the child keeps open; every
+        // later generation sees it with a link count above 1.
+        let first_root = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate artifact root");
+        std::fs::create_dir_all(&first_root)?;
+        let child_artifact = first_root.join("shared.commit");
+        std::fs::write(&child_artifact, vec![0xCDu8; 4096])?;
+
+        let mut roots = Vec::new();
+        for index in 0..10 {
+            let artifact_root = if index == 0 {
+                first_root.clone()
+            } else {
+                let artifact_root = persister
+                    .allocate_artifact_root(&metadata.id)
+                    .await?
+                    .expect("allocate artifact root");
+                std::fs::create_dir_all(&artifact_root)?;
+                // Mirror the pause path: a generation hardlinks what the child
+                // still references instead of copying it.
+                std::fs::hard_link(&child_artifact, artifact_root.join("shared.commit"))?;
+                artifact_root
+            };
+            if index == 0 {
+                std::fs::hard_link(&child_artifact, first_root.join("shared-alias.commit"))?;
+            }
+            std::fs::write(artifact_root.join("private.commit"), vec![0xABu8; 4096])?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        assert!(
+            child_artifact.exists(),
+            "a file a fork child still references must survive the sweep: {}",
+            child_artifact.display()
+        );
+        assert!(
+            std::fs::metadata(&child_artifact)?.nlink() > 1,
+            "the surviving artifact must still be reachable through a newer generation"
+        );
+        let current = roots.last().expect("ten generations");
+        assert!(current.join("private.commit").exists());
+        assert!(current.join("shared.commit").exists());
+        // The shared artifact keeps the stale generation it was created in
+        // non-empty, which is the price of correctness: only its private files
+        // are reclaimed, never the inode another runtime still references.
+        for stale in &roots[..roots.len() - 1] {
+            if stale.exists() {
+                assert!(
+                    !stale.join("private.commit").exists(),
+                    "the sweep must still reclaim private files from stale generation {}",
+                    stale.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Two stale generations that share one inode and that the newest generation
+    /// no longer references are reclaimed together.
+    ///
+    /// Under the old `nlink == 1` rule neither link was ever deleted: each one
+    /// saw the other and neither generation's directory could ever empty. With
+    /// the observed-link count both are inside the swept set, so the inode is
+    /// freed and both directories go.
+    #[tokio::test]
+    async fn persist_paused_reclaims_an_inode_shared_only_by_stale_generations(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+
+        let first = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate first generation");
+        std::fs::create_dir_all(&first)?;
+        let shared = first.join("shared.commit");
+        std::fs::write(&shared, vec![0xEFu8; 4096])?;
+        std::fs::write(first.join("private.commit"), b"first")?;
+        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+        persister
+            .persist_paused(&metadata, Some(&first), paused_state.as_ref())
+            .await?;
+
+        let second = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate second generation");
+        std::fs::create_dir_all(&second)?;
+        std::fs::hard_link(&shared, second.join("shared.commit"))?;
+        std::fs::write(second.join("private.commit"), b"second")?;
+        persister
+            .persist_paused(&metadata, Some(&second), paused_state.as_ref())
+            .await?;
+        assert!(
+            first.exists() && first.join("shared.commit").exists(),
+            "while one stale generation still shares the inode the sweep must keep it"
+        );
+
+        // The newest generation does not link the shared inode, so both stale
+        // links are now reachable only from the swept set.
+        let newest = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate newest generation");
+        std::fs::create_dir_all(&newest)?;
+        std::fs::write(newest.join("private.commit"), b"newest")?;
+        persister
+            .persist_paused(&metadata, Some(&newest), paused_state.as_ref())
+            .await?;
+
+        assert!(
+            !first.exists(),
+            "a stale generation whose only stale-shared inode was freed must be removed: {}",
+            first.display()
+        );
+        assert!(
+            !second.exists(),
+            "the sibling stale generation must be removed with it: {}",
+            second.display()
+        );
+        assert!(newest.exists());
+        assert!(newest.join("private.commit").exists());
+        Ok(())
+    }
+
+    /// A file the newest generation links must survive even when all its other
+    /// links are in stale generations: its `nlink` is larger than the count the
+    /// sweep observed, because one link lives outside the swept set.
+    #[tokio::test]
+    async fn persist_paused_sweep_keeps_a_file_the_newest_generation_links() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(48 << 30);
+        let metadata = SandboxMetadata::default();
+        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+
+        let first = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate first generation");
+        std::fs::create_dir_all(&first)?;
+        let kept = first.join("kept.commit");
+        std::fs::write(&kept, vec![0xCDu8; 4096])?;
+        persister
+            .persist_paused(&metadata, Some(&first), paused_state.as_ref())
+            .await?;
+
+        let second = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate second generation");
+        std::fs::create_dir_all(&second)?;
+        std::fs::hard_link(&kept, second.join("kept.commit"))?;
+        std::fs::write(second.join("private.commit"), b"second")?;
+        persister
+            .persist_paused(&metadata, Some(&second), paused_state.as_ref())
+            .await?;
+
+        let newest = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate newest generation");
+        std::fs::create_dir_all(&newest)?;
+        std::fs::hard_link(&kept, newest.join("kept.commit"))?;
+        std::fs::write(newest.join("private.commit"), b"newest")?;
+        persister
+            .persist_paused(&metadata, Some(&newest), paused_state.as_ref())
+            .await?;
+
+        assert!(
+            newest.join("kept.commit").exists(),
+            "the newest generation's link must survive"
+        );
+        assert!(
+            std::fs::metadata(newest.join("kept.commit"))?.nlink() > 2,
+            "the surviving inode must still be reachable from more places than the swept set"
+        );
+        for stale in [&first, &second] {
+            assert!(
+                !stale.join("private.commit").exists(),
+                "the sweep must still reclaim private files from {}",
+                stale.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// A graceful shutdown persists every sandbox at once; the sweep must not
+    /// run there, or it competes with the artifacts still being written.
+    #[tokio::test]
+    async fn persist_paused_skips_the_sweep_during_graceful_shutdown() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let shutdown = ShutdownSignal::new();
+        let persister = test_persister(temp.path())
+            .with_chain_bytes_ceiling(48 << 30)
+            .with_shutdown_signal(shutdown.clone());
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..4 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("allocate artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("private.commit"), b"generation")?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        let before_shutdown = generation_dirs(&sandbox_root);
+        shutdown.begin();
+        let shutdown_root = persister
+            .allocate_artifact_root(&metadata.id)
+            .await?
+            .expect("allocate artifact root");
+        std::fs::create_dir_all(&shutdown_root)?;
+        std::fs::write(shutdown_root.join("private.commit"), b"generation")?;
+        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+        persister
+            .persist_paused(&metadata, Some(&shutdown_root), paused_state.as_ref())
+            .await?;
+
+        let mut expected = before_shutdown.clone();
+        expected.push(shutdown_root);
+        expected.sort();
+        assert_eq!(
+            generation_dirs(&sandbox_root),
+            expected,
+            "a pause during shutdown must add its generation and reclaim nothing"
+        );
+        assert!(
+            roots
+                .iter()
+                .all(|root| root.exists() || !before_shutdown.contains(root)),
+            "no generation present before shutdown may be removed by it"
+        );
+        Ok(())
+    }
+
+    /// Pause `count` generations of one sandbox, each with a private artifact
+    /// so the sweep has something unreferenced to reclaim.
+    async fn pause_generations(
+        persister: &FileBackedSandboxPersister,
+        metadata: &SandboxMetadata,
+        count: usize,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut roots = Vec::with_capacity(count);
+        for _ in 0..count {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("file-backed persister allocates an artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("private.commit"), vec![0xABu8; 4096])?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+        Ok(roots)
+    }
+
+    /// Two persisters in the same process: one in graceful shutdown, one live.
+    /// Only the shut-down one may skip the sweep - a process-wide shutdown read
+    /// made the live one silently skip it too, which is exactly how the
+    /// reclaim test went flaky when these tests ran in parallel.
+    #[tokio::test]
+    async fn shutdown_is_per_persister_so_a_live_one_keeps_sweeping() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let live_dir = temp.path().join("live");
+        let stopped_dir = temp.path().join("stopped");
+        std::fs::create_dir_all(&live_dir)?;
+        std::fs::create_dir_all(&stopped_dir)?;
+
+        let shutting_down = ShutdownSignal::new();
+        let live = test_persister(&live_dir).with_chain_bytes_ceiling(48 << 30);
+        let stopped = test_persister(&stopped_dir)
+            .with_chain_bytes_ceiling(48 << 30)
+            .with_shutdown_signal(shutting_down.clone());
+
+        let live_metadata = SandboxMetadata::default();
+        let stopped_metadata = SandboxMetadata::default();
+
+        // The stopped persister is already shutting down; the live one is not,
+        // and both are paused at the same time in this process.
+        shutting_down.begin();
+        let live_roots = pause_generations(&live, &live_metadata, 4).await?;
+        let stopped_roots = pause_generations(&stopped, &stopped_metadata, 4).await?;
+
+        let live_generations = generation_dirs(&live.sandbox_artifact_root(&live_metadata.id));
+        assert!(
+            live_generations.len() <= 2,
+            "the live persister must keep sweeping its stale generations: {live_generations:?}"
+        );
+        assert!(
+            !live_roots[0].exists(),
+            "the live persister must remove a stale generation its sweep emptied: {}",
+            live_roots[0].display()
+        );
+        assert!(
+            live_generations.contains(&live_roots[3]),
+            "the live persister keeps the generation the current record references: {}",
+            live_roots[3].display()
+        );
+
+        assert_eq!(
+            generation_dirs(&stopped.sandbox_artifact_root(&stopped_metadata.id)),
+            stopped_roots,
+            "the shut-down persister must reclaim nothing while the live one sweeps"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_paused_keeps_every_generation_when_the_ceiling_is_disabled(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path()).with_chain_bytes_ceiling(0);
+        let metadata = SandboxMetadata::default();
+        let sandbox_root = persister.sandbox_artifact_root(&metadata.id);
+
+        let mut roots = Vec::new();
+        for _ in 0..4 {
+            let artifact_root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .expect("allocate artifact root");
+            std::fs::create_dir_all(&artifact_root)?;
+            std::fs::write(artifact_root.join("mem.commit"), b"generation")?;
+            let paused_state: Arc<dyn PausedSandboxState> = Arc::new(MockSnapshot);
+            persister
+                .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+                .await?;
+            roots.push(artifact_root);
+        }
+
+        assert_eq!(
+            generation_dirs(&sandbox_root),
+            roots,
+            "a 0 ceiling must keep today's behavior: no generation is swept"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn mark_resuming_and_rollback_preserve_loadability() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -728,8 +1920,159 @@ mod tests {
         Ok(())
     }
 
+    /// Every `artifacts/.quarantine/{epoch}/{sandbox_id}` directory for one id,
+    /// sorted. The epoch is the boot's clock, so the test must not compute it.
+    fn quarantined_dirs(artifacts_root: &Path, sandbox_id: &SandboxId) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(artifacts_root.join(QUARANTINE_DIR))
+            .map(|epochs| {
+                epochs
+                    .map(|epoch| epoch.expect("read quarantine epoch").path())
+                    .filter(|epoch| epoch.is_dir())
+                    .map(|epoch| epoch.join(sandbox_id.to_string()))
+                    .filter(|dir| dir.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        dirs.sort();
+        dirs
+    }
+
+    /// A boot over a root with generations no record names must keep them.
+    ///
+    /// This is the card's reproduction at persister level, with no VM: the
+    /// records a clean shutdown wrote, five artifact generations written
+    /// without a record (what a SIGKILL between `allocate_artifact_root` and
+    /// `persist_paused` leaves, and also what a resumed sandbox's last
+    /// generation looks like), and a new persister over the same root standing
+    /// in for the pod recreated on the same node. The old branch deleted the
+    /// five; it must quarantine them instead.
     #[tokio::test]
-    async fn load_all_removes_orphan_artifacts_without_records() -> anyhow::Result<()> {
+    async fn restarted_node_quarantines_generations_whose_record_never_existed(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        // Sync durability so the records survive dropping and reopening the
+        // store, which is what the pod restart does.
+        let persister = test_persister(&root).with_durability(LocalStoreDurability::Sync);
+        let mut recorded_ids = Vec::new();
+        for _ in 0..3 {
+            recorded_ids
+                .push(persist_test_record_with_generation(&persister, SandboxId::new()).await?);
+        }
+
+        let artifacts_root = root.join("artifacts");
+        let mut unrecorded_ids = Vec::new();
+        for _ in 0..5 {
+            let sandbox_id = SandboxId::new();
+            let generation = artifacts_root
+                .join(sandbox_id.to_string())
+                .join("generation-without-record");
+            tokio::fs::create_dir_all(&generation).await?;
+            tokio::fs::write(generation.join("vm_state.bin"), b"generation bytes").await?;
+            unrecorded_ids.push(sandbox_id);
+        }
+        drop(persister);
+
+        // The pod comes back on the same node: same root, new process.
+        let restarted = test_persister(&root).with_durability(LocalStoreDurability::Sync);
+        let mut loaded = restarted.load_all(&MockBackendFactory::new()).await?;
+        loaded.sort_by_key(|metadata| metadata.id);
+
+        assert_eq!(loaded.len(), 3, "the three records must still load");
+        for recorded_id in &recorded_ids {
+            assert!(
+                artifacts_root.join(recorded_id.to_string()).is_dir(),
+                "a loaded record keeps its artifacts in place"
+            );
+            assert!(
+                quarantined_dirs(&artifacts_root, recorded_id).is_empty(),
+                "a loaded record is never quarantined"
+            );
+        }
+        for unrecorded_id in &unrecorded_ids {
+            assert!(
+                !artifacts_root.join(unrecorded_id.to_string()).exists(),
+                "the generation must leave artifacts/{{id}}"
+            );
+            let quarantined = quarantined_dirs(&artifacts_root, unrecorded_id);
+            assert_eq!(
+                quarantined.len(),
+                1,
+                "the generation must be under artifacts/.quarantine/{{epoch}}/{{id}}"
+            );
+            assert_eq!(
+                std::fs::read(quarantined[0].join("generation-without-record/vm_state.bin"))?,
+                b"generation bytes",
+                "the bytes must survive the move: this is the loss the card reports"
+            );
+        }
+        Ok(())
+    }
+
+    /// The record must survive the same event its artifacts survive.
+    ///
+    /// In the deployment the DaemonSet mounts one hostPath, the node's local
+    /// SSD, at `/workspace` (`deploy/k8s/base/agentenv-daemonset.yaml`), and
+    /// `AENV_HOME_PATH=/workspace/env` (`deploy/docker/Dockerfile.agentenv`)
+    /// puts the store root inside it, so `records.db` and `artifacts/` are two
+    /// subdirectories of one directory a recreated pod sees again. This test
+    /// holds that invariant: dropping the persister is the pod dying without a
+    /// graceful shutdown, and a new persister over the same directory must load
+    /// the record back with its generation still where the record points.
+    ///
+    /// `Sync` durability is the production setting (`FileBackedSandboxPersister::new`),
+    /// and it is what makes the record fsynced at the moment `persist_paused`
+    /// returns rather than only on a clean shutdown.
+    #[tokio::test]
+    async fn a_pod_recreated_over_the_same_store_root_loads_the_records_back() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let root = temp.path().to_path_buf();
+        let persister = test_persister(&root).with_durability(LocalStoreDurability::Sync);
+        let sandbox_id = persist_test_record_with_generation(&persister, SandboxId::new()).await?;
+        let generation = persister.get_record(&sandbox_id).await?.artifact_root;
+        drop(persister);
+
+        // The pod comes back on the same node: same directory, new process.
+        let restarted = test_persister(&root).with_durability(LocalStoreDurability::Sync);
+        let artifacts_root = restarted.artifacts_root().expect("artifacts root");
+        assert_eq!(
+            restarted.records_db_path(),
+            root.join(RECORD_DB_DIR),
+            "the record DB lives in the store root"
+        );
+        assert!(
+            generation.starts_with(&artifacts_root),
+            "the generation lives in the same store root as the record, so a node \
+             that keeps one keeps the other"
+        );
+
+        let loaded = restarted.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the recreated pod must load the record the evicted one wrote"
+        );
+        assert_eq!(loaded[0].id, sandbox_id);
+        assert!(
+            generation.is_dir(),
+            "the generation the loaded record points at must still be on disk"
+        );
+        assert!(
+            quarantined_dirs(&artifacts_root, &sandbox_id).is_empty(),
+            "a record the new pod found is never quarantined"
+        );
+        Ok(())
+    }
+
+    /// The previous behavior, now deliberately inverted: a generation with no
+    /// record is moved to the quarantine, never deleted.
+    ///
+    /// This replaces `load_all_removes_orphan_artifacts_without_records`, and
+    /// the rename is the signal that the deletion branch is gone.
+    #[tokio::test]
+    async fn load_all_quarantines_orphan_artifacts() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -737,11 +2080,124 @@ mod tests {
             .sandbox_artifact_root(&sandbox_id)
             .join("resumed-generation");
         tokio::fs::create_dir_all(&artifact_root).await?;
+        tokio::fs::write(artifact_root.join("vm_state.bin"), b"generation bytes").await?;
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
-        assert!(loaded.is_empty());
-        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+        assert!(loaded.is_empty(), "no record means nothing is listed");
+        assert!(
+            !persister.sandbox_artifact_root(&sandbox_id).exists(),
+            "the generation must leave artifacts/{{id}}"
+        );
+        let quarantined = quarantined_dirs(&temp.path().join("artifacts"), &sandbox_id);
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the generation must be under artifacts/.quarantine/{{epoch}}/{{id}}"
+        );
+        assert_eq!(
+            std::fs::read(quarantined[0].join("resumed-generation/vm_state.bin"))?,
+            b"generation bytes",
+            "quarantine preserves the bytes; deletion is what the card forbids"
+        );
+        Ok(())
+    }
+
+    /// A control-plane delete is the explicit decision: it must clear a
+    /// generation that is already quarantined, not leave it for the TTL.
+    #[tokio::test]
+    async fn delete_record_and_artifacts_removes_a_quarantined_generation() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let quarantined = temp
+            .path()
+            .join("artifacts")
+            .join(QUARANTINE_DIR)
+            .join(epoch_seconds(std::time::SystemTime::now()).to_string())
+            .join(sandbox_id.to_string());
+        tokio::fs::create_dir_all(quarantined.join("generation")).await?;
+
+        persister.delete_record_and_artifacts(&sandbox_id).await?;
+
+        assert!(
+            !quarantined.exists(),
+            "an explicit delete must not leave the bytes for the TTL"
+        );
+        Ok(())
+    }
+
+    /// One entry that cannot be moved must not abort the boot: it stays where it
+    /// is, the pass counts it, and the caller still gets its records.
+    #[tokio::test]
+    async fn a_quarantine_rename_failure_keeps_the_directory_and_does_not_abort_boot(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let artifacts_root = temp.path().join("artifacts");
+        let sandbox_id = SandboxId::new();
+        let generation = artifacts_root
+            .join(sandbox_id.to_string())
+            .join("generation");
+        tokio::fs::create_dir_all(&generation).await?;
+
+        // The epoch directory is computed from the injected clock, so the test
+        // can make the destination a non-empty directory: a rename onto it
+        // fails with ENOTEMPTY, exactly the collision two boots quarantining
+        // the same id into the same epoch would hit.
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let blocked = artifacts_root
+            .join(QUARANTINE_DIR)
+            .join(epoch_seconds(now).to_string())
+            .join(sandbox_id.to_string());
+        tokio::fs::create_dir_all(&blocked).await?;
+        tokio::fs::write(blocked.join("occupied"), b"occupied").await?;
+
+        let mut outcomes = LoadOutcomes::default();
+        persister
+            .cleanup_orphan_artifacts(&HashSet::new(), now, &mut outcomes)
+            .await?;
+
+        assert_eq!(outcomes.quarantine_failed, 1);
+        assert_eq!(outcomes.quarantined, 0);
+        assert!(
+            generation.is_dir(),
+            "a failed move must leave the generation in place, never delete it"
+        );
+        assert!(
+            blocked.join("occupied").is_file(),
+            "the existing epoch entry must not be clobbered"
+        );
+        Ok(())
+    }
+
+    /// The quarantine directory is the boot path's own destination, never a
+    /// sandbox id, and a generation moved this boot is not moved again.
+    #[tokio::test]
+    async fn a_second_boot_does_not_move_the_quarantine_directory_itself() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let generation = persister
+            .sandbox_artifact_root(&sandbox_id)
+            .join("generation");
+        tokio::fs::create_dir_all(&generation).await?;
+
+        persister.load_all(&MockBackendFactory::new()).await?;
+        let quarantined = quarantined_dirs(&temp.path().join("artifacts"), &sandbox_id);
+        assert_eq!(quarantined.len(), 1);
+        // The first process is gone before the second starts: RocksDB's lock is
+        // process-scoped, and the restart is what the test reproduces.
+        drop(persister);
+
+        let second = test_persister(temp.path());
+        second.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(
+            quarantined_dirs(&temp.path().join("artifacts"), &sandbox_id),
+            quarantined,
+            "a second boot must leave the quarantined generation exactly where it is"
+        );
         Ok(())
     }
 
@@ -768,6 +2224,96 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(persister.sandbox_artifact_root(&sandbox_id).exists());
         Ok(())
+    }
+
+    /// R8: the descriptor is an optional sibling file, never a record field.
+    ///
+    /// A generation the new version paused therefore keeps record version 1 and
+    /// every field the previous version wrote; the previous version decodes it
+    /// and ignores the sibling, exactly as this test decodes a record written
+    /// without a descriptor (the previous version's shape) and a record written
+    /// with one. `git ls-remote --tags origin 'refs/tags/v0.2*'` is empty on
+    /// 13/11/2026 (only `v0.1.x` exists), so the previous runtime of the release
+    /// front is `rd/v0.2.4` and cannot be executed from this checkout; the
+    /// decode/validate path below is the compatibility contract and p-11 repeats
+    /// the real resume on the node.
+    #[tokio::test]
+    async fn load_all_keeps_a_paused_generation_with_a_sibling_deferred_descriptor(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = persister
+            .sandbox_artifact_root(&sandbox_id)
+            .join("generation");
+        let paused_state = paused_state(&snapshot_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .await?;
+
+        // What a deferred pause leaves beside the state it persisted.
+        crate::overlaybd::DeferredCompactionDescriptor::new(
+            "memory",
+            "mem_image.json",
+            "mem_compacted.commit",
+            Vec::new(),
+            0,
+            (0, 0),
+            "generation",
+        )
+        .write(&crate::overlaybd::DeferredCompactionDescriptor::path_in(
+            &snapshot_root,
+        ))?;
+
+        // The record is still version 1 and still loads, descriptor or not.
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the sibling file must not invalidate the record"
+        );
+        assert_eq!(loaded[0].id, sandbox_id);
+
+        let candidates = persister.paused_artifact_candidates().await?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sandbox_id, sandbox_id);
+        assert_eq!(candidates[0].artifact_root, snapshot_root);
+        Ok(())
+    }
+
+    /// The worker must find a volume's descriptor, whose directory is outside
+    /// the artifact root. It learns the config paths from the state it stores,
+    /// so this pins the extraction that makes that possible.
+    #[test]
+    fn image_config_paths_reads_every_config_the_paused_state_names() {
+        let state = serde_json::json!({
+            "mem_overlaybd_config": {
+                "image_config_path": "/state/gen/mem_image.json",
+                "read_only": true
+            },
+            "common": {
+                "rootfs_image_config": { "image_config_path": "/state/gen/rootfs/image.json" },
+                "extra_drives": [
+                    { "volume": { "image_config_path": "/volumes/v1/image.json" } },
+                    { "block": { "image_config_path": "/state/gen/drives/d0/image.json" } }
+                ]
+            }
+        });
+        let paths = image_config_paths(&state);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/state/gen/mem_image.json"),
+                PathBuf::from("/state/gen/rootfs/image.json"),
+                PathBuf::from("/volumes/v1/image.json"),
+                PathBuf::from("/state/gen/drives/d0/image.json"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -844,8 +2390,15 @@ mod tests {
         Ok(())
     }
 
+    /// A record this node cannot decode is not junk: its artifacts may be on
+    /// another node, and only a record kept is a record a pod swap can resume.
+    /// Deleting here is the step that turned a node replacement into permanent
+    /// loss, so the record and its artifacts must both survive the load.
+    ///
+    /// This replaces the previous assertion that such a record was discarded
+    /// and its artifacts removed.
     #[tokio::test]
-    async fn load_all_discards_unusable_record_and_artifacts() -> anyhow::Result<()> {
+    async fn load_all_retains_record_whose_runtime_state_is_unavailable() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -864,9 +2417,107 @@ mod tests {
 
         let loaded = persister.load_all(&RejectingFactory).await?;
 
-        assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+        let retained = loaded
+            .iter()
+            .find(|loaded| loaded.id == sandbox_id)
+            .expect("a record whose runtime state is unavailable must stay listed");
+        assert_eq!(retained.state, SandboxState::Paused);
+        assert!(
+            retained.paused_state.is_none(),
+            "a record without decodable runtime state must not advertise one"
+        );
+        assert!(has_record(&persister, &sandbox_id).await?);
+        assert!(snapshot_root.exists());
         Ok(())
+    }
+
+    /// The three outcomes must stay distinguishable: one that loaded, one whose
+    /// runtime state is unavailable here, and one that is genuinely corrupt.
+    /// The corrupt one keeps its cleanup, so this test also pins that the
+    /// retention above did not simply disable the cleanup path.
+    #[tokio::test]
+    async fn load_all_distinguishes_loaded_retained_and_discarded_records() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let loaded_root = temp.path().join("loaded-artifacts");
+        let (loaded_id, _loaded_state) = persist_test_record(&persister, &loaded_root).await?;
+
+        let unavailable_id = SandboxId::new();
+        let unavailable_root = persister
+            .sandbox_artifact_root(&unavailable_id)
+            .join("snapshot");
+        let unavailable_state = paused_state(&unavailable_root);
+        let unavailable_metadata = SandboxMetadata {
+            id: unavailable_id,
+            paused_state: Some(Arc::clone(&unavailable_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(
+                &unavailable_metadata,
+                Some(&unavailable_root),
+                unavailable_state.as_ref(),
+            )
+            .await?;
+
+        let corrupt_id = SandboxId::new();
+        persister
+            .db()
+            .await?
+            .put(corrupt_id.to_string(), b"not-json")
+            .await?;
+
+        // Only the loaded record's runtime is on this node, which is the whole
+        // point of the test: with a factory that decodes everything, the
+        // unavailable record would load and the assertion below would pass
+        // without ever exercising the retention path.
+        let factory = PartialRuntimeFactory {
+            decodable_roots: vec![loaded_root.clone()],
+        };
+        let mut loaded = persister.load_all(&factory).await?;
+        loaded.sort_by_key(|metadata| metadata.id);
+
+        assert_eq!(loaded.len(), 2, "loaded and retained records stay listed");
+
+        let decoded = loaded
+            .iter()
+            .find(|metadata| metadata.id == loaded_id)
+            .expect("the decodable record stays listed");
+        assert!(
+            decoded.paused_state.is_some(),
+            "a record whose runtime state decodes must carry it, so the two outcomes are distinguishable"
+        );
+
+        let unavailable = loaded
+            .iter()
+            .find(|metadata| metadata.id == unavailable_id)
+            .expect("the unavailable record stays listed");
+        assert_eq!(unavailable.state, SandboxState::Paused);
+        assert!(
+            unavailable.paused_state.is_none(),
+            "a record without decodable runtime state must not advertise one"
+        );
+
+        assert!(!has_record(&persister, &corrupt_id).await?);
+        assert!(has_record(&persister, &unavailable_id).await?);
+        assert!(unavailable_root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn load_outcome_labels_are_a_closed_set() {
+        let labels = [
+            LoadOutcome::LoadedFromLocal.as_str(),
+            LoadOutcome::RetainedWithoutRuntimeState.as_str(),
+            LoadOutcome::QuarantinedNoRecord.as_str(),
+            LoadOutcome::Discarded.as_str(),
+        ];
+
+        let unique: HashSet<_> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), labels.len(), "labels must not collide");
+        assert!(
+            labels.iter().all(|label| label.is_ascii()),
+            "label values stay greppable in metrics output"
+        );
     }
 }

@@ -10,8 +10,8 @@ use nix::fcntl::{Flock, FlockArg};
 use super::artifacts::sync_dir;
 
 use crate::repository::{
-    DocumentChange, DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError,
-    RepositoryResult,
+    DocumentChange, DocumentCollection, DocumentKey, DocumentUpdate, MaintenanceLock,
+    RepositoryError, RepositoryResult,
 };
 
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
@@ -24,6 +24,12 @@ pub struct PosixFsCatalogStore {
 
 #[derive(Debug)]
 struct PosixFileLockGuard {
+    _file: Flock<fs::File>,
+}
+
+/// The `flock` backing a POSIX maintenance lock. It is released when this guard
+/// is dropped, or by the kernel when the process dies.
+pub(crate) struct PosixMaintenanceLockKeeper {
     _file: Flock<fs::File>,
 }
 
@@ -140,6 +146,77 @@ impl PosixFsCatalogStore {
             }
         }
         Ok(documents)
+    }
+
+    /// Takes one maintenance lock, or reports `None` when a live process holds
+    /// it.
+    ///
+    /// The lock is an advisory `flock` on a file of its own, so a process that
+    /// dies releases it with the kernel and no stale-lock heuristic is needed.
+    /// The keeper returned alongside the lock holds the `flock`: it must live
+    /// as long as the pass.
+    pub(crate) fn acquire_maintenance_lock(
+        &self,
+        name: &str,
+    ) -> RepositoryResult<Option<(MaintenanceLock, PosixMaintenanceLockKeeper)>> {
+        let path = self
+            .root
+            .join(crate::repository::maintenance_lock_key(name));
+        let Some(parent) = path.parent() else {
+            return Err(RepositoryError::Backend {
+                message: format!("resolve parent for maintenance lock '{}'", path.display()),
+                source: None,
+            });
+        };
+        fs::create_dir_all(parent).map_err(|error| {
+            RepositoryError::backend(
+                format!("create maintenance lock dir '{}'", parent.display()),
+                error,
+            )
+        })?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("open maintenance lock '{}'", path.display()),
+                    error,
+                )
+            })?;
+        let mut file = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(file) => file,
+            // A live pass holds it; report the contention without waiting, so
+            // a scheduled sweep can skip this round.
+            Err((_file, error)) if error == Errno::EAGAIN || error == Errno::EWOULDBLOCK => {
+                return Ok(None)
+            }
+            Err((_file, error)) => {
+                return Err(RepositoryError::backend(
+                    format!("lock maintenance lock '{}'", path.display()),
+                    error,
+                ))
+            }
+        };
+        let token = uuid::Uuid::now_v7().to_string();
+        file.set_len(0).map_err(|error| {
+            RepositoryError::backend(
+                format!("truncate maintenance lock '{}'", path.display()),
+                error,
+            )
+        })?;
+        std::io::Write::write_all(&mut *file, token.as_bytes()).map_err(|error| {
+            RepositoryError::backend(
+                format!("write maintenance lock '{}'", path.display()),
+                error,
+            )
+        })?;
+        Ok(Some((
+            MaintenanceLock::new(name.to_owned(), token),
+            PosixMaintenanceLockKeeper { _file: file },
+        )))
     }
 
     fn write_bytes(&self, path: &Path, bytes: &[u8]) -> RepositoryResult<()> {

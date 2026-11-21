@@ -1,11 +1,13 @@
 mod access;
 mod backend;
+mod cpu_quota;
 pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
 mod firecracker;
 mod guest_volumes;
 pub(crate) mod logs;
+mod memory_containment;
 mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
@@ -32,18 +34,24 @@ pub use crate::types::{
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    publish_captured, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
-    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    publish_captured, CapturedSandboxSnapshot, PausedSandboxState, ResourceLimitPlan,
+    ResourceLimitStatus, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
+    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
+pub use cpu_quota::CpuQuota;
 pub use envd::EnvdApi;
-pub(crate) use firecracker::record_startup_pack;
+pub(crate) use firecracker::{
+    is_paused_chain_limit_exceeded, pause_refusal_code, record_startup_pack,
+};
+#[cfg(test)]
+pub(crate) use firecracker::{paused_chain_limit_error, PausedChainLimit};
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
 pub use logs::SandboxLogEntry;
+pub use memory_containment::{MemoryContainment, SandboxMemoryCgroup};
 pub use metrics::SandboxMetric;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{

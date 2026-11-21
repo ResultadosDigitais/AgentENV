@@ -517,8 +517,6 @@ fn path_to_json_string(path: &Path) -> Result<String, ToolExecutionError> {
 mod tests {
     use super::*;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[test]
@@ -809,16 +807,17 @@ mod tests {
     }
 
     fn write_script(path: &Path, contents: &str) {
-        fs::write(path, contents).unwrap();
-        set_executable(path);
-    }
-
-    fn set_executable(path: &Path) {
-        #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(path).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(path, perms).unwrap();
-        }
+        // Install from a child process: writing in this test process lets a
+        // concurrent fork inherit the writable fd, so a later exec of the same
+        // file fails with ETXTBSY (os error 26); CLOEXEC only closes it at exec.
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("install-script")
+            .arg(path)
+            .arg(contents)
+            .status()
+            .expect("install script");
+        assert!(status.success(), "install script: {status}");
     }
 }

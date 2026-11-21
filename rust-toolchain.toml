@@ -1,4 +1,5 @@
 [toolchain]
-channel = "stable"
+# Rust is pinned on purpose: bump it only through a PR that runs clippy on the new version.
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

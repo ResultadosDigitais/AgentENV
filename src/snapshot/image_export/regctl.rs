@@ -283,7 +283,6 @@ pub(crate) mod fixture {
     //! `{dir}/state`. No registry HTTP server runs.
 
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     use crate::digest;
@@ -307,8 +306,18 @@ esac
 
     pub(crate) fn install_fake_regctl(dir: &Path) -> PathBuf {
         let binary = dir.join("regctl");
-        fs::write(&binary, FAKE_REGCTL_SCRIPT).expect("write fake regctl");
-        fs::set_permissions(&binary, PermissionsExt::from_mode(0o755)).expect("chmod fake regctl");
+        // Install from a child process: writing in this test process lets a
+        // concurrent fork inherit the writable fd, so a later exec of the same
+        // file fails with ETXTBSY (os error 26); CLOEXEC only closes it at exec.
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("install-fake-regctl")
+            .arg(&binary)
+            .arg(FAKE_REGCTL_SCRIPT)
+            .status()
+            .expect("install fake regctl");
+        assert!(status.success(), "install fake regctl: {status}");
         binary
     }
 

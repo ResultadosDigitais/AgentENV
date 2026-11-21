@@ -13,12 +13,13 @@ use uuid::Uuid;
 use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
-    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CreateSandboxRequest, MemoryLimitState, NewTimeout, OrchestratorError, ResourceRequest,
+    SandboxForkChildSpec, SandboxLaunchSource, SandboxListFilter, SandboxMetadata,
+    SandboxResourceStatus, SandboxState, SandboxTimeoutAction,
 };
 use crate::prometheus::SandboxStageTimer;
 use crate::sandbox::custom_extension::HookStatusError;
-use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
+use crate::sandbox::{normalize_mount_path, pause_refusal_code, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
@@ -59,6 +60,26 @@ fn hook_client_error_message(err: &OrchestratorError) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The typed, recoverable pause refusal carried by an orchestrator error.
+///
+/// A pause the node declines on purpose — the paused-artifact chain is still
+/// above a bound after compaction, or the compaction lacks transient disk — is
+/// a capacity conflict, not a server failure: the sandbox stays Running and the
+/// caller may retry. Returning `409` with the stable code lets the platform
+/// classify it without parsing the message, and the platform-side mapping is
+/// deliberately out of this change.
+fn pause_refusal_error(err: &OrchestratorError) -> Option<models::Error> {
+    let OrchestratorError::SandboxOperationFailed { source, .. } = err else {
+        return None;
+    };
+    let error_code = pause_refusal_code(source)?;
+    Some(ApiImpl::error_with_code(
+        409,
+        error_code,
+        format!("sandbox pause refused: {source:#}"),
+    ))
+}
+
 fn default_sandbox_timeout() -> Duration {
     static DEFAULT_SANDBOX_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
@@ -96,6 +117,8 @@ impl From<OrchestratorError> for models::Error {
                 ),
             ),
             OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
+            OrchestratorError::UnsupportedResources(_) => Self::new(400, err.to_string()),
+            OrchestratorError::InsufficientCapacity(_) => Self::new(409, err.to_string()),
             other => ApiImpl::internal_error(&other),
         }
     }
@@ -376,6 +399,7 @@ impl From<SandboxTimeoutAction> for models::SandboxOnTimeout {
 
 impl From<SandboxMetadata> for models::ListedSandbox {
     fn from(m: SandboxMetadata) -> Self {
+        let allocated = m.allocated_resources();
         Self {
             template_id: m.snapshot_id,
             alias: m.snapshot_alias,
@@ -383,8 +407,10 @@ impl From<SandboxMetadata> for models::ListedSandbox {
             client_id: "".to_string(), // Deprecated field, only reserved for E2B Python SDK.
             started_at: started_at(m.created_at),
             end_at: end_at(m.expires_at),
-            cpu_count: m.resources.cpu_count,
-            memory_mb: m.resources.memory_mib,
+            cpu_count: allocated.cpu_count,
+            memory_mb: allocated.memory_mib,
+            max_cpu_count: Some(m.resources.cpu_count),
+            max_memory_mb: Some(m.resources.memory_mib),
             disk_size_mb: m.resources.disk_size_mib,
             metadata: m.user_metadata,
             state: m.state.into(),
@@ -459,6 +485,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
         let allow_internet_access = Some(allow_internet_access_from_base_policy(
             m.network_policy.base_policy,
         ));
+        let allocated = m.allocated_resources();
 
         Self {
             template_id: m.snapshot_id,
@@ -471,8 +498,10 @@ impl From<SandboxMetadata> for models::SandboxDetail {
             envd_access_token: None,
             allow_internet_access,
             domain: None,
-            cpu_count: m.resources.cpu_count,
-            memory_mb: m.resources.memory_mib,
+            cpu_count: allocated.cpu_count,
+            memory_mb: allocated.memory_mib,
+            max_cpu_count: Some(m.resources.cpu_count),
+            max_memory_mb: Some(m.resources.memory_mib),
             disk_size_mb: m.resources.disk_size_mib,
             metadata: m.user_metadata,
             state: m.state.into(),
@@ -482,6 +511,31 @@ impl From<SandboxMetadata> for models::SandboxDetail {
                 on_timeout: m.timeout_action.into(),
             }),
             volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
+        }
+    }
+}
+
+fn nullable(value: Option<u32>) -> Option<Nullable<u32>> {
+    Some(value.map_or(Nullable::Null, Nullable::Present))
+}
+
+impl From<SandboxResourceStatus> for models::SandboxResourceStatus {
+    fn from(status: SandboxResourceStatus) -> Self {
+        let memory_state = match status.memory_state() {
+            MemoryLimitState::Converged => models::SandboxMemoryLimitState::Converged,
+            MemoryLimitState::Converging => models::SandboxMemoryLimitState::Converging,
+            MemoryLimitState::Unobservable => models::SandboxMemoryLimitState::Unobservable,
+        };
+        let enforcement = status.enforcement.unwrap_or_default();
+        Self {
+            cpu_count: status.limits.cpu_count,
+            memory_mb: status.limits.memory_mib,
+            max_cpu_count: status.shape.cpu_count,
+            max_memory_mb: status.shape.memory_mib,
+            cpu_quota: nullable(enforcement.cpu_quota),
+            balloon_target_mb: nullable(enforcement.balloon_target_mib),
+            balloon_actual_mb: nullable(enforcement.balloon_actual_mib),
+            memory_state,
         }
     }
 }
@@ -565,11 +619,28 @@ fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResource
             "diskSizeMB must be at least 1024 and divisible by 1024".to_string(),
         ));
     }
+    let memory_request_mib = match body.memory_request_mb {
+        None => None,
+        Some(0) => {
+            return Err(ApiImpl::error(
+                400,
+                "memoryRequestMB must be greater than 0".to_string(),
+            ))
+        }
+        Some(request) if request > memory_mib => {
+            return Err(ApiImpl::error(
+                400,
+                "memoryRequestMB must not exceed memoryMB".to_string(),
+            ))
+        }
+        Some(request) => Some(request),
+    };
     Ok(SandboxResources {
         cpu_count,
         memory_mib,
         // Zero means omitted; the orchestrator fills it from the resolved rootfs.
         disk_size_mib,
+        memory_request_mib,
     })
 }
 
@@ -833,6 +904,8 @@ impl Sandboxes<()> for ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            // The cold-start resources above define the VM shape itself.
+            resources: ResourceRequest::default(),
         };
 
         match timer
@@ -1166,6 +1239,11 @@ impl Sandboxes<()> for ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            resources: ResourceRequest {
+                cpu_count: body.cpu_count,
+                memory_mib: body.memory_mb,
+                memory_request_mib: body.memory_request_mb,
+            },
         };
 
         match timer
@@ -1218,6 +1296,9 @@ impl Sandboxes<()> for ApiImpl {
                         400, message,
                     )));
                 }
+                if matches!(err, OrchestratorError::UnsupportedResources(_)) {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(err.into()));
+                }
                 Ok(SandboxesPostResponse::Status500_ServerError(
                     Self::internal_error(&err),
                 ))
@@ -1246,6 +1327,10 @@ impl Sandboxes<()> for ApiImpl {
             custom_extension_params: body.custom_extension_params.clone(),
             mcp: body.mcp.clone(),
             volume_mounts: body.volume_mounts.clone(),
+            cpu_count: body.cpu_count,
+            memory_mb: body.memory_mb,
+            memory_request_mb: None,
+            pool: body.pool.clone(),
         };
         Ok(
             match self
@@ -1709,6 +1794,71 @@ impl Sandboxes<()> for ApiImpl {
         }
     }
 
+    async fn sandboxes_sandbox_id_resources_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdResourcesGetPathParams,
+    ) -> Result<SandboxesSandboxIdResourcesGetResponse, ()> {
+        use SandboxesSandboxIdResourcesGetResponse::*;
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(Status404_NotFound(sandbox_not_found(path_id)));
+        };
+        match self.orchestrator.sandbox_resource_status(sandbox_id).await {
+            Ok(status) => Ok(Status200_SuccessfullyReturnedTheSandboxResources(
+                status.into(),
+            )),
+            Err(OrchestratorError::SandboxNotFound(id)) => {
+                Ok(Status404_NotFound(sandbox_not_found(id)))
+            }
+            Err(err) => Ok(Status500_ServerError(err.into())),
+        }
+    }
+
+    async fn sandboxes_sandbox_id_resources_patch(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdResourcesPatchPathParams,
+        body: &models::SandboxResourcesUpdate,
+    ) -> Result<SandboxesSandboxIdResourcesPatchResponse, ()> {
+        use SandboxesSandboxIdResourcesPatchResponse::*;
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(Status404_NotFound(sandbox_not_found(path_id)));
+        };
+        let request = ResourceRequest {
+            cpu_count: body.cpu_count,
+            memory_mib: body.memory_mb,
+            memory_request_mib: None,
+        };
+        match self.orchestrator.resize_sandbox(sandbox_id, request).await {
+            Ok(status) => Ok(Status200_TheNewLimitsAreEnforcedByTheVMM(status.into())),
+            Err(OrchestratorError::SandboxNotFound(id)) => {
+                Ok(Status404_NotFound(sandbox_not_found(id)))
+            }
+            Err(err @ OrchestratorError::UnsupportedResources(_)) => {
+                Ok(Status400_BadRequest(err.into()))
+            }
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                Ok(Status409_Conflict(Self::error(
+                    409,
+                    format!("sandbox resources cannot be changed from {state} state"),
+                )))
+            }
+            Err(
+                err @ (OrchestratorError::InsufficientCapacity(_)
+                | OrchestratorError::SandboxOperationConflict { .. }),
+            ) => Ok(Status409_Conflict(err.into())),
+            Err(err) => Ok(Status500_ServerError(err.into())),
+        }
+    }
+
     async fn sandboxes_sandbox_id_custom_extension_params_get(
         &self,
         _method: &Method,
@@ -1841,9 +1991,14 @@ impl Sandboxes<()> for ApiImpl {
                     format!("sandbox cannot be paused from {} state", state),
                 )),
             ),
-            Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
-                err.into(),
-            )),
+            Err(err) => match pause_refusal_error(&err) {
+                Some(refusal) => {
+                    Ok(SandboxesSandboxIdPausePostResponse::Status409_Conflict(refusal))
+                }
+                None => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
+                    err.into(),
+                )),
+            },
         }
     }
 
@@ -2249,6 +2404,47 @@ mod tests {
         assert!(hook_client_error_message(&err).is_none());
     }
 
+    /// A recoverable pause refusal is a capacity conflict with a stable code,
+    /// never a bare 500: the platform maps on `errorCode` instead of parsing
+    /// the message.
+    #[test]
+    fn pause_refusal_maps_to_409_with_the_stable_code() {
+        for limit in [
+            crate::sandbox::PausedChainLimit::ChainBytesCeiling,
+            crate::sandbox::PausedChainLimit::RootfsDiskMultiple,
+        ] {
+            let error = OrchestratorError::SandboxOperationFailed {
+                sandbox_id: SandboxId::new(),
+                operation: SandboxOperation::Pause,
+                source: crate::sandbox::paused_chain_limit_error(limit, 100, 50)
+                    .context("snapshot overlaybd runtime state to persistent dir"),
+            };
+            let refusal = pause_refusal_error(&error).expect("a chain refusal must map to a 409");
+            assert_eq!(refusal.code, 409);
+            assert_eq!(refusal.error_code.as_deref(), Some(limit.as_str()));
+            assert!(
+                refusal.message.contains(limit.as_str()),
+                "the message keeps the named code: {}",
+                refusal.message
+            );
+            let OrchestratorError::SandboxOperationFailed { source, .. } = &error else {
+                panic!("the test constructs a pause failure");
+            };
+            assert!(
+                crate::sandbox::pause_refusal_code(source).is_some(),
+                "the code must survive the context wrapping"
+            );
+        }
+
+        // Any other orchestrator failure keeps the existing 500 mapping.
+        let other = OrchestratorError::SandboxOperationFailed {
+            sandbox_id: SandboxId::new(),
+            operation: SandboxOperation::Pause,
+            source: anyhow::anyhow!("boom"),
+        };
+        assert!(pause_refusal_error(&other).is_none());
+    }
+
     #[test]
     fn fork_result_error_preserves_extension_rejection() {
         for (status, expected_code) in [
@@ -2368,6 +2564,29 @@ mod tests {
                 "value with spaces".to_string()
             )]))
         );
+    }
+
+    #[test]
+    fn cold_start_resources_validates_memory_request() {
+        let mut body = models::NewColdSandbox::new("ubuntu:24.04".to_string());
+        body.memory_mb = Some(512);
+        assert_eq!(
+            cold_start_resources(&body).unwrap().memory_request_mib,
+            None
+        );
+
+        body.memory_request_mb = Some(256);
+        assert_eq!(
+            cold_start_resources(&body).unwrap().memory_request_mib,
+            Some(256)
+        );
+
+        body.memory_request_mb = Some(512);
+        assert!(cold_start_resources(&body).is_ok());
+        body.memory_request_mb = Some(513);
+        assert!(cold_start_resources(&body).is_err());
+        body.memory_request_mb = Some(0);
+        assert!(cold_start_resources(&body).is_err());
     }
 
     #[test]
