@@ -18,6 +18,14 @@ service Scheduler {
   rpc LookupP2pArtifact(LookupP2pArtifactRequest) returns (LookupP2pArtifactResponse);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
+  // ScheduleResume applies the same capacity rule a new sandbox goes through
+  // before a paused sandbox resumes on its owner (or on another node when
+  // cross_node_resume is enabled).
+  rpc ScheduleResume(ScheduleResumeRequest) returns (ScheduleResumeResponse);
+  // SettleAdmission releases the reservation an admitted Schedule or
+  // ScheduleResume created, once the gateway knows whether the sandbox was
+  // actually created or resumed. Best-effort and idempotent.
+  rpc SettleAdmission(SettleAdmissionRequest) returns (SettleAdmissionResponse);
 }
 
 message Node {
@@ -34,6 +42,10 @@ message ScheduleRequestHint {
     NewColdSandboxHint new_cold_sandbox = 1;
     NewSandboxHint new_sandbox = 2;
   }
+  // Named node pool the request asks for. The scheduler only considers nodes
+  // whose pool equals this value, and an empty pool only matches nodes without
+  // a pool. Enforcing, unlike the advisory fields of the typed hint.
+  string pool = 3;
 }
 
 // NewColdSandboxHint describes a POST /sandboxes-cold request.
@@ -47,10 +59,32 @@ message NewColdSandboxHint {
   map<string, string> metadata = 4;
 }
 
+// TemplateShapeStatus reports whether the gateway could resolve the shape of a
+// template before scheduling a create. Zero means the gateway did not report
+// it (an older gateway, or a create whose body already carries its shape).
+enum TemplateShapeStatus {
+  TEMPLATE_SHAPE_STATUS_UNSPECIFIED = 0;
+  TEMPLATE_SHAPE_STATUS_RESOLVED = 1;
+  TEMPLATE_SHAPE_STATUS_NOT_FOUND = 2;
+  TEMPLATE_SHAPE_STATUS_LOOKUP_FAILED = 3;
+  TEMPLATE_SHAPE_STATUS_UNAVAILABLE = 4;
+}
+
 // NewSandboxHint describes a POST /sandboxes request.
 message NewSandboxHint {
   // Sandbox metadata key/value pairs parsed from the request body.
   map<string, string> metadata = 1;
+  // Requested shape when the body carries it; 0 means the template default
+  // applies and the scheduler can only reserve a slot.
+  uint32 cpu_count = 2;
+  uint64 memory_mb = 3;
+  // Shape of the template resolved by the gateway before scheduling, used
+  // when the body does not carry memory_mb. Zero when unresolved.
+  uint64 resolved_memory_mb = 4;
+  uint32 resolved_cpu_count = 5;
+  TemplateShapeStatus template_shape_status = 6;
+  // Template identifier the shape was resolved from; empty when absent.
+  string template_id = 7;
 }
 
 message ScheduleRequest {
@@ -58,8 +92,24 @@ message ScheduleRequest {
   ScheduleRequestHint hint = 2;
 }
 
+// ScheduleRefusalReason is the closed set of reasons a Schedule call refused
+// to pick a node for a request that is otherwise syntactically valid. Zero
+// means admitted.
+enum ScheduleRefusalReason {
+  SCHEDULE_REFUSAL_REASON_UNSPECIFIED = 0;
+  // The create targets a template whose shape the gateway could not read and
+  // the shape rule would have to admit it blind. Retryable.
+  SCHEDULE_REFUSAL_REASON_UNKNOWN_TEMPLATE_SHAPE = 1;
+}
+
 message ScheduleResponse {
   Node node = 1;
+  // Opaque reservation id the gateway settles once the create outcome is
+  // known. Empty when the reservation ledger is disabled.
+  string reservation_id = 2;
+  // Closed refusal reason; UNSPECIFIED means a node was selected. The gateway
+  // maps UNKNOWN_TEMPLATE_SHAPE to a retryable 503.
+  ScheduleRefusalReason refusal_reason = 3;
 }
 
 message ListNodesRequest {}
@@ -139,11 +189,48 @@ message NodeSnapshot {
   uint32 paused_sandbox_count = 14;
   uint32 paused_allocated_cpu = 15;
   uint64 paused_allocated_memory_bytes = 16;
+  // Sum of effective memory *requests* of the active running set. Equals
+  // allocated_memory_bytes unless sandboxes were created with an explicit
+  // memory_request_mb below their nominal limit. Older nodes do not report it
+  // (0). A node with allocated_memory_bytes > 0 always has requested > 0, so
+  // "requested == 0 && allocated > 0" identifies a non-reporting node and the
+  // scheduler falls back to allocated_memory_bytes (see filter.go).
+  uint64 requested_memory_bytes = 17;
+  // Memory working set of the runtime cgroup: memory.current minus
+  // inactive_file, the figure kubelet reports, so reclaimable page cache does
+  // not count as used. memory_used_bytes keeps the raw memory.current.
+  // Absent when the node cannot read memory.stat or predates the field; the
+  // scheduler then falls back to memory_used_bytes. Never reported as zero
+  // for "unknown".
+  optional uint64 memory_working_set_bytes = 18;
 }
 
 message P2pEndpoint {
   string backend = 1;
   string address = 2;
+}
+
+// AdmissionVerdict is the scheduler's admission decision for one VM shape on
+// one node. reason is a closed set (memory_allocated, memory_used, cpu,
+// starting, disk) and is empty when admitted.
+message AdmissionVerdict {
+  uint64 memory_gb = 1;
+  bool admitted = 2;
+  string reason = 3;
+}
+
+// NodeAdmission carries the capacity facts the verdict was computed over, so a
+// reader can reproduce the decision without duplicating the rule.
+message NodeAdmission {
+  uint64 allocatable_memory_bytes = 1;
+  uint64 runtime_overhead_bytes = 2;
+  uint64 capacity_memory_bytes = 3;
+  // "allocatable" or "total".
+  string capacity_source = 4;
+  repeated AdmissionVerdict layers = 5;
+  // Shapes admitted and still in flight, already included in the verdicts.
+  uint64 reserved_memory_bytes = 6;
+  uint32 reserved_cpu = 7;
 }
 
 message ObservedNode {
@@ -156,6 +243,19 @@ message ObservedNode {
   MachineInfo machine_info = 7;
   NodeSnapshot snapshot = 8;
   int64 last_seen_unix_ms = 9;
+  NodeAdmission admission = 10;
+  // Named node pool the node agent reported in its configuration. Empty when
+  // the node belongs to no pool (the shared nodes).
+  string pool = 11;
+}
+
+// PausedSandboxResources is the persisted shape of one paused sandbox on the
+// reporting node. The scheduler projects it when it decides whether a resume
+// fits, so a resume goes through the same capacity rule as a new sandbox.
+message PausedSandboxResources {
+  string sandbox_id = 1;
+  uint32 cpu_count = 2;
+  uint64 memory_bytes = 3;
 }
 
 message HeartbeatRequest {
@@ -168,6 +268,10 @@ message HeartbeatRequest {
   NodeSnapshot snapshot = 7;
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
+  repeated PausedSandboxResources paused_sandboxes = 10;
+  // Named node pool from the node agent's configuration. Empty means the node
+  // is shared: it only receives sandboxes that did not ask for a pool.
+  string pool = 11;
 }
 
 message HeartbeatResponse {
@@ -269,3 +373,36 @@ message UnregisterNodeRequest {
 }
 
 message UnregisterNodeResponse {}
+
+message ScheduleResumeRequest {
+  string sandbox_id = 1;
+  string cluster_id = 2;
+  // Template shape of the paused sandbox. The gateway supplies it while the
+  // node heartbeat does not carry per-sandbox paused resources yet; once the
+  // heartbeat reports them, that figure wins.
+  uint32 cpu_count = 3;
+  uint64 memory_bytes = 4;
+  // Named node pool the resume asks for. Empty only matches a node without a
+  // pool; a non-empty pool only matches nodes of that pool.
+  string pool = 5;
+}
+
+message ScheduleResumeResponse {
+  Node node = 1;
+  bool admitted = 2;
+  // Closed admission reason (memory_allocated, memory_used, cpu, starting or
+  // disk); empty when admitted.
+  string reason = 3;
+  // Opaque reservation id the gateway settles once the resume outcome is
+  // known. Empty when admitted with the reservation ledger disabled.
+  string reservation_id = 4;
+}
+
+message SettleAdmissionRequest {
+  string reservation_id = 1;
+  // Closed set: "confirmed" when the sandbox was created or resumed,
+  // "failed" when the upstream rejected it or the request never completed.
+  string outcome = 2;
+}
+
+message SettleAdmissionResponse {}

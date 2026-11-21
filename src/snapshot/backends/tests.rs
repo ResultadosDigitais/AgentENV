@@ -5,7 +5,7 @@ use overlaybd::config::ImageConfig as OverlaybdImageConfig;
 use tempfile::TempDir;
 
 use super::*;
-use crate::cfg::PosixFsBackendConfig as PosixConfig;
+use crate::cfg::{GcsBackendConfig, PosixFsBackendConfig as PosixConfig};
 use crate::image::cache::OverlaybdLayerLocation;
 use crate::repository::RepositoryError;
 use crate::snapshot::mock::write_mock_built_artifacts;
@@ -79,6 +79,58 @@ fn builder_namespace_preserves_oss_bucket_and_prefix() {
         assert_eq!(oss.bucket, "shared");
         assert_eq!(oss.prefix.as_deref(), Some(expected));
         assert_eq!(config.backend.oss.unwrap().prefix.as_deref(), prefix);
+    }
+}
+
+fn gcs_config(dir: &Path, prefix: Option<&str>) -> AppConfig {
+    let mut config = AppConfig::default();
+    config.snapshot.repository_backend = SnapshotRepositoryBackendKind::Gcs;
+    config.backend.gcs = Some(GcsBackendConfig {
+        bucket: "shared".to_owned(),
+        prefix: prefix.map(str::to_owned),
+        credential_path: None,
+        endpoint: Some("http://127.0.0.1:1".to_owned()),
+        allow_anonymous: true,
+        allow_application_default_credentials: false,
+        cache_max_size_gb: None,
+    });
+    config.snapshot.local_cache_path = dir.join("cache");
+    config.image.cache.root_dir = dir.join("images");
+    config
+}
+
+#[test]
+fn gcs_backend_is_selected_by_repository_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    // Construction makes no request, so an unreachable endpoint is enough.
+    build_snapshot_backend_from_config(&gcs_config(dir.path(), None), None)
+        .expect("gcs backend builds from [backend.gcs]");
+}
+
+#[test]
+fn gcs_backend_requires_its_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = gcs_config(dir.path(), None);
+    config.backend.gcs = None;
+    let err = build_snapshot_backend_from_config(&config, None)
+        .err()
+        .expect("missing [backend.gcs] must fail");
+    assert!(err.to_string().contains("backend.gcs"), "{err}");
+}
+
+#[test]
+fn builder_namespace_preserves_gcs_bucket_and_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    for (prefix, expected) in [
+        (None, "template-build/builder"),
+        (Some(" /prod/ "), "prod/template-build/builder"),
+    ] {
+        let config = gcs_config(dir.path(), prefix);
+        let builder = builder_snapshot_config(&config);
+        let gcs = builder.backend.gcs.unwrap();
+        assert_eq!(gcs.bucket, "shared");
+        assert_eq!(gcs.prefix.as_deref(), Some(expected));
+        assert_eq!(config.backend.gcs.unwrap().prefix.as_deref(), prefix);
     }
 }
 

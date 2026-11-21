@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::PublishedImage;
-use crate::repository::{DocumentKey, Repository, RepositoryError, RepositoryResult};
+use crate::repository::{
+    DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
+};
 use crate::types::{now_unix_ms, ImageTag};
 
 /// Where an image tag points, and since when.
@@ -31,6 +33,12 @@ pub trait ImageCatalog {
 
     /// The image digest `tag` points to; `None` when the tag does not exist.
     async fn get_image_tag(&self, tag: &ImageTag) -> RepositoryResult<Option<String>>;
+
+    /// Every published image description, in digest order. A managed-layer
+    /// collection pass needs this: a layer cited only by a published image must
+    /// never be collected, and the images are not reachable from the snapshot
+    /// and volume catalogs.
+    async fn list_images(&self) -> RepositoryResult<Vec<PublishedImage>>;
 }
 
 #[async_trait]
@@ -73,6 +81,19 @@ impl<R: Repository + ?Sized> ImageCatalog for R {
             return Ok(None);
         };
         Ok(Some(decode_tag(tag, &bytes)?.image_digest))
+    }
+
+    async fn list_images(&self) -> RepositoryResult<Vec<PublishedImage>> {
+        let documents = self
+            .read_documents(DocumentCollection::ImageDescriptions)
+            .await?;
+        documents
+            .into_iter()
+            .map(|(digest, bytes)| {
+                PublishedImage::decode(&digest, &bytes)
+                    .map_err(|error| RepositoryError::backend("verify image description", error))
+            })
+            .collect()
     }
 }
 

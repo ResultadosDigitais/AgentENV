@@ -1,0 +1,13 @@
+# Reserve image for build-time dependencies (OPSAI-6696).
+#
+# Built by agentenv-build-deps.cloudbuild.yaml from the files staged by
+# scripts/deps/stage_build_deps.sh. Every file's sha256 is verified against
+# config/build_deps.lock.toml before the image build, and the scheduler image
+# re-checks the probe digest after `COPY --from`. `FROM scratch` keeps the
+# image to the three artifacts.
+FROM scratch
+COPY grpc_health_probe /grpc_health_probe
+# Pinned Firecracker release tarball: the same bytes the runtime installer
+# verifies against config/deps_manifest.toml. The e2e follow-up extracts it.
+COPY firecracker /firecracker
+COPY vmlinux /vmlinux

@@ -100,8 +100,9 @@ implementation rather than after mistakes.
   upper; sealing turns changes into a reusable lower. `image.json` describes the
   stack, while layers hold data. ublk exposes it as a host block device for guest
   disks or memory restore; filesystem images and memory images are distinct.
-- **OSS:** The S3-compatible repository backend, including Alibaba OSS.
-  `snapshot.repository_backend` selects `oss` or `posix_fs`. Repositories own
+- **OSS:** The S3-compatible repository backend, including Alibaba OSS; `gcs` is
+  the native Google Cloud Storage one.
+  `snapshot.repository_backend` selects `oss`, `gcs` or `posix_fs`. Repositories own
   durable records and managed layers; external layers may stay in OCI registries.
   Runtime configs and download caches are derived data. P2P only accelerates access.
 

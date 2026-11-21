@@ -97,21 +97,22 @@ pub(crate) fn resolve_snapshot_image_target(
         return SnapshotImageTarget::parse(target_repository, tag);
     }
 
-    let (registry, repository) = if let Some(publication) =
-        canonical_rootfs_publication(snapshot_id, committed)
-    {
-        infer_repository_from_blob_urls([publication.repo_blob_url.as_str()])?
-    } else {
-        infer_repository_from_blob_urls(committed.rootfs_layers.iter().filter_map(|layer| {
-            match layer {
-                // OSS-managed layers recorded with the synthetic s3 URL
-                // are not registry sources.
-                OverlaybdLayerRef::External(layer) => (!layer.repo_blob_url.starts_with("s3://"))
-                    .then_some(layer.repo_blob_url.as_str()),
-                OverlaybdLayerRef::Managed(_) => None,
-            }
-        }))?
-    };
+    let (registry, repository) =
+        if let Some(publication) = canonical_rootfs_publication(snapshot_id, committed) {
+            infer_repository_from_blob_urls([publication.repo_blob_url.as_str()])?
+        } else {
+            infer_repository_from_blob_urls(committed.rootfs_layers.iter().filter_map(|layer| {
+                match layer {
+                    // OSS-managed layers recorded with the synthetic s3 URL
+                    // are not registry sources.
+                    OverlaybdLayerRef::External(layer) => {
+                        (!super::service::is_object_storage_url(&layer.repo_blob_url))
+                            .then_some(layer.repo_blob_url.as_str())
+                    }
+                    OverlaybdLayerRef::Managed(_) => None,
+                }
+            }))?
+        };
     let tag = match tag {
         Some(tag) => validated_tag(Some(tag))?.to_string(),
         None => format!("snapshot-{snapshot_id}"),

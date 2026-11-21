@@ -619,7 +619,6 @@ fn materialize_overlaybd_image_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
     use overlaybd::backend::local::LocalFile;
@@ -734,10 +733,19 @@ mod tests {
 
     fn fake_resize_tool(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("fake-resize.sh");
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).unwrap();
+        let script = format!("#!/bin/sh\n{body}\n");
+        // Install from a child process: writing in this test process lets a
+        // concurrent fork inherit the writable fd, so a later exec of the same
+        // file fails with ETXTBSY (os error 26); CLOEXEC only closes it at exec.
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("install-fake-resize-tool")
+            .arg(&path)
+            .arg(script)
+            .status()
+            .expect("install fake resize tool");
+        assert!(status.success(), "install fake resize tool: {status}");
         path
     }
 

@@ -1,18 +1,25 @@
 [firecracker.kvm]
 version = "1.15.1-patch-v1"
 url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
+# SHA-256 per target architecture, measured from the pinned upstream release.
+# Setup fails closed when the downloaded artifact does not match.
+sha256 = { x86_64 = "ac69af73ba5300332a9914397c8e81bdc6764711b5c190e6b8d748578bbae96b", aarch64 = "ecbe1e25c460d73136116b3c0bc827c03c1a2ceb28d3722f669786eb0a2c17b1" }
 
 [firecracker.pvm]
 version = "v1.17.0-next.1"
 url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version}/firecracker-next-{version}-{arch}.tgz"
+# PVM is supported only on x86_64; the release ships no aarch64 asset.
+sha256 = { x86_64 = "20428821e71280f1f0473a3831b5d460ad371d55df1cc472471e27137c25d657" }
 
 [kernel.kvm]
 version = "vmlinux-6.1.175"
 url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{version}-{arch}"
+sha256 = { x86_64 = "cd7c5a06a2026a2d8a0cddf60b41a5d76a6ac025e54439eb3ee5c9e57a60c67b", aarch64 = "04b12a7409b60c63bc807148826969d30ecb4d93a88ffc7690c22bcc06676752" }
 
 [kernel.pvm]
 version = "6.12.33-pvm"
 url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/vmlinux-guest-6.12.33-pvm"
+sha256 = { x86_64 = "3fe503e7b89a2b28da1d48c5973914f148a99f05e181fd8e904a73bf624a4686" }
 
 [tools]
 version = "0.1.1"

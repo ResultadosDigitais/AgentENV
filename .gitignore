@@ -59,6 +59,11 @@ Temporary Items
 # firecracker-client/**
 # !firecracker-client/firecracker.yaml
 
+### Build-time dependency reserve (OPSAI-6696)
+# Staged by scripts/deps/stage_build_deps.sh and consumed by the Cloud Build
+# image context; the verified artifacts are never committed.
+deploy/cloudbuild/build-deps/
+
 ### Runtime Environment
 env/
 .env

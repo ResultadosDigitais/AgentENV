@@ -14,8 +14,37 @@ pub(super) const HEADER_SIZE: u64 = 4096;
 pub(super) const MAX_IO_SIZE: usize = 4 * 1024 * 1024; // 4MB
 pub(super) const ALIGNMENT_4K: usize = 4096;
 pub(super) const INVALID_SEGMENT_OFFSET: u64 = (1 << 50) - 1;
-pub(super) const COMPACT_ZERO_DETECTION_ENABLED: bool = false;
 pub(crate) const PARALLEL_LOAD_INDEX: usize = 32;
+
+/// Options that change how [`compact_to_with_options`](super::helper::compact_to_with_options)
+/// lays out the destination layer.
+///
+/// Every option defaults to the historical compact behavior, so
+/// [`compact_to`](super::helper::compact_to) keeps every existing caller
+/// byte-identical.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactOptions {
+    /// Classify each 512-byte source block as zero and record the zero runs as
+    /// unbacked zero segments instead of copying their bytes.
+    ///
+    /// A discarded host page reads back as zeros, so this turns a dirty range
+    /// whose pages the guest already freed into index entries that occupy no
+    /// destination space. The format already represents these segments with
+    /// [`SegmentMapping::zeroed`](crate::lsmt::index::SegmentMapping), so the
+    /// reader path needs no change.
+    pub zero_detection: bool,
+}
+
+/// Byte accounting of one compact run, for observability of skip decisions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactStats {
+    /// Logical source bytes the mappings covered.
+    pub input_bytes: u64,
+    /// Source bytes left out of the destination because they were zero.
+    pub skipped_bytes: u64,
+    /// Data bytes written to the destination.
+    pub written_bytes: u64,
+}
 
 pub const MAX_STACK_LAYERS: usize = 255;
 

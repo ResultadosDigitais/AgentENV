@@ -26,6 +26,14 @@ pub enum DocumentKey {
     ImageTag(ImageTag),
     /// The record of one imageOnly build.
     ImageBuild(SnapshotId),
+    /// One managed-layer collection report receipt, named by the opaque token
+    /// the report returned.
+    ///
+    /// It lives outside `managed-layers/` on purpose: a collection pass that
+    /// listed its own receipt as a layer would count it unreadable and could
+    /// never run a clean enforce again. The token is only ever produced by
+    /// `uuid::Uuid::parse_str`, so a key can never escape this prefix.
+    ManagedLayerCollectReceipt(String),
 }
 
 /// A validated `sha256:<hex>` image digest. Only [`DocumentKey::image`]
@@ -54,6 +62,9 @@ impl DocumentKey {
             Self::Image(digest) => format!("{IMAGES_PREFIX}{}.json", digest.0),
             Self::ImageTag(tag) => format!("{}{}.json", image_tags_prefix(tag.name()), tag.tag()),
             Self::ImageBuild(id) => format!("{IMAGE_BUILDS_PREFIX}{id}.json"),
+            Self::ManagedLayerCollectReceipt(token) => {
+                format!("{MANAGED_LAYER_COLLECT_RECEIPTS_PREFIX}{token}.json")
+            }
         }
     }
 
@@ -80,13 +91,25 @@ impl DocumentKey {
             Self::Image(digest) => format!("{IMAGES_PREFIX}{}.lock", digest.0),
             Self::ImageTag(tag) => format!("{}{}.lock", image_tags_prefix(tag.name()), tag.tag()),
             Self::ImageBuild(id) => format!("{IMAGE_BUILDS_PREFIX}{id}.lock"),
-            Self::BuildLog(_) => format!("{}.lock", self.path()),
+            Self::BuildLog(_) | Self::ManagedLayerCollectReceipt(_) => {
+                format!("{}.lock", self.path())
+            }
         }
     }
 }
 
 fn image_tags_prefix(name: &ImageName) -> String {
     format!("{IMAGE_TAGS_PREFIX}{name}/")
+}
+
+/// Where a repository stores a named maintenance lock. Like the document and
+/// blob keys, this is the only place that names the path.
+///
+/// The prefix is one no catalog lists, so a lock object never shows up as a
+/// record. It deliberately sits outside `managed-layers/` too: a collection
+/// pass that listed its own lock as a layer would try to collect it.
+pub(crate) fn maintenance_lock_key(name: &str) -> String {
+    format!("maintenance/locks/{name}")
 }
 
 /// Whether `value` can be a volume ID or name: one path segment of the
@@ -104,12 +127,17 @@ const IMAGES_PREFIX: &str = "images/descriptions/";
 const IMAGE_TAGS_PREFIX: &str = "images/tags/";
 const IMAGE_BUILDS_PREFIX: &str = "images/builds/";
 const SNAPSHOT_RECORDS_PREFIX: &str = "catalog/records/";
+const MANAGED_LAYER_COLLECT_RECEIPTS_PREFIX: &str = "maintenance/managed-layer-collect/receipts/";
 
 /// Documents that are listed together, in ID order.
 #[derive(Clone, Copy, Debug)]
 pub enum DocumentCollection {
     VolumeRecords,
     SnapshotRecords,
+    /// Every published image description, named by its digest.
+    ImageDescriptions,
+    /// Every managed-layer collection report receipt, named by its token.
+    ManagedLayerCollectReceipts,
 }
 
 impl DocumentCollection {
@@ -118,6 +146,8 @@ impl DocumentCollection {
         match self {
             Self::VolumeRecords => VOLUME_RECORDS_PREFIX,
             Self::SnapshotRecords => SNAPSHOT_RECORDS_PREFIX,
+            Self::ImageDescriptions => IMAGES_PREFIX,
+            Self::ManagedLayerCollectReceipts => MANAGED_LAYER_COLLECT_RECEIPTS_PREFIX,
         }
     }
 
@@ -127,13 +157,20 @@ impl DocumentCollection {
         match self {
             Self::VolumeRecords => Some(DocumentKey::VolumeRecord(id.to_owned())),
             Self::SnapshotRecords => SnapshotId::parse(id).ok().map(DocumentKey::SnapshotRecord),
+            Self::ImageDescriptions => DocumentKey::image(id).ok(),
+            Self::ManagedLayerCollectReceipts => {
+                Some(DocumentKey::ManagedLayerCollectReceipt(id.to_owned()))
+            }
         }
     }
 
     /// Extracts the ID from a file name under [`Self::prefix`].
     pub(crate) fn id_from_file_name(self, file_name: &str) -> Option<&str> {
         match self {
-            Self::VolumeRecords | Self::SnapshotRecords => file_name.strip_suffix(".json"),
+            Self::VolumeRecords
+            | Self::SnapshotRecords
+            | Self::ImageDescriptions
+            | Self::ManagedLayerCollectReceipts => file_name.strip_suffix(".json"),
         }
     }
 }
@@ -170,11 +207,44 @@ impl SnapshotFile {
 
 impl BlobKey {
     /// The directory or object prefix that holds every managed layer.
-    pub(crate) const LAYERS_DIR: &'static str = "managed-layers";
+    ///
+    /// Public so the exported `behavior_table!` macro can address a layer file
+    /// from another crate; it is the single place this name is defined.
+    #[doc(hidden)]
+    pub const LAYERS_DIR: &'static str = "managed-layers";
+
+    /// The prefix every managed layer's repository-relative key starts with.
+    pub(crate) const LAYERS_PREFIX: &'static str = "managed-layers/";
 
     /// Where a POSIX repository prepares blobs before storing them, so they
     /// are on the repository's filesystem.
     pub(crate) const POSIX_STAGING_DIR: &'static str = "staging";
+
+    /// The suffix a POSIX repository gives a managed layer file.
+    pub(crate) const POSIX_LAYER_SUFFIX: &'static str = ".overlaybd.commit";
+
+    /// The digest of the layer stored under `key`, or `None` when the key does
+    /// not name a managed layer whose name translates back to a digest.
+    ///
+    /// This is the inverse of [`Self::path`] and [`Self::posix_path`], and the
+    /// only place that knows it. A collection pass uses it to decide which
+    /// managed-layer objects a record could possibly cite: an object whose name
+    /// does not translate is never deletable.
+    pub(crate) fn digest_from_layer_key(key: &str) -> Option<String> {
+        let name = key.strip_prefix(Self::LAYERS_PREFIX)?;
+        // A nested name addresses no layer this repository writes.
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        if let Some(hex) = name.strip_suffix(Self::POSIX_LAYER_SUFFIX) {
+            let hex = hex.strip_prefix("sha256_")?;
+            let digest = format!("sha256:{hex}");
+            return crate::digest::is_sha256_digest(&digest).then_some(digest);
+        }
+        // The object-store form keeps the digest verbatim, but only for the
+        // roles this repository stores, which is what `path` writes.
+        crate::digest::is_sha256_digest(name).then(|| name.to_owned())
+    }
 
     /// The object key in an object-store repository.
     pub(crate) fn path(&self) -> String {

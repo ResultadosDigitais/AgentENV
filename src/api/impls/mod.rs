@@ -1,8 +1,10 @@
 mod admin;
 mod attached_drives;
 pub(crate) mod auth;
+mod deferred_compaction;
 pub(crate) mod image_build;
 mod pagination;
+mod paused_artifacts;
 mod sandbox;
 mod snapshots;
 mod template;
@@ -96,6 +98,13 @@ impl ApiImpl {
         Arc::clone(&self.orchestrator)
     }
 
+    /// The API key this node authenticates inbound requests with. Its only
+    /// outbound use is calling the cluster gateway with the credential the node
+    /// already holds; it must never be logged or returned.
+    pub(crate) fn api_key(&self) -> &ApiKey {
+        &self.api_key
+    }
+
     pub(crate) fn proxy_client(&self) -> &ProxyClient {
         &self.proxy_client
     }
@@ -108,6 +117,11 @@ impl ApiImpl {
         Arc::clone(&self.image_resolver)
     }
 
+    /// The durable repository the snapshot manager reads and writes.
+    pub(crate) fn repository(&self) -> Arc<dyn crate::repository::Repository> {
+        self.snapshot_manager.repository()
+    }
+
     /// Returns the optional observability service backing node/admin
     /// observability endpoints. This is `None` when the server is configured
     /// with `observability.enabled = false`.
@@ -117,6 +131,20 @@ impl ApiImpl {
 
     fn error(code: i32, message: impl Into<String>) -> models::Error {
         models::Error::new(code, message.into())
+    }
+
+    /// An error that also carries a stable, machine-readable code, so a caller
+    /// can classify a deliberate refusal without parsing the message.
+    fn error_with_code(
+        code: i32,
+        error_code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> models::Error {
+        models::Error {
+            code,
+            error_code: Some(error_code.into()),
+            message: message.into(),
+        }
     }
 
     fn internal_error(err: &dyn std::error::Error) -> models::Error {

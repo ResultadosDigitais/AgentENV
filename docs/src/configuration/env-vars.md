@@ -20,6 +20,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_NODE_ID` | hostname-derived | Override the runtime node identifier used in observability/admin snapshots |
 | `AENV_CLUSTER_ID` | nil UUID | Override the cluster UUID used for P2P peer discovery and scheduler grouping |
 | `AENV_SERVICE_INSTANCE_ID` | random UUIDv7 | Override the per-process service instance UUID included in heartbeats |
+| `AENV_NODE_POOL` | empty | Named node pool reported in scheduler heartbeats. Empty keeps the node shared; a pooled node only receives sandboxes that ask for its pool |
 | `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED` | from config | Enable scheduler heartbeat reporting |
 | `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` | unset | Override scheduler heartbeat reporting endpoint |
 | `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS` | `5` | Override heartbeat reporting interval in seconds |
@@ -32,12 +33,20 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_VIRTUALIZATION_MODE` | `kvm` | Select the node virtualization mode. Leave unset for normal installations; set to `pvm` only when following the [PVM Deployment](../deployment/pvm.md) guide. |
 | `AENV_SNAPSHOT_LOCAL_CACHE_PATH` | `$AENV_HOME/snapshot-local-cache` | Override the snapshot manager's node-local artifact/cache root |
 | `AENV_SNAPSHOT_STORE` | `$AENV_HOME/snapshot-store` | Override the posix_fs snapshot repository root directory |
+| `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED` | `false` | Enable `POST /admin/managed-layers/collect`, which sweeps managed layers no catalog record cites. Disabled, the endpoint answers 409 and sweeps nothing. Deleting a layer is irreversible, so an `enforce` needs the `reportToken` of a clean report pass: the receipt it names lives in the repository and authorizes exactly one enforce, so the two calls may land on different nodes. See [Managed Layer Collection](../internals/persistence-artifact-inventory.md#managed-layer-collection). |
+| `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS` | `7200` | How old an uncited managed layer must be before `enforce` may delete it. A publish uploads its layers before it writes the record that cites them, so a layer younger than this may belong to a publish in flight. |
+| `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL` | unset | Base URL of the cluster gateway (`http://agentenv-gateway:8080` in the provided deployment), called as `GET /v2/sandboxes` with this node's API key. The gateway fans the list out to every node, so a sandbox paused on another node keeps its source layers cited, and the paused-artifact sweep sees it too. Unset, or when any node of the fan-out fails, `enforce` answers 409 and only `report` runs. |
+| `AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP` | `off` | Periodic sweep of `persisted_sandboxes/artifacts/` that reclaims a sandbox directory no record and no cluster list names any more: `off`, `report` (list and count only) or `enforce` (move to `artifacts/.trash/{epoch}/`, then delete after a second grace). Any failed or unconfigured cluster list degrades a pass to a report; see [Paused Artifact Reaping](../internals/persistence-artifact-inventory.md#orchestrator-persistence). |
 | `AENV_UBLK_DAEMON_BINARY_PATH` | `$AENV_HOME/ublk/uvm-ublk-daemon` | Override path to the `uvm-ublk-daemon` binary |
 | `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR` | `0.0.0.0:9103` | Override ublk daemon Prometheus metrics listen address; empty string disables it |
 | `AENV_FORCE_SYSCTL_TUNING` | unset | Set to `1` to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers. |
 | `AENV_FIRECRACKER_WORK_DIR` | `$AENV_HOME/firecracker-work` | Override the parent directory for per-sandbox Firecracker work directories. |
 | `AENV_FIRECRACKER_SERIAL_DIR` | `$AENV_HOME/logs/serial` | Override the directory for persistent Firecracker serial output. Files are grouped under `{serial_dir}/{sandbox_id}/`. |
 | `AENV_PERSISTED_SANDBOX_STORE_PATH` | `$AENV_HOME/persisted-sandboxes` | Override the directory where paused sandbox state is persisted across server restarts. |
+| `AENV_CHAIN_BYTES_CEILING` | `51539607552` (48 GiB) | Override the byte ceiling for the reclaimable part of one sandbox's paused artifact chain (its runtime-owned generations plus each pause's appended layer; the shared image prefix is reported but not charged). A breach no longer pays the rewrite inside the pause: when admission allows, the pause leaves a durable `deferred-compaction.json` and the maintenance worker compacts afterwards; otherwise the pause compacts inline and, if the part stays above the ceiling, refuses recoverably — the sandbox is resumed in place and keeps running and serving, so no ceiling path stops the VM. `0` disables the ceiling, the pre-flight and the stale-generation sweep, restoring the unbounded behavior without a redeploy. |
+| `AENV_ROOTFS_CHAIN_DISK_MULTIPLE` | `2` | Override the relative bound on the whole deduplicated rootfs chain of one sandbox, in multiples of the guest rootfs disk. Both bounds are judged at pause: the reclaimable part against `AENV_CHAIN_BYTES_CEILING` and the whole chain (stable prefix included) against this multiple. A breach leaves the runtime-owned suffix uncompacted and a durable descriptor behind (see `AENV_DEFERRED_COMPACTION_MAX_CONCURRENT`) when admission allows it; otherwise it compacts inline and, if the whole chain is still above the multiple, the pause is refused with the recoverable `ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED` and the VM is resumed in place. Only the rootfs chain carries this bound; memory, drive and volume keep the absolute ceiling alone. `0` disables the relative bound without a redeploy. |
+| `AENV_DEFERRED_COMPACTION_MAX_CONCURRENT` | `1` | Compactions the maintenance worker may run at the same time on this node. A pause whose byte bound is crossed leaves a durable descriptor and returns; a pause that finds this budget full compacts inline. A parameter, not a kill switch: the boot refuses `0`. PROVISIONAL default from the 13/11/2026 measurement (12 GiB rewritten per pause on a 32 GiB VM). |
+| `AENV_DEFERRED_COMPACTION_PENDING_BYTES_BUDGET` | `103079215104` (96 GiB) | Transient bytes of deferred compactions pending on this node (queued plus in flight); a pause whose compaction would cross it compacts inline. PROVISIONAL default: two times the shipped 48 GiB ceiling. A parameter, not a kill switch: the boot refuses `0`. |
 
 ## E2B SDK / CLI
 
@@ -51,18 +60,10 @@ These variables configure the E2B SDK and CLI to point at an AgentENV server. Va
 
 ### Values by Deployment Mode
 
-**Manual compile (single node)**:
+**Manual compile (single node)** uses port `8000`; **Docker Compose / Kubernetes (multi-node)** uses `8080`:
 
 ```bash
-export E2B_API_URL=http://127.0.0.1:8000
-export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=${AENV_API_KEY}
-```
-
-**Docker Compose / Kubernetes (multi-node)**:
-
-```bash
-export E2B_API_URL=http://127.0.0.1:8080
+export E2B_API_URL=http://127.0.0.1:8080   # 8000 on a single node
 export E2B_SANDBOX_URL=${E2B_API_URL}
 export E2B_API_KEY=${AENV_API_KEY}
 ```
@@ -101,7 +102,7 @@ These variables apply to both the gateway and scheduler processes.
 |----------|---------|-------------|
 | `SCHEDULER_GRPC_LISTEN_ADDR` | `:9090` | gRPC listen address |
 | `SCHEDULER_METRICS_LISTEN_ADDR` | `:9101` | Prometheus metrics listen address |
-| `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin` or `random` |
+| `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin`, `random` or `least_loaded` (the less loaded of two sampled nodes, by heartbeat CPU and memory) |
 | `SCHEDULER_REDIS_ADDR` | unset | Redis address for persistent sandbox-to-node bindings (for example, `redis:6379`). Unset = in-memory bindings, lost on scheduler restart. |
 | `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). |
 | `SCHEDULER_ARTIFACT_STORE_CAPACITY` | `1000000` | Maximum number of P2P artifact entries held in the scheduler's in-memory index |

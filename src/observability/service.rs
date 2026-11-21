@@ -77,15 +77,18 @@ impl ObservabilityService {
             node_id: self.identity.id.clone(),
             service_instance_id: self.identity.service_instance_id.clone(),
             cluster_id: self.identity.cluster_id,
+            pool: self.identity.pool.clone(),
             machine_info: self.machine_info.clone(),
             sandbox_count: runtime.running_sandbox_count,
             sandbox_ids: self.orchestrator.list_sandbox_ids().await?,
             metrics: NodeMetricsSnapshot {
                 allocated_cpu: runtime.allocated_cpu,
                 allocated_memory_bytes: runtime.allocated_memory_bytes,
+                requested_memory_bytes: runtime.requested_memory_bytes,
                 cpu_percent: host.cpu_percent,
                 cpu_count: host.cpu_count,
                 memory_used_bytes: host.memory_used_bytes,
+                memory_working_set_bytes: host.memory_working_set_bytes,
                 memory_total_bytes: host.memory_total_bytes,
                 disks: host.disks,
                 paused_allocated_cpu: runtime.paused_allocated_cpu,
@@ -95,6 +98,15 @@ impl ObservabilityService {
             create_fails: runtime.create_fails,
             sandbox_starting_count: runtime.starting_sandbox_count,
             paused_sandbox_count: runtime.paused_sandbox_count,
+            paused_sandboxes: runtime
+                .paused_sandboxes
+                .into_iter()
+                .map(|paused| super::PausedSandboxResources {
+                    sandbox_id: paused.sandbox_id,
+                    cpu_count: paused.cpu_count,
+                    memory_bytes: paused.memory_bytes,
+                })
+                .collect(),
         })
     }
 

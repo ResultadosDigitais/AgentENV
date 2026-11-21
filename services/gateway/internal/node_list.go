@@ -7,6 +7,8 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/admission"
+	"agentenv/services/shared/config"
 )
 
 func nodeStatusToString(status schedulerv1.NodeStatus) string {
@@ -44,9 +46,67 @@ type nodeListMetrics struct {
 	CPUCount                   uint32                `json:"cpuCount"`
 	MemoryUsedBytes            uint64                `json:"memoryUsedBytes"`
 	MemoryTotalBytes           uint64                `json:"memoryTotalBytes"`
+	MemoryWorkingSetBytes      *uint64               `json:"memoryWorkingSetBytes,omitempty"`
 	Disks                      []nodeListDiskMetrics `json:"disks"`
 	PausedAllocatedCPU         uint32                `json:"pausedAllocatedCPU"`
 	PausedAllocatedMemoryBytes uint64                `json:"pausedAllocatedMemoryBytes"`
+}
+
+type nodeListAdmissionLayer struct {
+	MemoryGB uint64 `json:"memoryGB"`
+	Admitted bool   `json:"admitted"`
+	// Reason is omitted when the layer is admitted.
+	Reason string `json:"reason,omitempty"`
+}
+
+// nodeListAdmissionCeilings is the including-paused ceiling pair computed from
+// the node's own reading. The ProductFactory ceiling reader looks for the
+// contract marker before trusting them.
+type nodeListAdmissionCeilings struct {
+	MemoryBytes uint64 `json:"memoryBytes"`
+	CPUCores    uint32 `json:"cpuCores"`
+}
+
+type nodeListAdmission struct {
+	AllocatableMemoryBytes uint64                   `json:"allocatableMemoryBytes"`
+	RuntimeOverheadBytes   uint64                   `json:"runtimeOverheadBytes"`
+	CapacityMemoryBytes    uint64                   `json:"capacityMemoryBytes"`
+	CapacitySource         string                   `json:"capacitySource"`
+	ReservedMemoryBytes    uint64                   `json:"reservedMemoryBytes"`
+	ReservedCPU            uint32                   `json:"reservedCPU"`
+	Layers                 []nodeListAdmissionLayer `json:"layers"`
+	// Contract marks the per-node ceiling contract the payload was computed
+	// over, Ceilings carries the pair, and ContractReason names the reason the
+	// pair could not be computed. The marker is published whenever the margin
+	// key is declared; Ceilings and ContractReason are mutually exclusive, so a
+	// reader sees unknown instead of a guessed ceiling, and a reading that has
+	// no figures never looks like the legacy path.
+	Contract       string                     `json:"contract,omitempty"`
+	Ceilings       *nodeListAdmissionCeilings `json:"ceilings,omitempty"`
+	ContractReason string                     `json:"contractReason,omitempty"`
+}
+
+// nodeAdmissionContract derives what /nodes publishes about the per-node
+// ceiling from the same shared leaf the scheduler decides on. With the margin
+// key declared the marker is always published: the ceilings ride it when the
+// node's own reading produces both, and the named reason rides it otherwise,
+// so an unreadable capacity is refused by the reader instead of falling back
+// to the legacy path. Without the margin key the legacy path publishes nothing.
+func nodeAdmissionContract(snapshot *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (string, *nodeListAdmissionCeilings, string) {
+	ceilings, reason := admission.IncludingPausedCeilingsOf(limit, snapshot.GetMemoryTotalBytes(), snapshot.GetCpuCount())
+	if !ceilings.Applied {
+		return "", nil, ""
+	}
+	if reason != "" {
+		return admission.ContractPerNodeCeilingV1, nil, reason
+	}
+	if ceilings.MemoryKnown && ceilings.CPUKnown {
+		return admission.ContractPerNodeCeilingV1, &nodeListAdmissionCeilings{
+			MemoryBytes: ceilings.MemoryBytes,
+			CPUCores:    ceilings.CPUCores,
+		}, ""
+	}
+	return admission.ContractPerNodeCeilingV1, nil, admission.ReasonCapacityUnknown
 }
 
 type nodeListItem struct {
@@ -55,14 +115,42 @@ type nodeListItem struct {
 	ID                   string              `json:"id"`
 	ServiceInstanceID    string              `json:"serviceInstanceID"`
 	ClusterID            string              `json:"clusterID"`
+	Pool                 string              `json:"pool"`
 	MachineInfo          nodeListMachineInfo `json:"machineInfo"`
 	Status               string              `json:"status"`
 	SandboxCount         uint32              `json:"sandboxCount"`
 	Metrics              nodeListMetrics     `json:"metrics"`
+	Admission            *nodeListAdmission  `json:"admission,omitempty"`
 	CreateSuccesses      uint64              `json:"createSuccesses"`
 	CreateFails          uint64              `json:"createFails"`
 	SandboxStartingCount uint32              `json:"sandboxStartingCount"`
 	SandboxPausedCount   uint32              `json:"sandboxPausedCount"`
+}
+
+// mapNodeAdmission converts the scheduler verdict into the gateway's JSON
+// shape, preserving the closed reason set and omitting the reason when the
+// layer is admitted.
+func mapNodeAdmission(admission *schedulerv1.NodeAdmission) *nodeListAdmission {
+	if admission == nil {
+		return nil
+	}
+	layers := make([]nodeListAdmissionLayer, 0, len(admission.GetLayers()))
+	for _, layer := range admission.GetLayers() {
+		layers = append(layers, nodeListAdmissionLayer{
+			MemoryGB: layer.GetMemoryGb(),
+			Admitted: layer.GetAdmitted(),
+			Reason:   layer.GetReason(),
+		})
+	}
+	return &nodeListAdmission{
+		AllocatableMemoryBytes: admission.GetAllocatableMemoryBytes(),
+		RuntimeOverheadBytes:   admission.GetRuntimeOverheadBytes(),
+		CapacityMemoryBytes:    admission.GetCapacityMemoryBytes(),
+		CapacitySource:         admission.GetCapacitySource(),
+		ReservedMemoryBytes:    admission.GetReservedMemoryBytes(),
+		ReservedCPU:            admission.GetReservedCpu(),
+		Layers:                 layers,
+	}
 }
 
 func isNodeListRequest(r *http.Request) bool {
@@ -121,12 +209,29 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			})
 		}
 
+		publishedAdmission := mapNodeAdmission(observed.GetAdmission())
+		// The marker rides the admission object the scheduler already
+		// publishes: it never invents an empty verdict only to carry it.
+		if publishedAdmission != nil {
+			if contract, ceilings, reason := nodeAdmissionContract(snapshot, s.nodeResourceLimit); contract != "" {
+				publishedAdmission.Contract = contract
+				publishedAdmission.Ceilings = ceilings
+				// ContractReason names why the pair could not be computed, so it
+				// is written only when there is one; with known ceilings the
+				// field stays empty instead of carrying an empty reason.
+				if reason != "" {
+					publishedAdmission.ContractReason = reason
+				}
+			}
+		}
+
 		out = append(out, nodeListItem{
 			Version:           observed.GetVersion(),
 			Commit:            observed.GetCommit(),
 			ID:                observed.GetNodeId(),
 			ServiceInstanceID: observed.GetServiceInstanceId(),
 			ClusterID:         observed.GetClusterId(),
+			Pool:              observed.GetPool(),
 			MachineInfo: nodeListMachineInfo{
 				CPUFamily:       observed.GetMachineInfo().GetCpuFamily(),
 				CPUModel:        observed.GetMachineInfo().GetCpuModel(),
@@ -135,6 +240,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			},
 			Status:       nodeStatusToString(snapshot.GetStatus()),
 			SandboxCount: snapshot.GetSandboxCount(),
+			Admission:    publishedAdmission,
 			Metrics: nodeListMetrics{
 				AllocatedCPU:               snapshot.GetAllocatedCpu(),
 				AllocatedMemoryBytes:       snapshot.GetAllocatedMemoryBytes(),
@@ -142,6 +248,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 				CPUCount:                   snapshot.GetCpuCount(),
 				MemoryUsedBytes:            snapshot.GetMemoryUsedBytes(),
 				MemoryTotalBytes:           snapshot.GetMemoryTotalBytes(),
+				MemoryWorkingSetBytes:      snapshot.MemoryWorkingSetBytes,
 				Disks:                      disks,
 				PausedAllocatedCPU:         snapshot.GetPausedAllocatedCpu(),
 				PausedAllocatedMemoryBytes: snapshot.GetPausedAllocatedMemoryBytes(),

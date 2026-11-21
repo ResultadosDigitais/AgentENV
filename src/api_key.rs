@@ -12,6 +12,11 @@ use tracing::info;
 use crate::cfg::AppConfig;
 use crate::managed_secret::{self, CreateOutcome};
 
+/// The header a node presents its API key in. It is wire contract, so it lives
+/// here, next to the key itself, and the inbound authenticator and the outbound
+/// cluster reader both read it from here.
+pub(crate) const API_KEY_HEADER: &str = "x-api-key";
+
 const API_KEY_ENV: &str = "AENV_API_KEY";
 const EXTERNAL_API_KEY_PATH: &str = "/run/secrets/api-key";
 const MANAGED_API_KEY_RELATIVE_PATH: &str = "secrets/api-key";
@@ -47,6 +52,13 @@ impl ApiKey {
             bail!("API key must contain between 32 and {API_KEY_MAX_LEN} URL-safe characters");
         }
         Ok(Self(value))
+    }
+
+    /// The key itself, for the one caller that has to present it: this node
+    /// calling the cluster gateway's aggregated list with the credential it
+    /// already holds. Never log the result.
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
     }
 
     pub(crate) fn matches(&self, candidate: &[u8]) -> bool {

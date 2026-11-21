@@ -17,10 +17,11 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
-    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxState, ResourceLimitPlan, ResourceLimitStatus,
+    SandboxBackend, SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
-use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
+use super::{FreshSandboxBuildSpec, PausedChainLimit, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
 use crate::types::RuntimeArtifactSet;
@@ -58,15 +59,35 @@ pub enum MockOperation {
     ForkChild,
     Stop,
     UpdateNetwork,
+    ApplyResourceLimits,
 }
 
 #[derive(Clone, Debug)]
 pub enum MockAction {
     Succeed,
     SucceedAfter(Duration),
-    Fail { message: String },
-    FailTerminal { message: String },
-    FailAfter { delay: Duration, message: String },
+    Fail {
+        message: String,
+    },
+    FailTerminal {
+        message: String,
+    },
+    FailAfter {
+        delay: Duration,
+        message: String,
+    },
+    /// Fail with the real `PausedChainLimitExceeded` type, not a message that
+    /// spells the code.
+    ///
+    /// The orchestrator's recoverable-pause branch classifies the refusal by
+    /// error TYPE, so a message-carrying variant would exercise the string path
+    /// and leave the typed one untested. This variant lets a test drive the
+    /// branch with the exact error the backend produces, for either bound.
+    FailPausedChainLimit {
+        limit: PausedChainLimit,
+        observed_bytes: u64,
+        limit_bytes: u64,
+    },
 }
 
 #[derive(Default)]
@@ -78,9 +99,18 @@ pub struct MockBehavior {
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
+    applied_resource_limits: Mutex<Vec<ResourceLimitPlan>>,
 }
 
 impl MockBehavior {
+    /// Every plan passed to `apply_resource_limits`, in call order.
+    pub fn applied_resource_limits(&self) -> Vec<ResourceLimitPlan> {
+        self.applied_resource_limits
+            .lock()
+            .expect("applied_resource_limits mutex poisoned")
+            .clone()
+    }
+
     pub fn set_envd(&self, envd: Arc<dyn super::EnvdApi>) {
         *self.envd.lock().unwrap() = Some(envd);
     }
@@ -178,6 +208,12 @@ impl MockBehavior {
                 sleep(delay).await;
                 Err(fail(message))
             }
+            // Only the capture path carries a typed ceiling error; the generic
+            // action runners never see this variant, and reaching it there is a
+            // test bug rather than a runtime case.
+            MockAction::FailPausedChainLimit { .. } => {
+                unreachable!("FailPausedChainLimit is only produced by apply_capture_result")
+            }
         }
     }
 
@@ -202,17 +238,34 @@ impl MockBehavior {
                 thread::sleep(delay);
                 Err(fail(message))
             }
+            MockAction::FailPausedChainLimit { .. } => {
+                unreachable!("FailPausedChainLimit is only produced by apply_capture_result")
+            }
         }
     }
 
     async fn apply_capture_result(&self, operation: MockOperation) -> SandboxCaptureResult<()> {
         self.run_operation_hook(operation);
-        Self::run_async_action(
-            self.pop_action(operation),
-            |message| SandboxCaptureError::recoverable(anyhow!(message)),
-            |message| SandboxCaptureError::terminal(anyhow!(message)),
-        )
-        .await
+        // Pop once: the typed ceiling variant produces the real error the backend
+        // would, so the orchestrator's type-based classification is what the test
+        // exercises, not a string that happens to spell the code.
+        match self.pop_action(operation) {
+            MockAction::FailPausedChainLimit {
+                limit,
+                observed_bytes,
+                limit_bytes,
+            } => Err(SandboxCaptureError::recoverable(
+                super::firecracker::paused_chain_limit_error(limit, observed_bytes, limit_bytes),
+            )),
+            action => {
+                Self::run_async_action(
+                    action,
+                    |message| SandboxCaptureError::recoverable(anyhow!(message)),
+                    |message| SandboxCaptureError::terminal(anyhow!(message)),
+                )
+                .await
+            }
+        }
     }
 
     async fn apply_async(&self, operation: MockOperation) -> Result<()> {
@@ -253,6 +306,7 @@ pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
     volumes_frozen: bool,
+    resource_limits: Option<ResourceLimitPlan>,
 }
 
 impl MockSandboxBackend {
@@ -268,6 +322,7 @@ impl MockSandboxBackend {
             behavior,
             host_ip,
             volumes_frozen: false,
+            resource_limits: None,
         }
     }
 }
@@ -417,6 +472,28 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     fn update_custom_extension_params(&mut self, _params: Option<CustomExtensionParams>) {}
+
+    async fn apply_resource_limits(&mut self, plan: &ResourceLimitPlan) -> Result<()> {
+        self.behavior
+            .apply_async(MockOperation::ApplyResourceLimits)
+            .await?;
+        self.behavior
+            .applied_resource_limits
+            .lock()
+            .expect("applied_resource_limits mutex poisoned")
+            .push(*plan);
+        self.resource_limits = Some(*plan);
+        Ok(())
+    }
+
+    async fn resource_limit_status(&self) -> Result<ResourceLimitStatus> {
+        let plan = self.resource_limits;
+        Ok(ResourceLimitStatus {
+            balloon_target_mib: Some(plan.map_or(0, |plan| plan.balloon_target_mib())),
+            balloon_actual_mib: None,
+            cpu_quota: plan.and_then(|plan| plan.cpu_quota()),
+        })
+    }
 }
 
 // ── MockBackendFactory ────────────────────────────────────────────────────────

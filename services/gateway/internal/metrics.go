@@ -40,6 +40,21 @@ var (
 		},
 		[]string{"rpc", "status"},
 	)
+	gatewayTemplateShapeTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_template_shape_total",
+			Help: "Template shape lookups by outcome (resolved, cache_hit, not_found, lookup_failed, unavailable, no_node).",
+		},
+		[]string{"outcome"},
+	)
+	gatewayTemplateShapeLookupSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "agentenv_gateway_template_shape_lookup_seconds",
+			Help:    "Template shape lookup duration by outcome, to measure the read does not slow the create.",
+			Buckets: observability.DurationBuckets,
+		},
+		[]string{"outcome"},
+	)
 )
 
 type statusRecorder struct {
