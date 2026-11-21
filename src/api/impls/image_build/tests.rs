@@ -357,7 +357,6 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
     let digest = publish_test_image(&api).await?;
     let build_id = image_build(&api, &["v1"]).await?;
     record::start(repository.as_ref(), &build_id).await?;
-    record::finish(repository.as_ref(), &build_id, &digest).await?;
     repository
         .put_image_tag(&ImageTag::parse("web:v1")?, &digest)
         .await?;
@@ -384,7 +383,12 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
     )
     .await?;
     assert_eq!(status, http::StatusCode::CONFLICT);
-    api.build_sessions.active.lock().unwrap().remove(&id);
+    // Publication finishes and marks the record ready, but the worker keeps the
+    // session while it drains its cleanup. The durable record is what decides
+    // whether the build is still running, so the session must not block the
+    // delete any more.
+    record::finish(repository.as_ref(), &build_id, &digest).await?;
+    session.state.send_replace(SessionState::Finished(None));
 
     let (status, info) = send(&api, http::Method::GET, &status_uri, None).await?;
     assert_eq!(status, http::StatusCode::OK);
@@ -411,6 +415,90 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
             .await?,
         Some(digest)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_build_does_not_block_deletion_while_its_session_drains() -> Result<()> {
+    use crate::image::ImageCatalog;
+    use crate::repository::DocumentKey;
+    use agentenv_http_server::apis::templates::{Templates, TemplatesTemplateIdDeleteResponse};
+    use axum_extra::extract::CookieJar;
+    use headers::Host;
+
+    let (_root, api, _) = test_api(VolumeLimits::default()).await?;
+    let repository = api.snapshot_manager.repository();
+    let digest = publish_test_image(&api).await?;
+    let build_id = image_build(&api, &["v1"]).await?;
+    record::start(repository.as_ref(), &build_id).await?;
+    // The worker publishes the image and marks the record ready before it
+    // publishes the cache seed and drains its cleanup; the session stays in the
+    // map (and in `Publishing`) until all of it is done. This is the state the
+    // e2e suite observes: the build reports ready, but its session has not been
+    // removed yet.
+    record::finish(repository.as_ref(), &build_id, &digest).await?;
+    let id = build_id.to_string();
+    let session = BuildSession::new();
+    session.state.send_replace(SessionState::Publishing);
+    api.build_sessions
+        .active
+        .lock()
+        .unwrap()
+        .insert(id.clone(), session);
+
+    // The collector never runs on the delete path: holding its maintenance lock
+    // and keeping a report receipt in the repository must not turn the delete
+    // into a conflict.
+    let receipt_token = uuid::Uuid::now_v7().hyphenated().to_string();
+    let receipt = serde_json::json!({
+        "token": receipt_token,
+        "issuedAtUnixMs": crate::types::now_unix_ms(),
+        "citedLayers": 1,
+        "citedBytes": 64,
+        "orphanLayers": 0,
+        "orphanBytes": 0,
+        "unexpiredLayers": 0,
+        "unreadableLayers": 0,
+        "unknownLayers": 0,
+    });
+    repository
+        .put_document(
+            DocumentKey::ManagedLayerCollectReceipt(receipt_token.clone()),
+            serde_json::to_vec(&receipt)?,
+        )
+        .await?;
+    let collector_lock = repository
+        .acquire_maintenance_lock("managed-layer-collect")
+        .await?
+        .expect("collector lock is free");
+
+    let response = api
+        .templates_template_id_delete(
+            &http::Method::DELETE,
+            &Host::from(http::uri::Authority::from_static("localhost")),
+            &CookieJar::new(),
+            &super::super::Claims,
+            &models::TemplatesTemplateIdDeletePathParams {
+                template_id: id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        response,
+        TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully
+    ));
+    assert!(image_build_record(&api, &build_id).await?.is_none());
+    // Deleting the finished build keeps the image it published.
+    assert!(repository.get_image(&digest).await?.is_some());
+    // The cleanup still owns the session; the delete did not touch it.
+    assert!(api.build_sessions.contains(&id));
+    // The receipt is a document of its own, untouched by the delete.
+    assert!(repository
+        .get_document(DocumentKey::ManagedLayerCollectReceipt(receipt_token))
+        .await?
+        .is_some());
+    drop(collector_lock);
     Ok(())
 }
 
