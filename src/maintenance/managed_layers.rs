@@ -39,12 +39,36 @@
 //! It never deletes an object in `managed-layers/` whose name does not translate
 //! back to a `sha256:<hex>` digest: the substrate cannot prove what such an
 //! object is, so it is reported and left alone.
+//!
+//! # The report receipt
+//!
+//! Enforce is irreversible, so it only runs after an operator has seen a clean
+//! report. The two calls of one pass need not reach the same server process —
+//! the caller goes through the gateway, and the gateway may spread them over
+//! different nodes — so the report leaves a **receipt** in the repository and
+//! the enforce consumes it:
+//!
+//! - the report writes `{ token, issuedAtUnixMs, counts }` as a repository
+//!   document under `maintenance/managed-layer-collect/receipts/`, **outside**
+//!   `managed-layers/`, and returns the token;
+//! - the enforce requires `reportToken`, reads the receipt under the same lock
+//!   the report held, and accepts it only when it exists, has not expired
+//!   ([`REPORT_RECEIPT_TTL`]), is clean (no downgrade, no unreadable or unknown
+//!   layer, at least one cited layer) and was not consumed;
+//! - the enforce then reclassifies the whole bucket under the lock and deletes
+//!   only an uncited layer older than the grace period. It never trusts the
+//!   counts in the receipt;
+//! - any deviation refuses the pass; nothing is deleted. A receipt authorizes
+//!   exactly one enforce, and each report prunes the receipts that expired.
+//!
+//! The token is a secret: it is never logged, and every backend message that
+//! names the receipt's document is redacted before it reaches a log line.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::image::{ImageCatalog, PublishedImage};
@@ -56,12 +80,25 @@ use crate::repository::{
 /// The lock one collection pass holds, so two passes never overlap.
 const PASS_LOCK: &str = "managed-layer-collect";
 
+/// How many report receipts one prune page lists.
+const RECEIPT_PRUNE_PAGE: usize = 256;
+
+/// How long a report receipt stays valid after the report pass finished.
+///
+/// A caller runs the report and the enforce of the same pass seconds apart, so
+/// this window only has to cover the gap between the two calls. It is short on
+/// purpose: the receipt is the proof that an operator saw a clean report, and an
+/// old receipt no longer describes the bucket.
+pub const REPORT_RECEIPT_TTL: Duration = Duration::from_secs(15 * 60);
+
 /// What one pass does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedLayerCollectMode {
-    /// List and count the orphans without deleting anything.
+    /// List and count the orphans without deleting anything, and leave the
+    /// receipt one enforce pass can use.
     Report,
-    /// Delete the orphans that are older than the grace period.
+    /// Delete the orphans that are older than the grace period, after consuming
+    /// the receipt a report pass left.
     Enforce,
 }
 
@@ -82,6 +119,14 @@ pub struct ManagedLayerCollectRequest {
     /// may delete it. Must exceed one publication's layer-upload-to-record-commit
     /// time; see the module documentation.
     pub grace: Duration,
+    /// The token a report pass returned. An enforce pass carries the token of
+    /// the report pass it follows; a report pass ignores it.
+    ///
+    /// This is what replaces the old requirement that both calls reach the same
+    /// server process: the report writes a receipt under the repository lock and
+    /// the enforce consumes it, so the two calls can land on different nodes.
+    /// The token is a secret and is never logged.
+    pub report_token: Option<String>,
 }
 
 /// One object the pass could not classify or act on. A single error never stops
@@ -117,10 +162,14 @@ pub struct ManagedLayerCollectReport {
     /// Bytes actually removed. Always zero in report mode.
     pub reclaimed_bytes: u64,
     /// Set when the pass listed and counted but deleted nothing, even in enforce
-    /// mode. A live sandbox whose source is gone sets it, and so does a request
-    /// that asked for enforce without a preceding report.
+    /// mode. A live sandbox whose source is gone sets it.
     pub downgraded_reason: Option<String>,
     pub failures: Vec<ManagedLayerCollectFailure>,
+    /// The opaque token a report pass leaves for exactly one enforce pass.
+    ///
+    /// Present only on a report pass that persisted its receipt. It is a
+    /// secret: never log it, never persist it anywhere but its own receipt.
+    pub report_token: Option<String>,
 }
 
 /// Why a pass could not run.
@@ -128,10 +177,84 @@ pub struct ManagedLayerCollectReport {
 pub enum ManagedLayerCollectorError {
     #[error("another managed-layer collection pass holds the repository lock")]
     Locked,
-    #[error("enforce requires a report pass in this server process first")]
-    ReportRequired,
+    /// Enforce was requested with a token that names no usable report receipt.
+    ///
+    /// The reason never carries the token itself: it is a secret.
+    #[error("enforce requires a valid report receipt: {0}")]
+    ReportReceiptRejected(&'static str),
+    /// The repository could not read, write or consume the receipt.
+    ///
+    /// The message is the backend's error with the token redacted.
+    #[error("the report receipt is unavailable: {0}")]
+    ReceiptUnavailable(String),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+}
+
+/// The proof one report pass leaves behind for exactly one enforce pass.
+///
+/// It is a repository document under
+/// `maintenance/managed-layer-collect/receipts/`, never under `managed-layers/`:
+/// a collection pass that listed its own receipt as a layer would count it
+/// unreadable and could never run a clean enforce again.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManagedLayerCollectReceipt {
+    /// The opaque token the report returned.
+    token: String,
+    /// When the report pass finished, in milliseconds since the Unix epoch.
+    #[serde(rename = "issuedAtUnixMs")]
+    issued_at_unix_ms: u64,
+    #[serde(rename = "citedLayers")]
+    cited_layers: u64,
+    #[serde(rename = "citedBytes")]
+    cited_bytes: u64,
+    #[serde(rename = "orphanLayers")]
+    orphan_layers: u64,
+    #[serde(rename = "orphanBytes")]
+    orphan_bytes: u64,
+    #[serde(rename = "unexpiredLayers")]
+    unexpired_layers: u64,
+    #[serde(rename = "unreadableLayers")]
+    unreadable_layers: u64,
+    #[serde(rename = "unknownLayers")]
+    unknown_layers: u64,
+    #[serde(rename = "downgradedReason", default)]
+    downgraded_reason: Option<String>,
+}
+
+impl ManagedLayerCollectReceipt {
+    fn from_report(token: String, report: &ManagedLayerCollectReport) -> Self {
+        Self {
+            token,
+            issued_at_unix_ms: now_unix_ms(),
+            cited_layers: report.cited_layers,
+            cited_bytes: report.cited_bytes,
+            orphan_layers: report.orphan_layers,
+            orphan_bytes: report.orphan_bytes,
+            unexpired_layers: report.unexpired_layers,
+            unreadable_layers: report.unreadable_layers,
+            unknown_layers: report.unknown_layers,
+            downgraded_reason: report.downgraded_reason.clone(),
+        }
+    }
+
+    /// Whether the report this receipt names proved the bucket safe to sweep.
+    ///
+    /// Only a pass whose citation set was knowable and whose bucket held at
+    /// least one cited layer can authorize a deletion. An unreadable object is
+    /// left alone by the pass itself, but it still means an operator must look
+    /// at what it is before anything is deleted.
+    fn is_clean(&self) -> bool {
+        self.unknown_layers == 0
+            && self.unreadable_layers == 0
+            && self.cited_layers > 0
+            && self.downgraded_reason.is_none()
+    }
+
+    fn expired(&self, now_unix_ms: u64) -> bool {
+        let ttl_ms = u64::try_from(REPORT_RECEIPT_TTL.as_millis()).unwrap_or(u64::MAX);
+        now_unix_ms.saturating_sub(self.issued_at_unix_ms) > ttl_ms
+    }
 }
 
 /// What the collector needs from the node it runs on.
@@ -166,9 +289,35 @@ where
     let Some(lock) = lock else {
         return Err(ManagedLayerCollectorError::Locked);
     };
-    let outcome = run_pass(repository, live, request).await;
+    let outcome = run_locked_pass(repository, live, request).await;
     release(repository, lock).await;
-    outcome.map_err(ManagedLayerCollectorError::from)
+    outcome
+}
+
+/// One pass, run with the repository lock already held.
+///
+/// The receipt is read and consumed here, under the same lock that serializes
+/// passes, so two enforce calls can never both use one receipt. The enforce
+/// reclassifies the whole bucket under this lock; it never trusts the counts the
+/// receipt carries, which are recorded for the operator only.
+async fn run_locked_pass<R, L>(
+    repository: &R,
+    live: &L,
+    request: &ManagedLayerCollectRequest,
+) -> Result<ManagedLayerCollectReport, ManagedLayerCollectorError>
+where
+    R: Repository + ?Sized,
+    L: LiveSandboxes + ?Sized,
+{
+    if request.mode == ManagedLayerCollectMode::Enforce {
+        consume_report_receipt(repository, request.report_token.as_deref()).await?;
+    }
+    let mut report = run_pass(repository, live, request).await?;
+    if request.mode == ManagedLayerCollectMode::Report {
+        prune_expired_report_receipts(repository).await;
+        report.report_token = Some(issue_report_receipt(repository, &report).await?);
+    }
+    Ok(report)
 }
 
 async fn run_pass<R, L>(
@@ -261,6 +410,206 @@ where
         "managed layer collection pass finished"
     );
     Ok(report)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// The canonical form of a token this server issued, or `None` when `token`
+/// cannot be one.
+///
+/// Only a UUID can be a token, so a caller-supplied string can never name a
+/// document outside the receipt prefix.
+fn canonical_report_token(token: &str) -> Option<String> {
+    uuid::Uuid::parse_str(token)
+        .ok()
+        .map(|token| token.hyphenated().to_string())
+}
+
+fn receipt_key(token: &str) -> DocumentKey {
+    DocumentKey::ManagedLayerCollectReceipt(token.to_owned())
+}
+
+/// Removes the token from a backend message before it can reach a log line or
+/// an operator. A backend names the document it failed on, and the token is
+/// that document's name.
+fn redact(token: &str, message: &str) -> String {
+    message.replace(token, "<report-token>")
+}
+
+/// Persists the receipt a report pass leaves for one enforce pass.
+async fn issue_report_receipt<R: Repository + ?Sized>(
+    repository: &R,
+    report: &ManagedLayerCollectReport,
+) -> Result<String, ManagedLayerCollectorError> {
+    let token = uuid::Uuid::now_v7().hyphenated().to_string();
+    let receipt = ManagedLayerCollectReceipt::from_report(token.clone(), report);
+    let bytes = serde_json::to_vec(&receipt).map_err(|error| {
+        ManagedLayerCollectorError::ReceiptUnavailable(redact(&token, &error.to_string()))
+    })?;
+    repository
+        .put_document(receipt_key(&token), bytes)
+        .await
+        .map_err(|error| {
+            ManagedLayerCollectorError::ReceiptUnavailable(redact(&token, &error.to_string()))
+        })?;
+    Ok(token)
+}
+
+/// Persists a clean receipt as a report pass would, dated by the caller.
+///
+/// Test scaffolding for the behavior table's expired case: only a real report
+/// pass mints a receipt in production, and this is not reachable from an
+/// external crate.
+pub(crate) async fn persist_receipt_for_test<R: Repository + ?Sized>(
+    repository: &R,
+    token: &str,
+    issued_at_unix_ms: u64,
+) -> RepositoryResult<()> {
+    let receipt = ManagedLayerCollectReceipt {
+        token: token.to_owned(),
+        issued_at_unix_ms,
+        cited_layers: 1,
+        cited_bytes: 64,
+        orphan_layers: 0,
+        orphan_bytes: 0,
+        unexpired_layers: 0,
+        unreadable_layers: 0,
+        unknown_layers: 0,
+        downgraded_reason: None,
+    };
+    let bytes = serde_json::to_vec(&receipt).map_err(|error| RepositoryError::InvalidRequest {
+        reason: format!("serialize report receipt: {error}"),
+    })?;
+    repository.put_document(receipt_key(token), bytes).await
+}
+
+/// Validates the receipt an enforce pass names and consumes it.
+///
+/// Called under the pass lock, before the bucket is classified: one report
+/// authorizes one enforce, and the enforce that gets here is the one that spends
+/// it. Every failure is a refusal to delete anything.
+async fn consume_report_receipt<R: Repository + ?Sized>(
+    repository: &R,
+    token: Option<&str>,
+) -> Result<(), ManagedLayerCollectorError> {
+    let Some(token) = token else {
+        return Err(ManagedLayerCollectorError::ReportReceiptRejected(
+            "enforce requires the reportToken a report pass returned",
+        ));
+    };
+    let Some(token) = canonical_report_token(token) else {
+        return Err(ManagedLayerCollectorError::ReportReceiptRejected(
+            "the reportToken is not a token this server hands out",
+        ));
+    };
+    let key = receipt_key(&token);
+    let bytes = repository
+        .get_document(key.clone())
+        .await
+        .map_err(|error| {
+            ManagedLayerCollectorError::ReceiptUnavailable(redact(&token, &error.to_string()))
+        })?;
+    let Some(bytes) = bytes else {
+        return Err(ManagedLayerCollectorError::ReportReceiptRejected(
+            "no report receipt matches this token: it was never issued, was already used, \
+             or expired",
+        ));
+    };
+    let receipt: ManagedLayerCollectReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+        ManagedLayerCollectorError::ReportReceiptRejected(
+            "the report receipt this token names is unreadable",
+        )
+    })?;
+    if receipt.token != token {
+        return Err(ManagedLayerCollectorError::ReportReceiptRejected(
+            "the report receipt this token names does not belong to it",
+        ));
+    }
+    if receipt.expired(now_unix_ms()) {
+        return Err(ManagedLayerCollectorError::ReportReceiptRejected(
+            "the report receipt expired; run a new report pass",
+        ));
+    }
+    if !receipt.is_clean() {
+        return Err(ManagedLayerCollectorError::ReportReceiptRejected(
+            "the report that issued this receipt did not prove the bucket safe: it was \
+             downgraded, found unreadable or unknown layers, or cited none",
+        ));
+    }
+    // The receipt is spent before the sweep starts, still under the lock: a call
+    // that dies mid-sweep never leaves a receipt another enforce could reuse.
+    repository.delete_document(key).await.map_err(|error| {
+        ManagedLayerCollectorError::ReceiptUnavailable(redact(&token, &error.to_string()))
+    })?;
+    Ok(())
+}
+
+/// Deletes the receipts that can no longer authorize an enforce.
+///
+/// A receipt the caller never used would otherwise stay in the bucket for good.
+/// Pruning is best-effort: a failure leaves the receipt to the next report, and
+/// never fails the report that is running.
+async fn prune_expired_report_receipts<R: Repository + ?Sized>(repository: &R) {
+    let collection = DocumentCollection::ManagedLayerCollectReceipts;
+    let now = now_unix_ms();
+    // Paged, because an object-store backend materializes the page it is asked
+    // for and cannot be handed an unbounded one.
+    let mut after: Option<String> = None;
+    loop {
+        let page = match repository
+            .list_documents(collection, after.as_deref(), RECEIPT_PRUNE_PAGE)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                // The listing names only the shared prefix, never a token.
+                warn!(error = %error, "failed to list report receipts; expired receipts stay until the next report");
+                return;
+            }
+        };
+        let full_page = page.len() == RECEIPT_PRUNE_PAGE;
+        for token in page.iter() {
+            let Some(token) = canonical_report_token(token) else {
+                // Nothing but a report writes here, so this is not a receipt
+                // this server can judge. Leaving it is safer than deleting a
+                // foreign object.
+                continue;
+            };
+            let key = receipt_key(&token);
+            let expired = match repository.get_document(key.clone()).await {
+                // A receipt this server cannot parse can never authorize an
+                // enforce, so it is collected with the expired ones.
+                Ok(Some(bytes)) => {
+                    match serde_json::from_slice::<ManagedLayerCollectReceipt>(&bytes) {
+                        Ok(receipt) => receipt.expired(now),
+                        Err(_) => true,
+                    }
+                }
+                // Consumed by an enforce since the listing.
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(error = %redact(&token, &error.to_string()), "failed to read a report receipt while pruning it");
+                    continue;
+                }
+            };
+            if !expired {
+                continue;
+            }
+            if let Err(error) = repository.delete_document(key).await {
+                warn!(error = %redact(&token, &error.to_string()), "failed to prune an expired report receipt");
+            }
+        }
+        if !full_page {
+            return;
+        }
+        after = page.last().cloned();
+    }
 }
 
 /// Records one pass, so an operator can see the bucket shrinking without

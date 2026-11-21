@@ -434,10 +434,29 @@ impl ApiImpl {
             return Ok(());
         };
         if self.build_sessions.contains(&id.to_string()) {
-            return Err(Self::error(
-                409,
-                "image build is active; cancel the builder or wait for it to finish",
-            ));
+            // The session outlives the build itself: after the record is ready
+            // or has failed, the worker still drains its cleanup (publishes the
+            // cache seed, retires the cache volume) before it removes the
+            // session. The durable record, not the in-memory session, says
+            // whether a writer may still touch the build, so only a record that
+            // is waiting or building blocks the deletion. This is also the fact
+            // another node observes, so a delete that lands while the local
+            // cleanup drains keeps working.
+            let running = record::get(self.snapshot_manager.repository().as_ref(), &id)
+                .await
+                .map_err(|err| Self::repository_error(&err))?
+                .is_some_and(|record| {
+                    matches!(
+                        record.build.status,
+                        TemplateBuildStatus::Waiting | TemplateBuildStatus::Building
+                    )
+                });
+            if running {
+                return Err(Self::error(
+                    409,
+                    "image build is active; cancel the builder or wait for it to finish",
+                ));
+            }
         }
         record::delete(self.snapshot_manager.repository().as_ref(), &id)
             .await

@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,13 +15,6 @@ use crate::observability::{DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSna
 use agentenv_http_server::{apis::admin::*, models};
 
 use super::ApiImpl;
-
-/// Whether a report pass has run in this process, which enforce requires.
-///
-/// Enforce is irreversible: the bucket has no trash, and a layer cannot be
-/// rebuilt without its origin. Requiring one report first makes an operator see
-/// what a pass would remove before it removes anything.
-static REPORT_RAN: AtomicBool = AtomicBool::new(false);
 
 impl From<MachineInfo> for models::MachineInfo {
     fn from(machine_info: MachineInfo) -> Self {
@@ -112,8 +104,8 @@ impl Admin<()> for ApiImpl {
                 ),
             ),
             // The refusals this endpoint decides itself (disabled on this node,
-            // another pass running, enforce before a report) are conflicts; a
-            // backend failure keeps its own status.
+            // another pass running, an enforce without a valid report receipt)
+            // are conflicts; a backend failure keeps its own status.
             Err(error) => Ok(match error.code {
                 400 => AdminManagedLayersCollectPostResponse::Status400_BadRequest(error),
                 403 => AdminManagedLayersCollectPostResponse::Status403_Forbidden(error),
@@ -242,14 +234,9 @@ impl ApiImpl {
             models::ManagedLayerCollectMode::Report => ManagedLayerCollectMode::Report,
             models::ManagedLayerCollectMode::Enforce => ManagedLayerCollectMode::Enforce,
         };
-        // Enforce is irreversible, so an operator must have seen a report from
-        // this process first.
-        if mode == ManagedLayerCollectMode::Enforce && !REPORT_RAN.load(Ordering::SeqCst) {
-            return Err(Self::error(
-                409,
-                "enforce requires a report pass in this server process first",
-            ));
-        }
+        // Enforce is irreversible, so it only runs after a clean report. That
+        // proof travels as the receipt the report left in the repository, so the
+        // report and the enforce of one pass may land on different nodes.
         let grace = body.grace_seconds.map_or_else(
             || Duration::from_secs(collect.grace_secs),
             Duration::from_secs,
@@ -270,21 +257,22 @@ impl ApiImpl {
         let report = collect_managed_layers(
             repository.as_ref(),
             &live,
-            &ManagedLayerCollectRequest { mode, grace },
+            &ManagedLayerCollectRequest {
+                mode,
+                grace,
+                report_token: body.report_token.clone(),
+            },
         )
         .await
         .map_err(|error| match error {
             ManagedLayerCollectorError::Locked => {
                 Self::error(409, "another managed-layer collection pass is running")
             }
-            ManagedLayerCollectorError::ReportRequired => {
-                Self::error(409, "enforce requires a report pass first")
-            }
+            // The refusal never carries the token: it is a secret.
+            ManagedLayerCollectorError::ReportReceiptRejected(reason) => Self::error(409, reason),
+            ManagedLayerCollectorError::ReceiptUnavailable(message) => Self::error(500, message),
             ManagedLayerCollectorError::Repository(error) => Self::repository_error(&error),
         })?;
-        if mode == ManagedLayerCollectMode::Report {
-            REPORT_RAN.store(true, Ordering::SeqCst);
-        }
         Ok(report)
     }
 
@@ -335,6 +323,7 @@ impl From<ManagedLayerCollectReport> for models::ManagedLayerCollectReport {
             deleted_layers: report.deleted_layers,
             reclaimed_bytes: report.reclaimed_bytes,
             downgraded_reason: report.downgraded_reason,
+            report_token: report.report_token,
             failures: (!report.failures.is_empty()).then(|| {
                 report
                     .failures

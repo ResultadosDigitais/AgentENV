@@ -37,7 +37,44 @@ pub fn layer(digest: &str) -> OverlaybdLayerRef {
 }
 
 pub fn request(mode: ManagedLayerCollectMode) -> ManagedLayerCollectRequest {
-    ManagedLayerCollectRequest { mode, grace: GRACE }
+    ManagedLayerCollectRequest {
+        mode,
+        grace: GRACE,
+        report_token: None,
+    }
+}
+
+/// Stores one layer and the snapshot record that cites it.
+///
+/// A clean report cites at least one layer, so every case that wants a receipt
+/// able to authorize an enforce starts here. Returns the cited digest.
+pub async fn store_cited_layer<R: Repository + ?Sized>(repository: &R) -> String {
+    let cited = digest("cited");
+    store_layer(repository, &cited, 64)
+        .await
+        .expect("store cited layer");
+    store_snapshot_record(repository, &[&cited]).await;
+    cited
+}
+
+/// A token shaped exactly like the one a report pass mints.
+pub fn fresh_report_token() -> String {
+    uuid::Uuid::now_v7().hyphenated().to_string()
+}
+
+/// Writes a report receipt as a report pass would, dated by the caller.
+///
+/// Test scaffolding: a case needs a receipt that expired, and only the server
+/// issues real ones. The token is fresh on every call.
+pub async fn write_report_receipt_at(
+    repository: &dyn Repository,
+    issued_at_unix_ms: u64,
+) -> String {
+    let token = fresh_report_token();
+    super::managed_layers::persist_receipt_for_test(repository, &token, issued_at_unix_ms)
+        .await
+        .expect("persist report receipt");
+    token
 }
 
 /// A node with no live sandbox.
@@ -283,13 +320,14 @@ macro_rules! behavior_table {
             // invocation, one level up.
             use super::*;
             use $crate::maintenance::behavior_table::{
-                age_layer, cluster_live, digest, filetime_set, request, store_image, store_layer,
-                store_snapshot_record, store_volume_record, stored_layer_keys,
+                age_layer, cluster_live, digest, filetime_set, fresh_report_token, request,
+                store_cited_layer, store_image, store_layer, store_snapshot_record,
+                store_volume_record, stored_layer_keys, write_report_receipt_at,
                 write_unreadable_layer, LiveSandboxesUnderTest, NoLiveSandboxesUnderTest,
             };
             use $crate::maintenance::{
-                collect_managed_layers, ManagedLayerCollectMode, ManagedLayerCollectRequest,
-                ManagedLayerCollectorError,
+                collect_managed_layers, LiveSandboxes, ManagedLayerCollectMode,
+                ManagedLayerCollectRequest, ManagedLayerCollectorError,
             };
             use $crate::repository::{
                 DocumentCollection, DocumentKey, ManagedLayerObject, Repository,
@@ -323,8 +361,59 @@ macro_rules! behavior_table {
                     ManagedLayerCollectRequest {
                         mode,
                         grace: std::time::Duration::ZERO,
+                        report_token: None,
                     }
                 }
+            }
+
+            /// Runs a report pass and returns the receipt token it issued.
+            ///
+            /// Every enforce case starts here: the receipt, not this process, is
+            /// what authorizes a deletion.
+            async fn report_and_token(
+                repository: &std::sync::Arc<dyn Repository>,
+                live: &dyn LiveSandboxes,
+                pass: ManagedLayerCollectRequest,
+            ) -> String {
+                let report = collect_managed_layers(repository.as_ref(), live, &pass)
+                    .await
+                    .expect("report pass");
+                report
+                    .report_token
+                    .expect("a report pass must return its receipt token")
+            }
+
+            /// The same request, carrying the token of the report it follows.
+            fn with_receipt(
+                mut pass: ManagedLayerCollectRequest,
+                token: &str,
+            ) -> ManagedLayerCollectRequest {
+                pass.report_token = Some(token.to_owned());
+                pass
+            }
+
+            /// A report pass over a clean bucket that cites one layer.
+            async fn clean_report_token(repository: &std::sync::Arc<dyn Repository>) -> String {
+                store_cited_layer(repository.as_ref()).await;
+                report_and_token(
+                    repository,
+                    &NoLiveSandboxesUnderTest,
+                    request(ManagedLayerCollectMode::Report),
+                )
+                .await
+            }
+
+            fn assert_receipt_rejected<T: std::fmt::Debug>(
+                result: Result<T, ManagedLayerCollectorError>,
+                case: &str,
+            ) {
+                assert!(
+                    matches!(
+                        &result,
+                        Err(ManagedLayerCollectorError::ReportReceiptRejected(_))
+                    ),
+                    "{case}: an enforce without a valid receipt must be refused, got {result:?}"
+                );
             }
 
             #[tokio::test]
@@ -362,11 +451,15 @@ macro_rules! behavior_table {
             #[tokio::test]
             async fn an_orphan_older_than_the_grace_leaves_in_enforce() {
                 let (repository, temp) = repository().await;
+                let token = clean_report_token(&repository).await;
                 let orphan = digest("stale-orphan");
                 store_layer(repository.as_ref(), &orphan, 256)
                     .await
                     .expect("store orphan");
-                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
 
                 let report =
                     collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
@@ -375,24 +468,28 @@ macro_rules! behavior_table {
 
                 assert_eq!(report.deleted_layers, 1);
                 assert_eq!(report.reclaimed_bytes, 256);
-                assert!(stored_layer_keys(repository.as_ref()).await.is_empty());
+                let remaining = stored_layer_keys(repository.as_ref()).await;
+                assert!(!remaining.contains(&orphan), "the stale orphan must leave");
+                assert!(
+                    remaining.contains(&digest("cited")),
+                    "the cited layer must stay: {remaining:?}"
+                );
             }
 
             #[tokio::test]
             async fn an_orphan_inside_the_grace_stays() {
                 let (repository, _temp) = repository().await;
+                let token = clean_report_token(&repository).await;
                 let young = digest("young-orphan");
                 store_layer(repository.as_ref(), &young, 512)
                     .await
                     .expect("store orphan");
+                let pass = with_receipt(request(ManagedLayerCollectMode::Enforce), &token);
 
-                let report = collect_managed_layers(
-                    repository.as_ref(),
-                    &NoLiveSandboxesUnderTest,
-                    &request(ManagedLayerCollectMode::Enforce),
-                )
-                .await
-                .expect("collect");
+                let report =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await
+                        .expect("collect");
 
                 assert_eq!(report.unexpired_layers, 1);
                 assert_eq!(report.orphan_layers, 0);
@@ -434,8 +531,16 @@ macro_rules! behavior_table {
                     .await
                     .expect("store image layer");
                 store_image(repository.as_ref(), &[&image_layer]).await;
-                let pass =
-                    age_or_shrink_grace(&temp, &image_layer, ManagedLayerCollectMode::Enforce);
+                let token = report_and_token(
+                    &repository,
+                    &NoLiveSandboxesUnderTest,
+                    request(ManagedLayerCollectMode::Report),
+                )
+                .await;
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &image_layer, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
 
                 let report =
                     collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
@@ -457,8 +562,16 @@ macro_rules! behavior_table {
                     .await
                     .expect("store volume layer");
                 store_volume_record(repository.as_ref(), &[&volume_layer]).await;
-                let pass =
-                    age_or_shrink_grace(&temp, &volume_layer, ManagedLayerCollectMode::Enforce);
+                let token = report_and_token(
+                    &repository,
+                    &NoLiveSandboxesUnderTest,
+                    request(ManagedLayerCollectMode::Report),
+                )
+                .await;
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &volume_layer, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
 
                 let report =
                     collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
@@ -475,6 +588,9 @@ macro_rules! behavior_table {
             #[tokio::test]
             async fn an_object_whose_name_is_not_a_digest_never_leaves() {
                 let (repository, temp) = repository().await;
+                // A stray object that appears after a clean report must still be
+                // left alone by the enforce the report authorized.
+                let token = clean_report_token(&repository).await;
                 write_unreadable_layer(repository.as_ref()).await;
                 // POSIX storage can be aged; an object store reports its own
                 // clock, so these cases ask for a zero grace instead.
@@ -501,10 +617,14 @@ macro_rules! behavior_table {
                 let report = collect_managed_layers(
                     repository.as_ref(),
                     &NoLiveSandboxesUnderTest,
-                    &ManagedLayerCollectRequest {
-                        mode: ManagedLayerCollectMode::Enforce,
-                        grace: std::time::Duration::ZERO,
-                    },
+                    &with_receipt(
+                        ManagedLayerCollectRequest {
+                            mode: ManagedLayerCollectMode::Enforce,
+                            grace: std::time::Duration::ZERO,
+                            report_token: None,
+                        },
+                        &token,
+                    ),
                 )
                 .await
                 .expect("collect");
@@ -521,6 +641,163 @@ macro_rules! behavior_table {
                         .count(),
                     1
                 );
+            }
+
+            #[tokio::test]
+            async fn a_report_pass_leaves_one_receipt_outside_the_layers_and_an_enforce_spends_it()
+            {
+                let (repository, temp) = repository().await;
+                store_cited_layer(repository.as_ref()).await;
+                let orphan = digest("receipt-orphan");
+                store_layer(repository.as_ref(), &orphan, 128)
+                    .await
+                    .expect("store orphan");
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Report);
+                let before = stored_layer_keys(repository.as_ref()).await;
+
+                let report =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await
+                        .expect("report");
+                let token = report.report_token.expect("a report must return its token");
+                assert_eq!(report.deleted_layers, 0, "a report never deletes");
+                assert_eq!(
+                    stored_layer_keys(repository.as_ref()).await,
+                    before,
+                    "the receipt must not be stored under managed-layers/"
+                );
+
+                // The enforce lands after the report and still spends the
+                // receipt; nothing about the process that ran the report matters.
+                let enforce = with_receipt(
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
+                let swept = collect_managed_layers(
+                    repository.as_ref(),
+                    &NoLiveSandboxesUnderTest,
+                    &enforce,
+                )
+                .await
+                .expect("enforce");
+                assert_eq!(swept.deleted_layers, 1);
+                assert!(!stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&orphan));
+
+                // One use only: the same token is refused the second time. The
+                // orphan is already gone, so the request needs no aging.
+                let again = collect_managed_layers(
+                    repository.as_ref(),
+                    &NoLiveSandboxesUnderTest,
+                    &with_receipt(request(ManagedLayerCollectMode::Enforce), &token),
+                )
+                .await;
+                assert_receipt_rejected(again, "a consumed receipt");
+            }
+
+            #[tokio::test]
+            async fn an_enforce_without_a_report_token_is_refused() {
+                let (repository, temp) = repository().await;
+                let orphan = digest("no-receipt-orphan");
+                store_layer(repository.as_ref(), &orphan, 256)
+                    .await
+                    .expect("store orphan");
+                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+
+                let refused =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await;
+
+                assert_receipt_rejected(refused, "no report token");
+                assert!(
+                    stored_layer_keys(repository.as_ref())
+                        .await
+                        .contains(&orphan),
+                    "a refused enforce must delete nothing"
+                );
+            }
+
+            #[tokio::test]
+            async fn an_enforce_with_a_token_this_server_never_issued_is_refused() {
+                let (repository, temp) = repository().await;
+                let orphan = digest("unknown-receipt-orphan");
+                store_layer(repository.as_ref(), &orphan, 256)
+                    .await
+                    .expect("store orphan");
+                let unknown = fresh_report_token();
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce),
+                    &unknown,
+                );
+
+                let refused =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await;
+
+                assert_receipt_rejected(refused, "an unknown token");
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&orphan));
+            }
+
+            #[tokio::test]
+            async fn an_enforce_with_an_expired_receipt_is_refused() {
+                let (repository, temp) = repository().await;
+                let orphan = digest("expired-receipt-orphan");
+                store_layer(repository.as_ref(), &orphan, 256)
+                    .await
+                    .expect("store orphan");
+                // Issued at the Unix epoch: far past any short TTL.
+                let expired = write_report_receipt_at(repository.as_ref(), 0).await;
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce),
+                    &expired,
+                );
+
+                let refused =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await;
+
+                assert_receipt_rejected(refused, "an expired receipt");
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&orphan));
+            }
+
+            #[tokio::test]
+            async fn a_report_that_was_not_clean_does_not_authorize_an_enforce() {
+                let (repository, temp) = repository().await;
+                let orphan = digest("unclean-report-orphan");
+                store_layer(repository.as_ref(), &orphan, 256)
+                    .await
+                    .expect("store orphan");
+                write_unreadable_layer(repository.as_ref()).await;
+                let report_pass =
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Report);
+
+                let report = collect_managed_layers(
+                    repository.as_ref(),
+                    &NoLiveSandboxesUnderTest,
+                    &report_pass,
+                )
+                .await
+                .expect("report");
+                assert_eq!(report.unreadable_layers, 1);
+                let token = report.report_token.expect("a report returns a token");
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
+
+                let refused =
+                    collect_managed_layers(repository.as_ref(), &NoLiveSandboxesUnderTest, &pass)
+                        .await;
+
+                assert_receipt_rejected(refused, "an unclean report");
+                assert!(stored_layer_keys(repository.as_ref())
+                    .await
+                    .contains(&orphan));
             }
 
             #[tokio::test]
@@ -557,11 +834,17 @@ macro_rules! behavior_table {
             #[tokio::test]
             async fn a_live_sandbox_source_that_is_gone_downgrades_the_pass_to_a_report() {
                 let (repository, temp) = repository().await;
+                // A clean report authorizes the enforce; the downgrade happens in
+                // the enforce itself, when a source it must keep cited is gone.
+                let token = clean_report_token(&repository).await;
                 let orphan = digest("downgraded-orphan");
                 store_layer(repository.as_ref(), &orphan, 8192)
                     .await
                     .expect("store orphan");
-                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
                 let missing = $crate::types::SnapshotId::generate().to_string();
 
                 let report = collect_managed_layers(
@@ -590,8 +873,18 @@ macro_rules! behavior_table {
                     .await
                     .expect("store live layer");
                 store_snapshot_record(repository.as_ref(), &[&live_layer]).await;
-                let pass =
-                    age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce);
+                // The report runs while the golden's record still exists, so it is
+                // clean; the deletion that strands the layer happens afterwards.
+                let token = report_and_token(
+                    &repository,
+                    &NoLiveSandboxesUnderTest,
+                    request(ManagedLayerCollectMode::Report),
+                )
+                .await;
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
                 let records = repository
                     .read_documents(DocumentCollection::SnapshotRecords)
                     .await
@@ -632,11 +925,15 @@ macro_rules! behavior_table {
             #[tokio::test]
             async fn a_fan_out_with_one_node_erroring_downgrades_to_a_report() {
                 let (repository, temp) = repository().await;
+                let token = clean_report_token(&repository).await;
                 let orphan = digest("partial-fan-out-orphan");
                 store_layer(repository.as_ref(), &orphan, 4096)
                     .await
                     .expect("store orphan");
-                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
                 // One node of the fan-out failed: the merged list is complete
                 // for every other node and silently missing this one, so it
                 // cannot be treated as the cluster.
@@ -664,11 +961,15 @@ macro_rules! behavior_table {
             #[tokio::test]
             async fn an_unconfigured_gateway_downgrades_to_a_report() {
                 let (repository, temp) = repository().await;
+                let token = clean_report_token(&repository).await;
                 let orphan = digest("no-gateway-orphan");
                 store_layer(repository.as_ref(), &orphan, 2048)
                     .await
                     .expect("store orphan");
-                let pass = age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce);
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &orphan, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
                 // Without a gateway this node cannot see the sandboxes other
                 // nodes hold, so it cannot prove any layer uncited.
                 let live = cluster_live(None, Vec::new());
@@ -695,13 +996,21 @@ macro_rules! behavior_table {
                     .await
                     .expect("store live layer");
                 store_snapshot_record(repository.as_ref(), &[&live_layer]).await;
-                let pass =
-                    age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce);
                 let records = repository
                     .read_documents(DocumentCollection::SnapshotRecords)
                     .await
                     .expect("read records");
                 let origin = records.first().expect("one record").0.clone();
+                let token = report_and_token(
+                    &repository,
+                    &LiveSandboxesUnderTest(vec![origin.clone()]),
+                    request(ManagedLayerCollectMode::Report),
+                )
+                .await;
+                let pass = with_receipt(
+                    age_or_shrink_grace(&temp, &live_layer, ManagedLayerCollectMode::Enforce),
+                    &token,
+                );
 
                 let report = collect_managed_layers(
                     repository.as_ref(),
