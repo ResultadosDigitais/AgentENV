@@ -13,7 +13,6 @@ use tracing::{info, warn};
 
 use super::ApiImpl;
 use crate::maintenance::{DeferredCompactionWorker, DEFERRED_COMPACTION_INTERVAL};
-use crate::overlaybd::DeferredCompactionGate;
 
 impl ApiImpl {
     /// Starts the deferred-compaction task.
@@ -28,8 +27,7 @@ impl ApiImpl {
         pending_bytes_budget: u64,
     ) -> Option<tokio::task::JoinHandle<()>> {
         self.orchestrator().artifacts_root()?;
-        let worker = Arc::new(DeferredCompactionWorker::new(
-            DeferredCompactionGate::global(),
+        let worker = Arc::new(DeferredCompactionWorker::for_node(
             max_concurrent,
             pending_bytes_budget,
         ));
@@ -64,6 +62,7 @@ impl ApiImpl {
                         headroom_refused = report.headroom_refused,
                         queued = report.queued,
                         unlinked = report.unlinked,
+                        reclaimed_bytes = report.reclaimed_bytes,
                         "deferred compaction pass finished"
                     );
                 }
