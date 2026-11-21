@@ -49,7 +49,7 @@ Owned by `src/sandbox/firecracker/*`.
 | ---------------------------- | ------------------------------------------------------------ | --------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | Managed live snapshot root   | `<firecracker-work-base>/managed-snapshots/{sandbox_id}/{uuid}/...` | Firecracker snapshot artifacts kept alive in-process      | Holds captured running-sandbox snapshots until publish, and supports in-process pause state | Created by `FirecrackerSandbox::pause()` or `snapshot()`. Removed when `PersistentSnapshotRootGuard` drops. | No.                                                          |
 | Snapshot VM state            | snapshot artifact dir `vm_state.bin`                         | Firecracker VM state                                      | Pause/resume and snapshot publish input                      | Created by Firecracker's state-only diff snapshot. Owner depends on caller: persister, managed root, or repository publish input. | No.                                                          |
-| Memory overlaybd layer       | snapshot artifact dir `mem_overlaybd/overlaybd.commit`       | Sealed OverlayBD layer for memory pages                   | Runtime memory restore and publish input                     | Created directly from Firecracker dirty/present memory ranges read with `process_vm_readv`. Imported into repository managed layers during publish. | No.                                                          |
+| Memory overlaybd layer       | snapshot artifact dir `mem_overlaybd/overlaybd.commit`       | Sealed OverlayBD layer for memory pages                   | Runtime memory restore and publish input                     | Created directly from Firecracker dirty/present memory ranges read with `process_vm_readv`. Every 512-byte block that reads back as zeros (a page the host already discarded) is recorded as an unbacked zero segment (`SegmentMapping.zeroed`) instead of being written, so the layer holds only bytes that still exist in the host; `agentenv_memory_snapshot_skipped_bytes` and the named `memory snapshot skipped host-discarded pages` log report the skipped bytes per pause. Imported into repository managed layers during publish. | No.                                                          |
 | Memory image config          | snapshot artifact dir `mem_image.json`                       | Overlaybd image config stacking memory layers             | Resume paused sandbox and publish memory layers              | Written after memory conversion. Later repository resolvers regenerate runtime memory configs from committed layers. | Yes after publish; no for paused sandbox unless layers are known. |
 | Rootfs snapshot config       | snapshot artifact dir `rootfs/image.json`                    | Overlaybd image config for captured rootfs state          | Resume paused sandbox and publish rootfs layers              | Staged from live runtime config after restack/seal.          | Yes only from associated layers and metadata.                |
 | Rootfs snapshot layer        | snapshot artifact dir `rootfs/snapshot.commit`               | Sealed writable upper from live rootfs                    | Captures disk writes since previous lower stack              | Created by ublk daemon restack for writable overlaybd rootfs. | No.                                                          |
@@ -131,11 +131,48 @@ Owned by `src/repository/*` and `src/snapshot/types/*`.
 | Shared documents (snapshot records and aliases, volume records and names, build logs, build-cache state) | Paths named in `src/repository/layout.rs`. POSIX: one file each, updated under a lock file. OSS: one `{name}.json` object each. S3 stores replace it only if its ETag is unchanged. Alibaba OSS cannot, so every write holds a lease on the appendable lock object `locks/{path}` (see `src/repository/backends/oss/lease.rs`). | Volume state, reservations, and name bindings; template build logs; the shared build-cache seed | Updated atomically by the snapshot and volume catalogs and the template builder on every node | A released lease deletes its lock object. A holder that dies leaves it until a contender takes it over 30 seconds later. | No. |
 | Firecracker manifest | POSIX: `<snapshot_store>/repository/snapshots/{id}/firecracker-manifest.json`; OSS: `artifacts/{id}/firecracker-manifest.json` | Firecracker snapshot shape, virtual sizes, attached-drive metadata; path fields are hydrated at runtime | Runtime manifest template for launching committed snapshots | Persisted during publish. Removed with per-snapshot artifacts. | Partially, but kept as durable artifact. |
 | VM state | POSIX: `<snapshot_store>/repository/snapshots/{id}/vm_state.bin`; OSS: `artifacts/{id}/vm_state.bin` | Firecracker VM state snapshot | Required to resume committed snapshots | Copied/uploaded during publish. Removed with per-snapshot artifacts. | No. |
-| Managed snapshot layers | POSIX: `<snapshot_store>/repository/managed-layers/{digest}.overlaybd.commit`; OSS: `managed-layers/{digest}` | Content-addressed rootfs, attached-drive, and memory overlaybd commit layers | Shared immutable layer storage for committed snapshots | Imported during publish by descriptor or by hashing local descriptor-less layers. Usually not removed with a single snapshot. | Not from metadata alone; can be re-fetched only if source still exists. |
+| Managed snapshot layers | POSIX: `<snapshot_store>/repository/managed-layers/{digest}.overlaybd.commit`; OSS: `managed-layers/{digest}` | Content-addressed rootfs, attached-drive, and memory overlaybd commit layers | Shared immutable layer storage for committed snapshots, volume backing, and published images | Imported during publish by descriptor or by hashing local descriptor-less layers. Not removed with a single snapshot, because other records may cite the layer. A layer no record cites is collected by `POST /admin/managed-layers/collect` once it is older than `[snapshot.managed_layer_collect].grace_secs`; see "Managed Layer Collection" below. | Not from metadata alone; can be re-fetched only if source still exists, and a collected layer is gone for good. |
+| Managed-layer collection lock | POSIX: `<snapshot_store>/repository/maintenance/locks/managed-layer-collect`; OSS: `maintenance/locks/managed-layer-collect` | The holder token of the running collection pass | Serializes collection passes so two never overlap | Created by `maintenance::collect_managed_layers`. POSIX holds an `flock` the kernel drops with the process; OSS deletes the object on release, and a later pass takes over an object older than 30 minutes. Never under `managed-layers/`, so a pass never lists its own lock as a layer. | Yes. |
+| Managed-layer report receipt | POSIX: `<snapshot_store>/repository/maintenance/managed-layer-collect/receipts/{token}.json`; OSS: `maintenance/managed-layer-collect/receipts/{token}.json` | `{ token, issuedAtUnixMs, counts }` for one report pass | Lets an enforce pass on another node accept the report that authorized it, and is consumed by that enforce | Written by a report pass under the pass lock and deleted by the enforce that accepts it; each report prunes expired receipts (TTL 15 minutes). Never under `managed-layers/`, where a pass would count it unreadable. The token is a secret and is never logged, and every backend message that names the receipt's document is redacted. | Yes. |
 | Staging files | POSIX: `<snapshot_store>/repository/staging/*`; OSS: process temp dir | Dense-exported and recontainerized layers prepared for storage | On POSIX, the same filesystem as `managed-layers/`, so a prepared layer is hard-linked in without a copy | Temporary files, removed once the publish that made them is done. A process that crashes mid-publish leaves its files behind. | Yes. |
 | Source-registry publications | `SnapshotRecord.committed.disk_publications` plus remote OCI registry objects | Published rootfs/attached-drive image refs and manifest digests | Lets compatible snapshot deltas live in their source registry | Created during OSS publish when image publishing is enabled. Rolled back on failure or delete when possible. | Registry-owned; record is required to locate. |
 
 Repository records are the logical source of truth for committed snapshots. Build-time and runtime `image.json` files should not become committed truth unless they contain data that cannot be derived from committed metadata.
+
+## Managed Layer Collection
+
+Owned by `src/maintenance/managed_layers.rs`.
+
+A managed layer is content addressed and shared, so deleting a snapshot removes only that snapshot's own files and leaves every layer behind. Nothing used to notice a layer that no record cited any more, so deleting a record stranded its layers in the bucket for good. `POST /admin/managed-layers/collect` is that collector.
+
+The citation set is closed and comes from four places:
+
+- **snapshot records** (`catalog/records/`): committed rootfs, attached-drive, memory and volume-snapshot layers;
+- **volume records** (`volumes/records/`): backing layers, which keep a volume's layers after the snapshots that used it are gone;
+- **published image descriptions** (`images/descriptions/`): an image owns its layers;
+- **live sandboxes**: the source snapshot of every sandbox in the cluster, running or paused. The pass unions the node's own list with the gateway's aggregated `GET /v2/sandboxes`, which fans out to every node, because a sandbox paused on *another* node still reads its source snapshot's layers on resume. If a live sandbox's source is no longer in the catalog, the pass is downgraded to a report for the whole bucket, because the substrate can no longer prove which layers that sandbox may read.
+
+The cluster list is fail-closed. When `[snapshot.managed_layer_collect].gateway_url` is unset, when any node of the gateway's fan-out fails (the gateway answers 502 for the whole page), when a page does not arrive, or when a page token repeats, the pass treats the citation set as unknowable and deletes nothing: `enforce` is refused with 409 and only `report` runs. A partial list is never read as a complete one — an enforce pass built from one node's list deleted 123 layers on staging, one of them a lower layer of a sandbox paused on another node.
+
+`BlobKey::Layer` is written only by snapshot publication (`src/snapshot/store.rs`) and volume publication (`src/volume/mod.rs`); image builds reuse the same two stores, and image descriptions only reference layers those stores wrote.
+
+The pass runs in two modes. `report` lists and counts without deleting anything and returns a `reportToken`. `enforce` deletes only the uncited layers older than `[snapshot.managed_layer_collect].grace_secs`, and only after accepting the receipt that token names: the report persists `{ token, issuedAtUnixMs, counts }` under `maintenance/managed-layer-collect/receipts/` — never under `managed-layers/`, where a pass would count it unreadable — under the same repository lock the enforce holds. The enforce requires the receipt to exist, be unexpired, be clean (no downgrade, no unreadable or unknown layer, at least one cited layer) and not have been consumed, reclassifies the whole bucket under the lock, and spends the receipt. One report authorizes exactly one enforce, and the two calls may land on different nodes; each report prunes the receipts that expired. The token is a secret and is never logged. The grace period exists because a publish uploads its layers *before* it writes the record that cites them: a layer uploaded moments ago and not cited yet belongs to a publish in flight.
+
+Two things the pass never does:
+
+- it never deletes an object under `managed-layers/` whose name does not translate back to a `sha256:<hex>` digest — the substrate cannot prove what such an object is, so it is counted as unreadable and left alone;
+- it never deletes while another pass holds the maintenance lock. The lock serializes passes only; it does not exclude publishers, and the grace period covers that race.
+
+Every pass records cited layers and bytes, orphan layers and bytes, unexpired and unreadable layers, deleted layers and reclaimed bytes, and the objects it could not handle. A single failure never stops the pass.
+
+### Rolling it out
+
+Report first, in this order, on a node whose repository is the environment you are cleaning:
+
+1. Start one node with `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED=true`, and with `AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL` pointing at the cluster gateway. Without the gateway URL the pass sees only its own node, so a sandbox paused elsewhere looks gone and its layers look uncited: enforce is refused, and report still runs but its `orphanLayers` is not the cluster's.
+2. Run `POST /admin/managed-layers/collect` with `{"mode": "report"}` and compare `orphanLayers`/`orphanBytes` with what you measured independently. A difference larger than the layers a known publication is uploading means the citation set is missing a source; **stop** and investigate, do not enforce. A report whose `downgradedReason` is set proves nothing and must not be followed by an enforce.
+3. Only then run `{"mode": "enforce", "reportToken": "<the token the report returned>"}`. It applies the same grace period, so the layers a pass in flight is uploading stay. A missing, unknown, already used, expired or unclean receipt is refused and deletes nothing.
+4. The pass never removes an object whose name is not a digest. A non-zero `unreadableLayers` is expected from older releases and stays reported every pass.
 
 ## Snapshot Runtime Resolution
 
@@ -157,10 +194,119 @@ Owned by `src/orchestrator/persistence/*`.
 
 | Artifact | Location | Contents | Purpose | Lifecycle |
 | --- | --- | --- | --- | --- |
-| Paused sandbox record DB | `<persisted_sandbox_store_path>/records.db` | RocksDB keyed by sandbox ID; values are compact JSON records containing version, lifecycle, sandbox metadata, artifact root, and backend state | Restores paused sandboxes after server restart | Record written after pause succeeds. Marked `resuming` before resume. Rolled back on resume failure. Deleted on resume/delete. |
-| Paused sandbox artifact generation | `<persisted_sandbox_store_path>/artifacts/{sandbox_id}/{uuid}/...` | Firecracker snapshot artifacts generated by `pause_to_dir` | Durable artifacts for one paused sandbox generation | Allocated before pause, populated by backend, referenced by paused record. Removed during explicit delete or `load_all` orphan cleanup. |
+| Paused sandbox record DB | `<persisted_sandbox_store_path>/records.db` | RocksDB keyed by sandbox ID; values are compact JSON records containing version, lifecycle, sandbox metadata, artifact root, and backend state | Restores paused sandboxes after server restart | Record written after pause succeeds. Marked `resuming` before resume. Rolled back on resume failure. Deleted on resume/delete. A record whose runtime state cannot be decoded on the loading node is **retained**, not deleted; see "Load outcome". |
+| Paused sandbox artifact generation | `<persisted_sandbox_store_path>/artifacts/{sandbox_id}/{uuid}/...` | Firecracker snapshot artifacts generated by `pause_to_dir` | Durable artifacts for one paused sandbox generation | Allocated before pause, populated by backend, referenced by paused record. Each pause adds a generation whose unchanged files are hard links of the previous ones. Removed only by an explicit delete (a control-plane delete removes `artifacts/{sandbox_id}` and any quarantined copy); boot never deletes one. A generation whose record the loading node does not have is moved to `artifacts/.quarantine/{epoch}/{sandbox_id}` at boot, preserving its bytes; once the new record is durable, the persister also sweeps stale sibling generations of regular files whose link count is 1. A periodic sweep in `src/maintenance/paused_artifacts.rs` reclaims the whole `{sandbox_id}` directory of a sandbox no record and no cluster list names any more, moving it to `artifacts/.trash/{epoch}/` first and deleting it only after a second grace; see "Paused Artifact Reaping". |
+| Paused sandbox artifact quarantine | `<persisted_sandbox_store_path>/artifacts/.quarantine/{epoch}/{sandbox_id}/...` | A generation boot found with no record on this node | Keeps a paused sandbox's bytes when the record is on another node, was lost in an eviction, or was never written | Written only by `load_all`, as a rename: boot never copies and never deletes. Expired only by the reaper in enforce mode, once the epoch is older than `QUARANTINE_TTL` (7 days), or removed by an explicit control-plane delete of that sandbox id. Quarantine preserves bytes, not resumability: the cluster does not list the sandbox until a record exists, and `FirecrackerPausedState::decode` rebuilds the snapshot config from the record's state, not from the artifact path. |
 
-Paused sandbox artifacts are not committed snapshot repository artifacts. They are owned by the sandbox persister and should not be shared as snapshot truth.
+Paused sandbox artifacts are not committed snapshot repository artifacts. They are owned by the sandbox persister and should not be shared as snapshot truth. Only an explicit delete removes an `artifacts/{sandbox_id}/` directory; a destroy that answered `404`, a record lost between `allocate_artifact_root` and `persist_paused`, and the last generation of a sandbox that has since resumed all strand it, and boot quarantines rather than deletes it; `src/maintenance/paused_artifacts.rs` sweeps those directories periodically, reclaiming one only when no keep condition holds — no local id (running, paused, restoring or template build), no restore open, the id absent from the gateway's aggregated `GET /v2/sandboxes`, and an mtime older than `ARTIFACT_GRACE` — while a symlink, a non-directory, a non-canonical name or a path outside `artifacts/` is skipped and never followed. The removal is two-phase: a reclaimed directory is renamed to `artifacts/.trash/{epoch}/{sandbox_id}`, which frees nothing, and deleted by a later pass once the epoch is older than `TRASH_GRACE`, so a mistaken verdict can be renamed back while its record still resolves; bytes are counted only on the deletion. A third phase empties the boot quarantine, `artifacts/.quarantine/{epoch}/{sandbox_id}`, under the same rules and only once the epoch is older than `QUARANTINE_TTL`; report mode counts it and deletes nothing. Neither the boot path nor the reaper deletes without one of those two explicit decisions. An unconfigured gateway, a failed node in the fan-out or a missing page degrades the whole pass to a report, which moves and deletes nothing, quarantine included. `AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP` selects `off`, `report` or `enforce` and defaults to `off`; each verdict has a named counter (`agentenv_paused_sandbox_artifact_reap_{kept,skipped}_total` with a `reason`, `..._{moved,deleted,reclaimed_bytes}_total`, and `agentenv_paused_sandbox_quarantine_{expired,reclaimed_bytes}_total`), the sandbox id is a log field and never a label, and the `trashed`/`removed`/quarantine lines carry the id and the bytes.
+
+A sandbox's chain of generations is bounded by two independent limits. The absolute `orchestrator.chain_bytes_ceiling` bounds the reclaimable part of a chain — the runtime-owned overlaybd lowers plus the layer the pause appends, allocated bytes deduplicated by device and inode so hard links count once — because that is the part a sandbox's own pauses grow. The immutable stable prefix is reported but never charged there: it is materialized once from the image and every sandbox of that image points at the same node-local files, so charging it per sandbox would count one node's bytes once per sandbox. The second, relative limit is `orchestrator.rootfs_chain_disk_multiple`: it judges the whole deduplicated rootfs chain, stable prefix included, against a small measured multiple of the guest rootfs disk (default `2`). Only the rootfs chain carries it; memory, drive and volume keep the absolute ceiling alone. When a pause would push either bound past its limit, the runtime-owned suffix is folded into one complete generation — but not necessarily inside the pause. Since OPSAI-7467 the byte-triggered rewrite is deferred whenever admission proves the node can finish it later: the pause adopts the runtime-owned suffix into the generation (hardlinks under `inherited-layers/`, as the no-breach path already does) and writes `deferred-compaction.json` beside the image config with the layer-count trigger and every inline refusal unchanged. The descriptor is a versioned, optional sibling file — never a record field, which keeps record version `1` and the previous runtime able to resume the generation — carrying the kind, the config to swap, the compacted output name, the layers in chain order, the frozen bounds and the view bytes. `src/maintenance/deferred_compaction.rs` scans the records that are still `Paused`, compacts each pending descriptor (repeating the same pre-rewrite headroom refusal), replaces the image config atomically (`write tmp + fsync + rename`), marks the descriptor `Swapped`, and only in a later pass unlinks the inputs the current config no longer references. The rewrite does not free its own inputs: a compacted generation that kept the memory delta it folded held both `mem_compacted.commit` and `mem_overlaybd/overlaybd.commit`, and a rootfs generation held `managed-base.commit` plus the `snapshot.commit` it replaced (146 GiB in one measured generation where about 79 were needed). The delta a pause writes therefore stays at its own path — it is never adopted a second time under `inherited-layers/` — so the order names the inode the unlink actually frees, and the inline fallback (which already compacted inside the pause) leaves the very same order with the swap done, so only the unlink is left. The pass that frees them records `agentenv_paused_sandbox_deferred_chain_compactions_total{kind,outcome="reclaimed"}` and one `paused sandbox chain removed the copies its compaction replaced` line with the kind, the generation, the inputs and the bytes the node got back (a hard link an older generation still owns frees nothing until the sweep takes it). A failure of that unlink keeps the descriptor for the next pass and never touches the generation a paused sandbox resumes from. Admission is the pause's path decision, never a new refusal: concurrency below `deferred_compaction_max_concurrent`, pending transient bytes plus the new one within `deferred_compaction_pending_bytes_budget`, free bytes at the generation at least `compaction_transient_bytes`, and a writable descriptor; any failure takes today's inline path with its three named codes. The deferred path records `agentenv_paused_sandbox_deferred_chain_compactions_total{kind,outcome}` and one `paused sandbox chain compacted outside the pause` line with kind, bytes before and after, duration and generation (the sandbox id is a log field, never a label). The threshold values, the node disk alert and the per-sandbox disk limit do not change. For disks of 48 GiB and above the absolute reclaimable ceiling usually fires first; for smaller disks the relative bound is the tighter one. The stale-generation sweep treats a regular file as unreferenced only when every hard link it has lives in the swept (stale) set, so an inode shared solely by two stale generations is freed and both directories can empty, while a file the newest generation, a fork child or a live runtime still reaches has a larger link count and is kept; non-regular files are never deleted.
+
+A pause that still exceeds a limit after compaction fails with the corresponding stable code: `CHAIN_BYTES_CEILING_EXCEEDED` for the absolute bound, or `ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED` when the whole rootfs chain is still above `multiple × guest disk`. Both failures are **recoverable on every device** — rootfs, drive and volume alike. Pause is a capacity optimization: losing the VM loses the sandbox's work. The rootfs and drive restacks mutate the live runtime before the size is known, so a limit refusal is the one post-restack error that is deliberately not terminal; the pause path resumes the paused-in-memory VM in place, reinserts the handle, restores the proxy route and leaves the sandbox `Running`. Every other post-restack error (a lost restack reply, a descriptor size mismatch) stays terminal, because the runtime there is genuinely unknown. Before the restack, a pre-flight measures the live chain plus the writable upper's allocated bytes against both enabled bounds; when that already fits, the post-compaction rejection is provably moot and is skipped, and the pre-flight never refuses on its own (its number is an upper bound, not a floor). A rejected pause cleans up the artifacts it wrote, but never frees a layer a live runtime config references: the sealed layer is copied into the sandbox's snapshot tree and the config repointed before the generation directory is deleted, and a failure to retain it keeps the directory instead. On the deferred path the worker cannot refuse a pause that already returned: when its rewrite leaves the generation still above a bound it logs the numbers, records outcome `still_over_limit` and keeps the generation usable, and the next pause folds another generation in. Setting `chain_bytes_ceiling` to `0` disables the absolute bound, the pre-flight and the stale-generation sweep; `rootfs_chain_disk_multiple = 0` disables only the relative bound, restoring the unbounded behavior without a redeploy.
+
+Each refusal increments `agentenv_paused_sandbox_chain_ceiling_exceeded_total{kind}`, emits one backend log line with the stable code, the observed bytes, the limit, the appended-upper bytes and the artifact root's free/total bytes, and one orchestrator line with the node's paused-sandbox count; the seven-day measurement reads both through the named code. Every pause also records `agentenv_paused_sandbox_chain_limit_ratio{kind,limit}`, the measured bytes divided by the limit, so the seven-day check can assert that no post-rollout rootfs pause ran above its bound without re-deriving the accounting. The sandbox id is a log field, never a metric label.
+
+Compaction itself needs transient disk, and a pause refuses before starting one the node cannot finish. `compact_layers` writes the merged commit to a sibling temp file and renames it into place, so while it runs the inputs and the output coexist on the artifact root; the output is the union of the inputs' blocks, bounded by the device's virtual size and by the sum of the inputs' allocated bytes (each taken as an upper bound, the smaller one used), plus one eighth for the commit index and metadata. The rootfs, drive and volume restacks pass their device's virtual size, so the first pause of a sandbox far above the bound needs about one guest disk of transient space, not its whole chain: a 144 GB rootfs chain on a 64 GiB guest disk compacts to at most about 64 GiB plus the index margin. When the free bytes at the artifact root are below that bound the pause is refused with the recoverable `COMPACTION_HEADROOM_INSUFFICIENT` **before** `compact_layers` is called, so the node never fills its disk half-way through a rewrite; a failed filesystem probe is fail-closed for the same reason. The memory chain keeps the previous behavior. The pause path has no compaction deadline: the only timeout on it is the Firecracker process stop (`firecracker.socket_timeout_secs`, default 3 s), which runs after the snapshot and the compaction are staged, and there is no server-side HTTP timeout, so a multi-minute compaction completes on the node even when the caller's client timeout fires first.
+
+A pause the node declines on purpose is a capacity conflict, not a server failure: the pause endpoint answers `409` with the `code` field set to `409` and a stable `errorCode` in the body plus the sandbox left `Running`. The codes are `ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED`, `CHAIN_BYTES_CEILING_EXCEEDED` and `COMPACTION_HEADROOM_INSUFFICIENT`; `errorCode` is the machine-readable discriminator the platform maps on, so no caller parses the message. Every headroom refusal increments `agentenv_paused_sandbox_compaction_headroom_refused_total{kind}` and emits a backend log line with the artifact root, the required and free bytes, the device view and the compacted input bytes.
+
+### Load outcome
+
+`load_all` decides one outcome per paused record and records it in
+`agentenv_paused_sandbox_load_total{outcome}`. The label values are a closed set,
+so a sandbox ID never becomes a label:
+
+| `outcome` | Meaning | Record kept | Artifacts kept |
+| --- | --- | --- | --- |
+| `loaded_from_local` | Runtime state decoded and its artifacts are on this node. | Yes | Yes |
+| `retained_unreachable` | The record is readable but this node holds no resumable runtime state for it — the artifacts are on another node, or its virtualization mode differs. It stays listed as `Paused` with no runtime state. | Yes | Yes |
+| `quarantined_no_record` | An `artifacts/{sandbox_id}` directory that no record on this node names. It is renamed to `artifacts/.quarantine/{epoch}/{sandbox_id}` and kept. | No | Yes, moved to the quarantine |
+| `discarded` | The record is not a paused record at all, or a resume was abandoned in `resuming`. This is the only branch that deletes a record. | No | No for the `resuming` branch, which removes both; an undecodable record is removed alone, so its directory is then quarantined by name |
+
+The distinction matters because a node that cannot decode a paused record is
+exactly what a recreated pod looks like when the artifacts live elsewhere.
+Deleting that record is what made a pod swap permanent loss. The same reasoning
+applies to the artifacts: a generation with no record can be a pause whose
+record never reached the store, or one whose record sits on another node, so the
+boot path moves it to the quarantine instead of deleting it. The boot summary
+line reports `quarantined` and `quarantine_failed` beside the outcome tallies; a
+quarantine step that cannot rename logs the sandbox id and both paths and leaves
+the directory in place, so a failed move is never a loss.
+
+**Acceptance query.** Zero paused sandboxes may be lost across a node
+replacement, so the discarded branch is the one to watch:
+
+```promql
+sum by (node_id) (increase(agentenv_paused_sandbox_load_total{outcome="discarded"}[7d]))
+```
+
+It must stay at `0` for the observation window. The alert fires above zero, on the
+reasoning that a single discarded record is already a lost sandbox and the
+discarded branch should only ever see genuinely corrupt bytes. A run that
+discards one record is a bug report, not a threshold to tune.
+
+The boot must also stop deleting artifact generations, which is a different
+signal: a non-zero `quarantined_no_record` is the expected outcome of a pod swap
+on a node that still holds the SSD, not an incident. The pair to watch together
+is the quarantine growth (it is inert until the reaper runs in enforce mode) and
+the absence of any new `discarded`:
+
+```promql
+sum by (node_id) (increase(agentenv_paused_sandbox_load_total{outcome="quarantined_no_record"}[24h]))
+```
+
+A window with `discarded` still at `0` and a non-zero
+`quarantined_no_record` is the card's scenario handled: the generations survived
+the recreated pod. If `quarantined_no_record` stays at zero across a pod swap
+whose boot log reports no loss, the artifacts were not on the node at all and
+the quarantine path was never exercised.
+
+The complementary signal, that the bucket path is actually being used, is:
+
+```promql
+sum by (node_id) (increase(agentenv_paused_sandbox_load_total{outcome="loaded_from_local"}[1h]))
+```
+
+A node that keeps reporting only `loaded_from_local` across pod swaps is still
+serving from the SSD, so its bucket path is not exercised.
+
+### Where a paused record and its artifacts live
+
+Both live in the same directory, and that is what makes a recreated pod on the
+same node find one with the other. The store root is
+`persisted_sandbox_store_path`, default `$AENV_HOME/persisted-sandboxes`
+(`src/cfg.rs`); `$AENV_HOME` is `home_path`, which `AENV_HOME_PATH` overrides
+because the environment is the first source the config builder adds
+(`src/cfg.rs`, `Config::builder().env().file(path)`; see
+[Configuration reference](../configuration/reference.md)). In the runtime image
+`AENV_HOME_PATH=/workspace/env` (`deploy/docker/Dockerfile.agentenv`), and
+`/workspace` is the DaemonSet's `hostPath` `/var/lib/aenv`
+(`deploy/k8s/base/agentenv-daemonset.yaml`) — the node's local SSD. So on a
+cluster node:
+
+- the record DB is `/workspace/env/persisted-sandboxes/records.db`;
+- the generations are
+  `/workspace/env/persisted-sandboxes/artifacts/{sandbox_id}/{uuid}/...`;
+- both are on the local SSD and survive a pod recreation on the same node; no
+  paused record is ever written to an `emptyDir` or to the container overlay.
+
+The record therefore cannot disappear in an eviction while its generation
+stays: a generation found without a record was either never given one or had it
+removed. Two paths produce that state, and both run against the same SSD. The
+first is resume, which deletes the record and keeps the generation
+(`launch_sandbox` calls `delete_record`, not `delete_record_and_artifacts`);
+nothing reclaims the directory while `paused_artifact_reap` is at its default
+`off`. The second is an eviction inside the window between
+`allocate_artifact_root` and `persist_paused`. The log line that separates them
+for one sandbox id is `persisting paused sandbox`: present in the evicted pod's
+log means its pause reached the record write, absent means it did not. The lv72
+measurement of 05/11/2026 found five generations and three records: the replica
+that replaced the evicted pod read the three and reported `loaded=3 retained=3`,
+so the record DB was intact on the SSD and no record was lost with the pod —
+and a record write is fsynced before it is acknowledged, so a record cannot be
+torn. The five were generations of sandboxes that had already resumed.
+Whichever of the two produced them, the boot path now quarantines them instead
+of deleting them.
 
 ## P2P Artifact Transport
 
