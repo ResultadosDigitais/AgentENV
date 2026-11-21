@@ -62,6 +62,10 @@ pub(crate) const DESCRIPTOR_VERSION: u32 = 1;
 /// worker has swapped the config atomically, it marks the descriptor `Swapped`;
 /// the inputs may only be unlinked by a *later* pass, while the record is still
 /// `Paused`, so a resume that read the old config never loses a layer it named.
+///
+/// A descriptor is written already `Swapped` by the pause's inline fallback:
+/// there the config the caller writes names the compacted layer from the start,
+/// so only the unlink is left, and it still waits for a `Paused` record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeferredCompactionState {

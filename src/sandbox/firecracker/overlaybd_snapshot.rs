@@ -31,7 +31,8 @@ use super::process_vm_reader::ProcessVmReader;
 use crate::cfg::ConfigManager;
 use crate::overlaybd::{
     compact_layers, compactable_allocated_bytes, compaction_transient_bytes, create_commit_args,
-    DeferredCompactionDescriptor, DeferredCompactionGate, OverlaybdCompactOutput,
+    DeferredCompactionDescriptor, DeferredCompactionGate, DeferredCompactionState,
+    OverlaybdCompactOutput,
 };
 use crate::sandbox::ublk::{UblkDevice, UblkDeviceManager};
 use crate::sandbox::SandboxCaptureError;
@@ -1273,8 +1274,12 @@ impl DeferredCompactionRequest {
 /// The result of one chain rewrite.
 ///
 /// `deferred` is the work order the caller must persist **after** the image
-/// config is durable; it is `None` on the inline path, including every path that
-/// compacted in the pause, and on every path that adopted without a breach.
+/// config is durable. It is `Pending` when the rewrite itself was deferred to
+/// the maintenance worker, and `Swapped` when the pause already compacted (the
+/// inline fallback, or a layer-count trigger) and only the unlink of the copies
+/// the merge replaced is left. It is `None` on every path that adopted without
+/// a breach, and on a capture into a throwaway directory whose generation no
+/// `Paused` record will ever name.
 #[derive(Debug)]
 pub(super) struct RewriteLowers {
     pub(super) lowers: Vec<LayerConfig>,
@@ -1467,6 +1472,10 @@ async fn rewrite_lowers_with_runtime_roots(
             0
         };
         let compacted_lowers = compactable.len() + usize::from(appended_layer.is_some());
+        // The layer this pause wrote travels last, in chain order, so both paths
+        // below can hand it over at its own path instead of adopting a second
+        // directory entry to the same inode.
+        let pause_wrote_a_layer = appended_layer.is_some();
         if let Some(layer) = appended_layer {
             compactable.push(layer);
         }
@@ -1482,6 +1491,7 @@ async fn rewrite_lowers_with_runtime_roots(
         // hard limit and is not the call the card measures — and a non-raw
         // output stays inline because the descriptor only names a raw output.
         if let Some(request) = deferral
+            .as_ref()
             .filter(|_| breach.is_some() && compaction_output == OverlaybdCompactOutput::Raw)
         {
             let transient = compaction_transient_bytes(
@@ -1507,8 +1517,19 @@ async fn rewrite_lowers_with_runtime_roots(
                 // Adopt the suffix exactly like the no-compaction path: the pause
                 // returns as soon as the dirty state is written, and the worker
                 // folds these adopted layers into one generation later.
-                // `compactable` already carries the appended layer, in order.
-                let adopted = adopt_runtime_owned_suffix(output_dir, compactable, None).await?;
+                //
+                // The layer this pause wrote is the last entry of `compactable`
+                // and stays at its own path (`mem_overlaybd/overlaybd.commit`,
+                // `rootfs/snapshot.commit`) instead of being adopted: adopting it
+                // would only add a second directory entry to the same inode, and
+                // the order must name that inode so the worker's unlink actually
+                // frees the bytes.
+                let appended = if pause_wrote_a_layer {
+                    compactable.pop()
+                } else {
+                    None
+                };
+                let adopted = adopt_runtime_owned_suffix(output_dir, compactable, appended).await?;
                 let descriptor = DeferredCompactionDescriptor::new(
                     request.kind,
                     request.config_file,
@@ -1516,7 +1537,7 @@ async fn rewrite_lowers_with_runtime_roots(
                     adopted.iter().map(|layer| layer.file.clone()).collect(),
                     compaction_view_bytes,
                     (limits.reclaimable_ceiling, limits.whole_chain_ceiling),
-                    request.generation,
+                    request.generation.clone(),
                 );
                 lowers.extend(adopted);
                 chain_metrics::record_deferred_compaction(compaction_output_name, "deferred");
@@ -1661,9 +1682,40 @@ async fn rewrite_lowers_with_runtime_roots(
                 ));
             }
         }
+        // The merge replaced the copies this generation holds — the delta the
+        // pause just wrote above all — and they are still on disk. The pause
+        // cannot free them inside the call: its config is written by the caller
+        // afterwards, and a failure between here and the persisted record still
+        // resumes from the live runtime config, which names the sealed layer.
+        // So it leaves the same two-pass order the deferred path uses, with the
+        // swap already done: the worker only unlinks, and only once the
+        // generation is in a `Paused` record.
+        let reclaim = deferral.clone().and_then(|request| {
+            let replaced: Vec<String> = compactable
+                .iter()
+                .map(|layer| layer.file.clone())
+                .filter(|file| Path::new(file).starts_with(output_dir))
+                .collect();
+            // Never claim inputs the caller's config will not replace: without a
+            // compacted output the config keeps naming them, and the order would
+            // be the only thing holding the bytes.
+            (!replaced.is_empty() && compacted_path.is_some()).then(|| {
+                let mut descriptor = DeferredCompactionDescriptor::new(
+                    request.kind,
+                    request.config_file,
+                    compaction_output_name,
+                    replaced,
+                    compaction_view_bytes,
+                    (limits.reclaimable_ceiling, limits.whole_chain_ceiling),
+                    request.generation,
+                );
+                descriptor.state = DeferredCompactionState::Swapped;
+                descriptor
+            })
+        });
         return Ok(RewriteLowers {
             lowers,
-            deferred: None,
+            deferred: reclaim,
         });
     }
 
@@ -4107,9 +4159,12 @@ mod tests {
             .await;
             lowers.push(local_layer_config(&path));
         }
-        let appended = seal_raw_test_layer(
+        // The layer this pause writes lives in its own generation, exactly where
+        // `snapshot_memory_to_overlaybd` leaves `mem_overlaybd/overlaybd.commit`.
+        let appended = seal_generation_layer(
             &runtime_root,
-            "mem-appended",
+            &generation,
+            "mem_overlaybd/overlaybd.commit",
             8192,
             &[(0, 0xEE), (4096, 0xEE)],
         )
@@ -4121,7 +4176,10 @@ mod tests {
             .collect();
         let chain_bytes = chain_allocated_bytes(&chain_paths);
         let ceiling = chain_bytes * 3 / 4;
-        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+        let runtime_owned_roots = [
+            runtime_root.canonicalize().unwrap(),
+            temp.path().join("artifacts").canonicalize().unwrap(),
+        ];
 
         let gate = DeferredCompactionGate::new_for_test();
         let request = DeferredCompactionRequest::for_test(
@@ -4250,9 +4308,19 @@ mod tests {
             .await;
             lowers.push(local_layer_config(&path));
         }
-        let appended =
-            seal_raw_test_layer(&runtime_root, "rootfs-appended", DISK_BYTES, &writes(0xDD)).await;
-        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+        // The delta the restack seals lives in the generation it captures.
+        let appended = seal_generation_layer(
+            &runtime_root,
+            &generation,
+            "snapshot.commit",
+            DISK_BYTES,
+            &writes(0xDD),
+        )
+        .await;
+        let runtime_owned_roots = [
+            runtime_root.canonicalize().unwrap(),
+            temp.path().join("artifacts").canonicalize().unwrap(),
+        ];
         let gate = DeferredCompactionGate::new_for_test();
         let request = DeferredCompactionRequest::for_test(
             gate.clone(),
@@ -4342,8 +4410,10 @@ mod tests {
     async fn a_refused_admission_keeps_the_inline_compaction_and_its_codes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_root = temp.path().join("runtime");
+        let staging = temp.path().join("staging");
         let output_dir = temp.path().join("out");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&staging).expect("create staging dir");
         std::fs::create_dir_all(&output_dir).expect("create output dir");
         let mut layers = Vec::new();
         for (index, byte) in [0xAAu8, 0xBB].into_iter().enumerate() {
@@ -4356,7 +4426,11 @@ mod tests {
             .await;
             layers.push(local_layer_config(&path));
         }
-        let appended = seal_raw_test_layer(&runtime_root, "appended", 8192, &[(0, 0xCC)]).await;
+        // The layer this pause writes lives in its own generation, exactly like
+        // the sealed `snapshot.commit` the restack leaves behind.
+        let appended =
+            seal_generation_layer(&staging, &output_dir, "snapshot.commit", 8192, &[(0, 0xCC)])
+                .await;
         // Above one compacted generation but below the chain, so the inline path
         // compacts and succeeds instead of refusing for a reason of its own.
         let chain_paths: Vec<PathBuf> = layers
@@ -4404,9 +4478,28 @@ mod tests {
             output_dir.join(MANAGED_BASE_LAYER_FILE).exists(),
             "a refused admission must fall back to today's inline compaction"
         );
+        // The inline rewrite itself pays the merge, so it leaves the inputs in
+        // place: the pause must not free anything before its config is durable.
+        // What it leaves behind is the reclaim order the worker runs later, and
+        // that order names only the inputs this generation holds.
+        let reclaim = rewritten
+            .deferred
+            .as_ref()
+            .expect("an inline compaction leaves the copies it replaced to the worker");
+        assert_eq!(
+            reclaim.state,
+            crate::overlaybd::DeferredCompactionState::Swapped,
+            "the inline path already swapped the config, so only the unlink is left"
+        );
+        assert_eq!(
+            reclaim.compactable,
+            vec![appended.display().to_string()],
+            "only the layers this generation holds may be claimed: {:?}",
+            reclaim.compactable
+        );
         assert!(
-            rewritten.deferred.is_none(),
-            "an inline compaction leaves no deferred work"
+            Path::new(&appended).exists(),
+            "the pause must not free an input while it is still inside the call"
         );
         assert_eq!(gate.pending_transient_bytes(), 0);
 
@@ -4431,6 +4524,133 @@ mod tests {
         assert_eq!(
             pause_refusal_code(&compaction_headroom_insufficient(10, Some(0))),
             Some(COMPACTION_HEADROOM_INSUFFICIENT)
+        );
+    }
+
+    /// Seal the layer a pause writes into its own generation (`snapshot.commit`
+    /// for the rootfs, `mem_overlaybd/overlaybd.commit` for memory), exactly as
+    /// the restack and the memory conversion leave it: the commit file lives in
+    /// the generation and the staging files do not.
+    async fn seal_generation_layer(
+        staging: &Path,
+        generation_dir: &Path,
+        file_name: &str,
+        vsize: u64,
+        writes: &[(u64, u8)],
+    ) -> PathBuf {
+        let sealed = seal_raw_test_layer(staging, "sealing", vsize, writes).await;
+        let destination = generation_dir.join(file_name);
+        std::fs::create_dir_all(destination.parent().expect("layer parent"))
+            .expect("create layer directory");
+        std::fs::rename(&sealed, &destination).expect("move sealed layer into the generation");
+        destination
+    }
+
+    /// The deferred order must name the delta the pause itself wrote, not only
+    /// the hardlink it adopted, or the worker can unlink forever without ever
+    /// freeing those bytes: the adopted link and the original are the same
+    /// inode, and the generation keeps the original.
+    #[tokio::test]
+    async fn the_deferred_order_names_the_delta_the_pause_wrote() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging = temp.path().join("staging");
+        let runtime_root = temp.path().join("runtime");
+        let generation = temp
+            .path()
+            .join("artifacts")
+            .join("sandbox")
+            .join("gen")
+            .join("rootfs");
+        std::fs::create_dir_all(&staging).expect("create staging dir");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&generation).expect("create generation dir");
+
+        const DISK_BYTES: u64 = 768 * 1024;
+        const REGION_BYTES: u64 = 256 * 1024;
+        let writes = |byte: u8| -> Vec<(u64, u8)> {
+            (0..REGION_BYTES / 4096)
+                .map(|index| (index * 4096, byte))
+                .collect()
+        };
+        let mut lowers = Vec::new();
+        for (index, byte) in [0xAAu8, 0xBB].into_iter().enumerate() {
+            let path = seal_raw_test_layer(
+                &runtime_root,
+                &format!("rootfs-{index}"),
+                DISK_BYTES,
+                &writes(byte),
+            )
+            .await;
+            lowers.push(local_layer_config(&path));
+        }
+        let appended = seal_generation_layer(
+            &staging,
+            &generation,
+            "snapshot.commit",
+            DISK_BYTES,
+            &writes(0xCC),
+        )
+        .await;
+        let runtime_owned_roots = [
+            runtime_root.canonicalize().unwrap(),
+            temp.path().join("artifacts").canonicalize().unwrap(),
+        ];
+        // The bound is derived from the chain the fixture really allocates: the
+        // sealed layers are sparse, so a bound derived from the virtual sizes
+        // would never be crossed and the pause would adopt instead of deferring.
+        let chain_bytes = chain_allocated_bytes(
+            &lowers
+                .iter()
+                .map(|lower| PathBuf::from(&lower.file))
+                .chain(std::iter::once(appended.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let limit_bytes = chain_bytes * 3 / 4;
+        let gate = DeferredCompactionGate::new_for_test();
+        let request = DeferredCompactionRequest::for_test(
+            gate.clone(),
+            "rootfs",
+            "image.json",
+            &generation,
+            1,
+            96 << 30,
+        );
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &generation,
+            Some(local_layer_config(&appended)),
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainLimitPolicy {
+                limits: ChainLimits {
+                    reclaimable_ceiling: 0,
+                    whole_chain_ceiling: limit_bytes,
+                },
+                preflight: ChainPreflight::disabled(),
+                compaction_view_bytes: DISK_BYTES,
+            },
+            Some(request),
+        )
+        .await
+        .expect("a rootfs chain over the disk multiple must defer");
+
+        let descriptor = rewritten.deferred.clone().expect("durable work");
+        assert!(
+            descriptor
+                .compactable
+                .contains(&appended.display().to_string()),
+            "the order must name the delta the pause wrote, so the worker frees its bytes: {:?}",
+            descriptor.compactable
+        );
+        assert!(
+            descriptor
+                .compactable
+                .iter()
+                .all(|layer| Path::new(layer).starts_with(&generation)),
+            "every layer the worker may unlink must live inside the generation: {:?}",
+            descriptor.compactable
         );
     }
 
