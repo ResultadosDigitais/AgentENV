@@ -65,3 +65,26 @@ func TestNodeListPublishesMemoryWorkingSetOnlyWhenReported(t *testing.T) {
 		t.Fatalf("absent working set must be omitted, got %v", got)
 	}
 }
+
+// /nodes also publishes the unreclaimable figure when the node reports it, so
+// the rollout can confirm the runtime is reporting before the scheduler starts
+// admitting by it, and omits it instead of publishing a zero.
+func TestNodeListPublishesMemoryUnreclaimableOnlyWhenReported(t *testing.T) {
+	metrics := listNodeMetrics(t,
+		&schedulerv1.NodeSnapshot{
+			MemoryUsedBytes:          250000,
+			MemoryUnreclaimableBytes: proto.Uint64(24000),
+		},
+		&schedulerv1.NodeSnapshot{MemoryUsedBytes: 250000},
+	)
+
+	if got := metrics[0]["memoryUnreclaimableBytes"]; got != float64(24000) {
+		t.Fatalf("memoryUnreclaimableBytes = %v, want 24000", got)
+	}
+	if got := metrics[0]["memoryUsedBytes"]; got != float64(250000) {
+		t.Fatalf("memoryUsedBytes must stay raw, got %v", got)
+	}
+	if got, ok := metrics[1]["memoryUnreclaimableBytes"]; ok {
+		t.Fatalf("absent unreclaimable figure must be omitted, got %v", got)
+	}
+}
