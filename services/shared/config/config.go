@@ -116,8 +116,18 @@ type NodeResourceLimit struct {
 	// compares: "raw" (default) is memory_used_bytes, the cgroup
 	// memory.current including page cache; "working_set" is
 	// memory_working_set_bytes (memory.current minus inactive_file, the
-	// figure kubelet uses). A node that does not report the working set is
-	// evaluated on the raw figure and the fallback is logged.
+	// figure kubelet uses); "unreclaimable" is memory_unreclaimable_bytes,
+	// the memory the runtime cgroup cannot give back.
+	//
+	// The meters chain down for a node that does not report the selected
+	// field, so a mixed fleet during the rollout is never admitted free:
+	// unreclaimable falls back to the working set and then to raw, and
+	// working_set falls back to raw. The fallback is logged with the reason
+	// naming the absent field.
+	//
+	// Under "unreclaimable" the memory ceiling base does not subtract the raw
+	// runtime overhead: the figure already counts the runtime's own pages in
+	// the numerator, so subtracting used - allocated again would double count.
 	MemoryUsedMeter *string `json:"memory_used_meter"`
 	// CrossNodeResume allows a paused sandbox rejected on its owner to resume
 	// on another admitted node. Off by default: moving a resume before the
@@ -163,8 +173,9 @@ const (
 	MemoryCapacitySourceTotal       = "total"
 
 	// Memory used meters accepted by NodeResourceLimit.MemoryUsedMeter.
-	MemoryUsedMeterRaw        = "raw"
-	MemoryUsedMeterWorkingSet = "working_set"
+	MemoryUsedMeterRaw           = "raw"
+	MemoryUsedMeterWorkingSet    = "working_set"
+	MemoryUsedMeterUnreclaimable = "unreclaimable"
 
 	// Shape admission modes accepted by NodeResourceLimit.ShapeAdmission.
 	// "on" decides by the shape rule, "off" restores the pre-OPSAI-6200 routing
@@ -233,10 +244,14 @@ func (l *NodeResourceLimit) ResolvedMemoryUsedMeter() string {
 	if l == nil || l.MemoryUsedMeter == nil {
 		return MemoryUsedMeterRaw
 	}
-	if strings.ToLower(strings.TrimSpace(*l.MemoryUsedMeter)) == MemoryUsedMeterWorkingSet {
+	switch strings.ToLower(strings.TrimSpace(*l.MemoryUsedMeter)) {
+	case MemoryUsedMeterWorkingSet:
 		return MemoryUsedMeterWorkingSet
+	case MemoryUsedMeterUnreclaimable:
+		return MemoryUsedMeterUnreclaimable
+	default:
+		return MemoryUsedMeterRaw
 	}
-	return MemoryUsedMeterRaw
 }
 
 // ResolvedShapeAdmission returns "on", "off" or "shadow", defaulting to "on".
@@ -418,9 +433,9 @@ func (l *NodeResourceLimit) Validate() error {
 	}
 	if l.MemoryUsedMeter != nil {
 		switch strings.ToLower(strings.TrimSpace(*l.MemoryUsedMeter)) {
-		case MemoryUsedMeterRaw, MemoryUsedMeterWorkingSet:
+		case MemoryUsedMeterRaw, MemoryUsedMeterWorkingSet, MemoryUsedMeterUnreclaimable:
 		default:
-			return fmt.Errorf("scheduler.node_resource_limit.memory_used_meter must be one of raw, working_set, got %q", *l.MemoryUsedMeter)
+			return fmt.Errorf("scheduler.node_resource_limit.memory_used_meter must be one of raw, working_set, unreclaimable, got %q", *l.MemoryUsedMeter)
 		}
 	}
 	if l.ShapeAdmission != nil {

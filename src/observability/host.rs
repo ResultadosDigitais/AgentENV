@@ -32,6 +32,12 @@ pub struct HostMetrics {
     /// the figure kubelet reports. `None` when memory.stat cannot be read or
     /// the node has no cgroup memory limit; never zero for "unknown".
     pub memory_working_set_bytes: Option<u64>,
+    /// Memory the runtime cgroup cannot give back: anon + file_mapped +
+    /// shmem + dirty/writeback file pages + unreclaimable kernel memory. See
+    /// `parse_memory_stat_unreclaimable` for the measured definition. `None`
+    /// when memory.stat cannot be read or there is no cgroup memory limit;
+    /// never zero for "unknown".
+    pub memory_unreclaimable_bytes: Option<u64>,
     pub memory_total_bytes: u64,
     pub disks: Vec<DiskMetric>,
 }
@@ -60,6 +66,7 @@ struct CgroupMemoryLimit {
     limit_bytes: u64,
     used_bytes: Option<u64>,
     inactive_file_bytes: Option<u64>,
+    unreclaimable_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +74,7 @@ struct MemoryReading {
     total_bytes: u64,
     used_bytes: u64,
     working_set_bytes: Option<u64>,
+    unreclaimable_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -136,6 +144,7 @@ impl HostMetricsCollector {
             cpu_count,
             memory_used_bytes: memory.used_bytes,
             memory_working_set_bytes: memory.working_set_bytes,
+            memory_unreclaimable_bytes: memory.unreclaimable_bytes,
             memory_total_bytes: memory.total_bytes,
             disks: Self::read_disk_metrics()?,
         })
@@ -145,6 +154,9 @@ impl HostMetricsCollector {
     /// applies, otherwise against the host totals. The raw used figure is
     /// memory.current; the working set subtracts inactive_file from it and is
     /// only published when both memory.current and memory.stat are readable.
+    /// The unreclaimable figure comes from memory.stat and is clamped by
+    /// memory.current when readable, then by the cgroup limit: the components
+    /// overlap in kernel accounting, so the sum may only overestimate.
     fn read_memory(&self, host_total_bytes: u64, host_used_bytes: u64) -> MemoryReading {
         self.read_cgroup_memory_limit()
             .filter(|limit| limit.limit_bytes <= host_total_bytes)
@@ -159,11 +171,18 @@ impl HostMetricsCollector {
                         current.saturating_sub(inactive_file).min(limit.limit_bytes)
                     },
                 ),
+                unreclaimable_bytes: limit.unreclaimable_bytes.map(|unreclaimable| {
+                    let clamped = limit
+                        .used_bytes
+                        .map_or(unreclaimable, |current| unreclaimable.min(current));
+                    clamped.min(limit.limit_bytes)
+                }),
             })
             .unwrap_or(MemoryReading {
                 total_bytes: host_total_bytes,
                 used_bytes: host_used_bytes,
                 working_set_bytes: None,
+                unreclaimable_bytes: None,
             })
     }
 
@@ -249,6 +268,9 @@ impl HostMetricsCollector {
             .read_first(&self.cgroup_files.memory_max)
             .as_deref()
             .and_then(|limit| {
+                // Read memory.stat once: the working set and the unreclaimable
+                // figure are two readings of the same file.
+                let memory_stat = self.cgroup_files.read_first(&self.cgroup_files.memory_stat);
                 Self::parse_cgroup_memory_limit(limit).map(|limit_bytes| CgroupMemoryLimit {
                     limit_bytes,
                     used_bytes: self
@@ -256,11 +278,12 @@ impl HostMetricsCollector {
                         .read_first(&self.cgroup_files.memory_current)
                         .as_deref()
                         .and_then(Self::parse_cgroup_memory_usage),
-                    inactive_file_bytes: self
-                        .cgroup_files
-                        .read_first(&self.cgroup_files.memory_stat)
+                    inactive_file_bytes: memory_stat
                         .as_deref()
                         .and_then(Self::parse_memory_stat_inactive_file),
+                    unreclaimable_bytes: memory_stat
+                        .as_deref()
+                        .and_then(Self::parse_memory_stat_unreclaimable),
                 })
             })
     }
@@ -276,6 +299,52 @@ impl HostMetricsCollector {
             })
         };
         value_of("total_inactive_file").or_else(|| value_of("inactive_file"))
+    }
+
+    /// Reads the memory the runtime cgroup cannot give back from a cgroup
+    /// memory.stat: anon + file_mapped + shmem + file_dirty + file_writeback
+    /// plus the unreclaimable kernel pages (kernel_stack, pagetables, percpu,
+    /// sock, slab_unreclaimable).
+    ///
+    /// Measured on wzcn4 on 2026-11-22 around 06:50Z (OPSAI-6555): anon 11 GiB
+    /// plus file_mapped 11 GiB plus about 2 GiB of shmem and kernel pages is
+    /// roughly 24 GiB, against a 114 GiB working set built from 100 GiB of
+    /// active, unmapped page cache. The node was refused 75 times in 15 minutes
+    /// on the working set while roughly 24 GiB was actually held. MemAvailable
+    /// is not used because it treats file_mapped as reclaimable, and here the
+    /// mapped pages are restored VM memory the container still owns.
+    ///
+    /// cgroup v1 reports the hierarchical figure as `total_<key>`, which wins
+    /// per component, like total_inactive_file for the working set. `anon`
+    /// (or `total_rss` on v1) is required: without it the figure is unknown
+    /// (`None`), never zero. A missing optional component counts zero.
+    fn parse_memory_stat_unreclaimable(content: &str) -> Option<u64> {
+        let value_of = |wanted: &str| {
+            content.lines().find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == wanted).then(|| value.trim().parse::<u64>().ok())?
+            })
+        };
+        let component =
+            |v1: &str, v2: &str| -> u64 { value_of(v1).or_else(|| value_of(v2)).unwrap_or(0) };
+
+        let anon = value_of("total_rss").or_else(|| value_of("anon"))?;
+        Some(
+            [
+                anon,
+                component("total_mapped_file", "file_mapped"),
+                component("total_shmem", "shmem"),
+                component("total_dirty", "file_dirty"),
+                component("total_writeback", "file_writeback"),
+                component("total_kernel_stack", "kernel_stack"),
+                component("total_pagetables", "pagetables"),
+                component("total_percpu", "percpu"),
+                component("total_sock", "sock"),
+                component("total_slab_unreclaimable", "slab_unreclaimable"),
+            ]
+            .into_iter()
+            .fold(0u64, u64::saturating_add),
+        )
     }
 
     fn parse_cgroup_memory_limit(content: &str) -> Option<u64> {
@@ -646,6 +715,140 @@ mod tests {
         assert_eq!(memory.total_bytes, 8000000);
         assert_eq!(memory.used_bytes, 3000000);
         assert_eq!(memory.working_set_bytes, None);
+        assert_eq!(memory.unreclaimable_bytes, None);
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// memory.stat measured on wzcn4 on 2026-11-22 around 06:50Z (OPSAI-6555):
+    /// total 126 GiB, memory.current 117 GiB, anon 11 GiB, file 104 GiB
+    /// (active_file 100, inactive_file 3, file_mapped 11). The working set
+    /// reports 114 GiB (90%) because it counts the active, unmapped page cache,
+    /// while roughly 24 GiB is memory the container cannot give back.
+    const WZCN4_MEMORY_STAT: &str = "\
+anon 11811160064
+file 111669149696
+active_file 107374182400
+inactive_file 3221225472
+file_mapped 11811160064
+shmem 1073741824
+file_dirty 134217728
+file_writeback 67108864
+kernel_stack 16777216
+pagetables 536870912
+percpu 8388608
+sock 33554432
+slab_reclaimable 1073741824
+slab_unreclaimable 268435456
+";
+
+    /// anon + file_mapped + shmem + file_dirty + file_writeback +
+    /// kernel_stack + pagetables + percpu + sock + slab_unreclaimable.
+    const WZCN4_UNRECLAIMABLE_BYTES: u64 = 25761415168;
+
+    #[test]
+    fn parse_memory_stat_unreclaimable_sums_the_measured_wzcn4_shape() {
+        let unreclaimable =
+            HostMetricsCollector::parse_memory_stat_unreclaimable(WZCN4_MEMORY_STAT)
+                .expect("unreclaimable figure");
+        assert_eq!(unreclaimable, WZCN4_UNRECLAIMABLE_BYTES);
+        // Roughly 24 GiB of memory that cannot be given back, against the
+        // 114 GiB working set the raw subtractive measure reports.
+        assert_eq!(unreclaimable / GIB, 23);
+        assert!(unreclaimable > 23 * GIB);
+        assert!(unreclaimable < 24 * GIB);
+        assert_ne!(unreclaimable, 114 * GIB);
+    }
+
+    #[test]
+    fn parse_memory_stat_unreclaimable_prefers_v1_hierarchical_keys() {
+        // cgroup v1 reports `total_<key>` hierarchical values; like
+        // total_inactive_file for the working set, they win per component.
+        let content = "\
+total_rss 111
+anon 999
+total_mapped_file 222
+file_mapped 888
+total_shmem 333
+shmem 777
+total_dirty 5
+file_dirty 500
+total_writeback 6
+file_writeback 600
+total_kernel_stack 10
+kernel_stack 100
+total_pagetables 20
+pagetables 200
+total_percpu 30
+percpu 300
+total_sock 40
+sock 400
+total_slab_unreclaimable 50
+slab_unreclaimable 500
+";
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_unreclaimable(content),
+            Some(111 + 222 + 333 + 5 + 6 + 10 + 20 + 30 + 40 + 50)
+        );
+    }
+
+    #[test]
+    fn parse_memory_stat_unreclaimable_is_absent_without_anon() {
+        // Without the anon/anon-rss component there is no unreclaimable
+        // figure at all: None, never zero, and the scheduler falls back.
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_unreclaimable(
+                "file_mapped 500\npagetables 20\n"
+            ),
+            None
+        );
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_unreclaimable(""),
+            None
+        );
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_unreclaimable("anon lots\n"),
+            None
+        );
+        // An optional component that is missing counts zero rather than
+        // discarding the figure.
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_unreclaimable("anon 100\n"),
+            Some(100)
+        );
+        assert_eq!(
+            HostMetricsCollector::parse_memory_stat_unreclaimable("total_rss 100\n"),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn cgroup_memory_publishes_unreclaimable_next_to_raw_and_working_set() {
+        let dir = cgroup_fixture("135291469824\n", "125627793408\n", Some(WZCN4_MEMORY_STAT));
+
+        let memory = collector_for(&dir).read_memory(u64::MAX, 0);
+
+        assert_eq!(memory.total_bytes, 126 * GIB);
+        assert_eq!(memory.used_bytes, 117 * GIB);
+        assert_eq!(memory.working_set_bytes, Some(114 * GIB));
+        assert_eq!(memory.unreclaimable_bytes, Some(WZCN4_UNRECLAIMABLE_BYTES));
+    }
+
+    #[test]
+    fn cgroup_memory_unreclaimable_clamps_at_memory_current() {
+        // file_mapped overlaps file_dirty and shmem in kernel accounting, so
+        // the summed estimate can exceed memory.current; the published figure
+        // never exceeds what the cgroup actually holds.
+        let dir = cgroup_fixture(
+            "1000000\n",
+            "100000\n",
+            Some("anon 90000\nfile_mapped 80000\nshmem 30000\n"),
+        );
+
+        let memory = collector_for(&dir).read_memory(u64::MAX, 0);
+
+        assert_eq!(memory.used_bytes, 100000);
+        assert_eq!(memory.unreclaimable_bytes, Some(100000));
     }
 
     #[test]

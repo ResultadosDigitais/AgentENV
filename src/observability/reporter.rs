@@ -403,6 +403,7 @@ impl ObservabilityReporter {
                 cpu_count: snapshot.metrics.cpu_count,
                 memory_used_bytes: snapshot.metrics.memory_used_bytes,
                 memory_working_set_bytes: snapshot.metrics.memory_working_set_bytes,
+                memory_unreclaimable_bytes: snapshot.metrics.memory_unreclaimable_bytes,
                 memory_total_bytes: snapshot.metrics.memory_total_bytes,
                 disks: snapshot
                     .metrics
@@ -639,6 +640,7 @@ mod tests {
                 cpu_count: 8,
                 memory_used_bytes: 0,
                 memory_working_set_bytes: None,
+                memory_unreclaimable_bytes: None,
                 memory_total_bytes: 128 * 1024 * 1024 * 1024,
                 disks: Vec::new(),
                 paused_allocated_cpu: 4,
@@ -692,6 +694,7 @@ mod tests {
                 cpu_count: 0,
                 memory_used_bytes: 0,
                 memory_working_set_bytes: None,
+                memory_unreclaimable_bytes: None,
                 memory_total_bytes: 0,
                 disks: Vec::new(),
                 paused_allocated_cpu: 0,
@@ -708,7 +711,10 @@ mod tests {
         assert!(req.paused_sandboxes.is_empty());
     }
 
-    fn snapshot_with_memory(working_set: Option<u64>) -> crate::observability::NodeSnapshot {
+    fn snapshot_with_memory(
+        working_set: Option<u64>,
+        unreclaimable: Option<u64>,
+    ) -> crate::observability::NodeSnapshot {
         crate::observability::NodeSnapshot {
             version: String::new(),
             commit: String::new(),
@@ -733,6 +739,7 @@ mod tests {
                 cpu_count: 0,
                 memory_used_bytes: 250000,
                 memory_working_set_bytes: working_set,
+                memory_unreclaimable_bytes: unreclaimable,
                 memory_total_bytes: 1000000,
                 disks: Vec::new(),
                 paused_allocated_cpu: 0,
@@ -749,7 +756,7 @@ mod tests {
     #[test]
     fn test_build_heartbeat_request_carries_working_set_next_to_raw_used() {
         let req = ObservabilityReporter::build_heartbeat_request(
-            snapshot_with_memory(Some(200000)),
+            snapshot_with_memory(Some(200000), None),
             0,
             None,
         );
@@ -760,10 +767,37 @@ mod tests {
 
     #[test]
     fn test_build_heartbeat_request_leaves_unknown_working_set_absent() {
-        let req =
-            ObservabilityReporter::build_heartbeat_request(snapshot_with_memory(None), 0, None);
+        let req = ObservabilityReporter::build_heartbeat_request(
+            snapshot_with_memory(None, None),
+            0,
+            None,
+        );
         let snapshot = req.snapshot.expect("snapshot");
         assert_eq!(snapshot.memory_used_bytes, 250000);
         assert_eq!(snapshot.memory_working_set_bytes, None);
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_carries_unreclaimable_next_to_working_set() {
+        let req = ObservabilityReporter::build_heartbeat_request(
+            snapshot_with_memory(Some(200000), Some(24000)),
+            0,
+            None,
+        );
+        let snapshot = req.snapshot.expect("snapshot");
+        assert_eq!(snapshot.memory_used_bytes, 250000);
+        assert_eq!(snapshot.memory_working_set_bytes, Some(200000));
+        assert_eq!(snapshot.memory_unreclaimable_bytes, Some(24000));
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_leaves_unknown_unreclaimable_absent() {
+        let req = ObservabilityReporter::build_heartbeat_request(
+            snapshot_with_memory(None, None),
+            0,
+            None,
+        );
+        let snapshot = req.snapshot.expect("snapshot");
+        assert_eq!(snapshot.memory_unreclaimable_bytes, None);
     }
 }

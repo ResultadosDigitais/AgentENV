@@ -171,11 +171,12 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 				zap.String("detail", violation.Detail),
 			)
 		},
-		MeterFallback: func(nodeID string) {
-			s.logger.Info("scheduler memory meter fell back to raw",
+		MeterFallback: func(nodeID, meter, reason string) {
+			s.logger.Info("scheduler memory meter fell back",
 				zap.String("node_id", nodeID),
-				zap.String("configured_meter", config.MemoryUsedMeterWorkingSet),
-				zap.String("reason", "memory_working_set_bytes_absent"),
+				zap.String("configured_meter", s.resourceLimit.ResolvedMemoryUsedMeter()),
+				zap.String("meter", meter),
+				zap.String("reason", reason),
 			)
 		},
 	})
@@ -567,6 +568,12 @@ func (s *Service) projectReservationsExcept(nodes []RichNode, excludeKey string)
 		if snapshot.MemoryWorkingSetBytes != nil {
 			snapshot.MemoryWorkingSetBytes = proto.Uint64(snapshot.GetMemoryWorkingSetBytes() + memoryBytes)
 		}
+		// The unreclaimable figure is projected the same way, and only when the
+		// node reports it, so an absent field stays absent and the meter chains
+		// down instead of reading the reservation alone.
+		if snapshot.MemoryUnreclaimableBytes != nil {
+			snapshot.MemoryUnreclaimableBytes = proto.Uint64(snapshot.GetMemoryUnreclaimableBytes() + memoryBytes)
+		}
 		if snapshot.GetRequestedMemoryBytes() > 0 {
 			snapshot.RequestedMemoryBytes += memoryBytes
 		}
@@ -752,7 +759,7 @@ func (s *Service) nodeAdmission(n RichNode) *schedulerv1.NodeAdmission {
 	verdicts := EvaluateNodeAdmission(n, s.resourceLimit)
 	capacity, source := capacityMemoryBytes(n.Snapshot, n.Capacity, s.resourceLimit)
 	admission := &schedulerv1.NodeAdmission{
-		RuntimeOverheadBytes: runtimeOverheadBytes(n.Snapshot),
+		RuntimeOverheadBytes: runtimeOverheadBytes(n.Snapshot, s.resourceLimit),
 		CapacityMemoryBytes:  capacity,
 		CapacitySource:       source,
 	}

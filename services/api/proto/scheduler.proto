@@ -203,6 +203,14 @@ message NodeSnapshot {
   // scheduler then falls back to memory_used_bytes. Never reported as zero
   // for "unknown".
   optional uint64 memory_working_set_bytes = 18;
+  // Memory the runtime cgroup cannot give back: anon + file_mapped + shmem +
+  // file_dirty + file_writeback + unreclaimable kernel memory (kernel_stack,
+  // pagetables, percpu, sock, slab_unreclaimable). MemAvailable is not used
+  // because it treats file_mapped as reclaimable, and here the mapped pages
+  // are restored VM memory. Absent when the node cannot read memory.stat or
+  // predates the field; the scheduler then falls back to the working set and
+  // then to memory_used_bytes. Never reported as zero for "unknown".
+  optional uint64 memory_unreclaimable_bytes = 19;
 }
 
 message P2pEndpoint {
