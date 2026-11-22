@@ -138,6 +138,7 @@ All fields are optional. Omitting a field (or setting the whole block to `null`)
 | `max_cpu_allocated_percent` | uint32 | Maximum allocated-CPU-to-physical-CPU ratio; can exceed 100 when overcommit is allowed |
 | `max_memory_used_percent` | uint32 | Maximum observed memory usage (0–100) |
 | `max_memory_allocated_percent` | uint32 | Maximum allocated-memory-to-physical-memory ratio; can exceed 100 when overcommit is allowed |
+| `memory_used_meter` | string | Figure `max_memory_used_percent` compares: `raw` (default) is the cgroup `memory.current`, `working_set` is `memory.current` minus `inactive_file`, `unreclaimable` is the memory the runtime cgroup cannot give back (`anon` + `file_mapped` + `shmem` + dirty/writeback + unreclaimable kernel pages). The meters chain down when the node does not report the selected field — `unreclaimable` → `working_set` → `raw`, and `working_set` → `raw` — so a mixed fleet during the rollout is never admitted free; the fallback is logged with the absent field as its reason |
 | `admission_mode` | string | `nominal` (default), `request` or `shadow`; see "Memory admission modes" below |
 | `max_memory_limit_overcommit_ratio` | float | In `request`/`shadow` mode: cap on (sum of nominal VM sizes) / node memory. Default `1.5`; ignored in `nominal` |
 | `max_disk_used_percent` | uint32 | Maximum used percentage of the filesystem at `disk_mount_point` (0–100). Always effective: unlike the memory limits it does not take part in `admission_mode` |
@@ -146,6 +147,8 @@ All fields are optional. Omitting a field (or setting the whole block to `null`)
 | `shape_admission` | string | `on` (default) decides create and resume admission by the shape rule and publishes the per-layer verdict; `shadow` is computed and published per node, never enforced — the verdict and the shadow outcomes are published while create and resume decide like `off`; `off` is the kill switch that restores the pre-OPSAI-6200 routing and publishes nothing |
 | `cross_node_resume` | bool | Allow a paused sandbox rejected on its owner to resume on another admitted node. Off by default: only enable it once the paused artifacts are readable from another node |
 | `admission_layers` | array | VM shapes published per node: `{"memory_gb": 8, "cpu_count": 4}`. Default the 8, 16, 32 and 64 GiB layers; `cpu_count` is optional |
+
+Under `memory_used_meter: unreclaimable` the ceiling base does not subtract the runtime overhead: the meter already counts the runtime's own pages, so with `memory_capacity_source: allocatable` the base is `min(allocatable, memory_total)` and `GET /nodes` publishes `runtimeOverheadBytes: 0`. Roll out the runtime image first and confirm `memoryUnreclaimableBytes` in `GET /nodes` before switching the meter; rollback is config-only.
 
 Example:
 
