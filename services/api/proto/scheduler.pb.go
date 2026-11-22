@@ -1128,8 +1128,16 @@ type NodeSnapshot struct {
 	// scheduler then falls back to memory_used_bytes. Never reported as zero
 	// for "unknown".
 	MemoryWorkingSetBytes *uint64 `protobuf:"varint,18,opt,name=memory_working_set_bytes,json=memoryWorkingSetBytes,proto3,oneof" json:"memory_working_set_bytes,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Memory the runtime cgroup cannot give back: anon + file_mapped + shmem +
+	// file_dirty + file_writeback + unreclaimable kernel memory (kernel_stack,
+	// pagetables, percpu, sock, slab_unreclaimable). MemAvailable is not used
+	// because it treats file_mapped as reclaimable, and here the mapped pages
+	// are restored VM memory. Absent when the node cannot read memory.stat or
+	// predates the field; the scheduler then falls back to the working set and
+	// then to memory_used_bytes. Never reported as zero for "unknown".
+	MemoryUnreclaimableBytes *uint64 `protobuf:"varint,19,opt,name=memory_unreclaimable_bytes,json=memoryUnreclaimableBytes,proto3,oneof" json:"memory_unreclaimable_bytes,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *NodeSnapshot) Reset() {
@@ -1284,6 +1292,13 @@ func (x *NodeSnapshot) GetRequestedMemoryBytes() uint64 {
 func (x *NodeSnapshot) GetMemoryWorkingSetBytes() uint64 {
 	if x != nil && x.MemoryWorkingSetBytes != nil {
 		return *x.MemoryWorkingSetBytes
+	}
+	return 0
+}
+
+func (x *NodeSnapshot) GetMemoryUnreclaimableBytes() uint64 {
+	if x != nil && x.MemoryUnreclaimableBytes != nil {
+		return *x.MemoryUnreclaimableBytes
 	}
 	return 0
 }
@@ -3098,7 +3113,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"used_bytes\x18\x04 \x01(\x04R\tusedBytes\x12\x1f\n" +
 	"\vtotal_bytes\x18\x05 \x01(\x04R\n" +
-	"totalBytes\"\xf3\x06\n" +
+	"totalBytes\"\xd5\a\n" +
 	"\fNodeSnapshot\x120\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x18.scheduler.v1.NodeStatusR\x06status\x12#\n" +
 	"\rallocated_cpu\x18\x02 \x01(\rR\fallocatedCpu\x124\n" +
@@ -3119,8 +3134,10 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x14paused_allocated_cpu\x18\x0f \x01(\rR\x12pausedAllocatedCpu\x12A\n" +
 	"\x1dpaused_allocated_memory_bytes\x18\x10 \x01(\x04R\x1apausedAllocatedMemoryBytes\x124\n" +
 	"\x16requested_memory_bytes\x18\x11 \x01(\x04R\x14requestedMemoryBytes\x12<\n" +
-	"\x18memory_working_set_bytes\x18\x12 \x01(\x04H\x00R\x15memoryWorkingSetBytes\x88\x01\x01B\x1b\n" +
-	"\x19_memory_working_set_bytes\"A\n" +
+	"\x18memory_working_set_bytes\x18\x12 \x01(\x04H\x00R\x15memoryWorkingSetBytes\x88\x01\x01\x12A\n" +
+	"\x1amemory_unreclaimable_bytes\x18\x13 \x01(\x04H\x01R\x18memoryUnreclaimableBytes\x88\x01\x01B\x1b\n" +
+	"\x19_memory_working_set_bytesB\x1d\n" +
+	"\x1b_memory_unreclaimable_bytes\"A\n" +
 	"\vP2pEndpoint\x12\x18\n" +
 	"\abackend\x18\x01 \x01(\tR\abackend\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\"c\n" +
