@@ -350,6 +350,7 @@ mod tests {
             cpu_count: 4,
             memory_used_bytes: 250000,
             memory_working_set_bytes: working_set,
+            memory_unreclaimable_bytes: None,
             memory_total_bytes: 1000000,
             disks: Vec::new(),
             paused_allocated_cpu: 0,
