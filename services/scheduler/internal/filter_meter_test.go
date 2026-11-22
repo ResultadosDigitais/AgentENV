@@ -78,13 +78,16 @@ func TestMemoryUsedMeterWorkingSetRefusesAboveThreshold(t *testing.T) {
 func TestMemoryUsedMeterWorkingSetFallsBackToRawWhenAbsent(t *testing.T) {
 	node := meterNode("q9rvm", nil)
 	var rejected []LimitViolation
-	var fellBack []string
+	var fellBack []meterFallbackEvent
 	FilterByResourceLimitObservedBy([]RichNode{node}, meterLimit(strPtr(config.MemoryUsedMeterWorkingSet)), ResourceLimitObservers{
-		Reject:        func(_ string, v LimitViolation) { rejected = append(rejected, v) },
-		MeterFallback: func(nodeID string) { fellBack = append(fellBack, nodeID) },
+		Reject: func(_ string, v LimitViolation) { rejected = append(rejected, v) },
+		MeterFallback: func(nodeID, meter, reason string) {
+			fellBack = append(fellBack, meterFallbackEvent{nodeID: nodeID, meter: meter, reason: reason})
+		},
 	})
-	if len(fellBack) != 1 || fellBack[0] != "q9rvm" {
-		t.Fatalf("fallback must be reported for the node, got %v", fellBack)
+	want := meterFallbackEvent{nodeID: "q9rvm", meter: config.MemoryUsedMeterRaw, reason: "memory_working_set_bytes_absent"}
+	if len(fellBack) != 1 || fellBack[0] != want {
+		t.Fatalf("fallback event = %v, want %v", fellBack, want)
 	}
 	if len(rejected) != 1 || rejected[0].Observed != "90" || rejected[0].Meter != config.MemoryUsedMeterRaw {
 		t.Fatalf("absent working set must be evaluated on raw, got %+v", rejected)
@@ -94,10 +97,12 @@ func TestMemoryUsedMeterWorkingSetFallsBackToRawWhenAbsent(t *testing.T) {
 func TestMemoryUsedMeterRawDefaultIgnoresWorkingSet(t *testing.T) {
 	node := meterNode("v6qcb", proto.Uint64(meterWorkingSetBytes))
 	var rejected []LimitViolation
-	var fellBack []string
+	var fellBack []meterFallbackEvent
 	FilterByResourceLimitObservedBy([]RichNode{node}, meterLimit(nil), ResourceLimitObservers{
-		Reject:        func(_ string, v LimitViolation) { rejected = append(rejected, v) },
-		MeterFallback: func(nodeID string) { fellBack = append(fellBack, nodeID) },
+		Reject: func(_ string, v LimitViolation) { rejected = append(rejected, v) },
+		MeterFallback: func(nodeID, meter, reason string) {
+			fellBack = append(fellBack, meterFallbackEvent{nodeID: nodeID, meter: meter, reason: reason})
+		},
 	})
 	if len(rejected) != 1 || rejected[0].Observed != "90" || rejected[0].Meter != config.MemoryUsedMeterRaw {
 		t.Fatalf("default meter must stay raw, got %+v", rejected)
@@ -147,9 +152,16 @@ func TestScheduleLogsMeterOnRefusalAndFallback(t *testing.T) {
 	if _, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{}); err == nil {
 		t.Fatal("expected the only node to be refused on the raw fallback")
 	}
-	fallback := logs.FilterMessage("scheduler memory meter fell back to raw").All()
-	if len(fallback) != 1 || fallback[0].ContextMap()["node_id"] != "nktxk" {
-		t.Fatalf("expected one named fallback line for nktxk, got %v", fallback)
+	fallback := logs.FilterMessage("scheduler memory meter fell back").All()
+	if len(fallback) != 1 {
+		t.Fatalf("expected one fallback line, got %v", fallback)
+	}
+	fields := fallback[0].ContextMap()
+	if fields["node_id"] != "nktxk" ||
+		fields["configured_meter"] != config.MemoryUsedMeterWorkingSet ||
+		fields["meter"] != config.MemoryUsedMeterRaw ||
+		fields["reason"] != "memory_working_set_bytes_absent" {
+		t.Fatalf("unexpected fallback fields %v", fields)
 	}
 	refusals := logs.FilterMessage("scheduler rejected node by resource limit").All()
 	if len(refusals) != 1 {

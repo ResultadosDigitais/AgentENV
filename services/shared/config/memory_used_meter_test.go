@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestMemoryUsedMeterDefaultsToRaw(t *testing.T) {
 	var nilLimit *NodeResourceLimit
@@ -19,6 +22,13 @@ func TestMemoryUsedMeterResolvesWorkingSet(t *testing.T) {
 	}
 }
 
+func TestMemoryUsedMeterResolvesUnreclaimable(t *testing.T) {
+	meter := " Unreclaimable "
+	if got := (&NodeResourceLimit{MemoryUsedMeter: &meter}).ResolvedMemoryUsedMeter(); got != MemoryUsedMeterUnreclaimable {
+		t.Fatalf("memory_used_meter = %q, want unreclaimable", got)
+	}
+}
+
 func TestMemoryUsedMeterUnknownFailsSafeToRaw(t *testing.T) {
 	meter := "rss"
 	if got := (&NodeResourceLimit{MemoryUsedMeter: &meter}).ResolvedMemoryUsedMeter(); got != MemoryUsedMeterRaw {
@@ -28,12 +38,12 @@ func TestMemoryUsedMeterUnknownFailsSafeToRaw(t *testing.T) {
 
 func TestMemoryUsedMeterValidate(t *testing.T) {
 	str := func(v string) *string { return &v }
-	for _, meter := range []string{"raw", "working_set", " RAW "} {
+	for _, meter := range []string{"raw", "working_set", " RAW ", "unreclaimable", " Unreclaimable "} {
 		if err := (&NodeResourceLimit{MemoryUsedMeter: str(meter)}).Validate(); err != nil {
 			t.Fatalf("memory_used_meter %q rejected: %v", meter, err)
 		}
 	}
-	for _, meter := range []string{"rss", "", "working-set"} {
+	for _, meter := range []string{"rss", "", "working-set", "unreclaimable_bytes", "unreclaimable-set"} {
 		if err := (&NodeResourceLimit{MemoryUsedMeter: str(meter)}).Validate(); err == nil {
 			t.Fatalf("memory_used_meter %q accepted", meter)
 		}
@@ -52,16 +62,21 @@ func TestLoadRejectsUnknownMemoryUsedMeter(t *testing.T) {
 }
 
 func TestLoadParsesMemoryUsedMeter(t *testing.T) {
-	cfg, err := loadSchedulerConfig(t, `{
-		"scheduler": {
-			"nodes": [{"id": "node-a", "endpoint": "http://node-a:8000"}],
-			"node_resource_limit": {"max_memory_used_percent": 85, "memory_used_meter": "working_set"}
+	for value, want := range map[string]string{
+		"working_set":   MemoryUsedMeterWorkingSet,
+		"unreclaimable": MemoryUsedMeterUnreclaimable,
+	} {
+		cfg, err := loadSchedulerConfig(t, fmt.Sprintf(`{
+			"scheduler": {
+				"nodes": [{"id": "node-a", "endpoint": "http://node-a:8000"}],
+				"node_resource_limit": {"max_memory_used_percent": 85, "memory_used_meter": %q}
+			}
+		}`, value))
+		if err != nil {
+			t.Fatalf("load config with memory_used_meter %q failed: %v", value, err)
 		}
-	}`)
-	if err != nil {
-		t.Fatalf("load config failed: %v", err)
-	}
-	if got := cfg.Scheduler.NodeResourceLimit.ResolvedMemoryUsedMeter(); got != MemoryUsedMeterWorkingSet {
-		t.Fatalf("memory_used_meter = %q, want working_set", got)
+		if got := cfg.Scheduler.NodeResourceLimit.ResolvedMemoryUsedMeter(); got != want {
+			t.Fatalf("memory_used_meter = %q, want %q", got, want)
+		}
 	}
 }

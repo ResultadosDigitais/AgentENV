@@ -24,10 +24,18 @@ type RejectionObserver func(nodeID string, violation LimitViolation)
 // in the outcome counter. It must not block.
 type DiskSkipObserver func(nodeID string, violation LimitViolation)
 
-// MeterFallbackObserver receives a node evaluated on the raw memory figure
-// although memory_used_meter is working_set, because its heartbeat does not
-// carry memory_working_set_bytes. It must not block.
-type MeterFallbackObserver func(nodeID string)
+// MeterFallbackObserver receives a node evaluated on a lower memory figure than
+// the configured meter, because its heartbeat does not carry the selected
+// field, along with the meter that was actually used and the reason naming the
+// absent field. It must not block.
+type MeterFallbackObserver func(nodeID, usedMeter, reason string)
+
+// Memory meter fallback reasons: the field the configured meter needed and the
+// node did not report.
+const (
+	reasonUnreclaimableAbsent = "memory_unreclaimable_bytes_absent"
+	reasonWorkingSetAbsent    = "memory_working_set_bytes_absent"
+)
 
 // ResourceLimitObservers groups the optional observers of the resource limit
 // filter. Every field may be nil.
@@ -104,7 +112,7 @@ func capacityMemoryBytes(s *schedulerv1.NodeSnapshot, capacity *NodeCapacity, li
 	if total > 0 && total < base {
 		base = total
 	}
-	overhead := runtimeOverheadBytes(s)
+	overhead := runtimeOverheadBytes(s, limit)
 	if overhead >= base {
 		return 0, config.MemoryCapacitySourceAllocatable
 	}
@@ -115,7 +123,15 @@ func capacityMemoryBytes(s *schedulerv1.NodeSnapshot, capacity *NodeCapacity, li
 // memory_used - allocated. It includes page cache and guest anon the guest
 // does not attribute to a sandbox, so it is conservative: it may defer a
 // sandbox earlier than the measured demand suggests, never later.
-func runtimeOverheadBytes(s *schedulerv1.NodeSnapshot) uint64 {
+//
+// Under the unreclaimable meter it is zero: the numerator already counts the
+// runtime's own pages, so subtracting used - allocated again would collapse the
+// capacity base with the page cache (the wzcn4 node would fall from a 120 GiB
+// base to 27 GiB and be refused by both the used and the allocated check).
+func runtimeOverheadBytes(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) uint64 {
+	if _, meter, _ := memoryUsedBytes(s, limit); meter == config.MemoryUsedMeterUnreclaimable {
+		return 0
+	}
 	used := s.GetMemoryUsedBytes()
 	allocated := s.GetAllocatedMemoryBytes()
 	if used <= allocated {
@@ -275,28 +291,36 @@ func memoryAllocatedCheck(s *schedulerv1.NodeSnapshot, limit *config.NodeResourc
 	return observed, *limit.MaxMemoryAllocatedPercent, observed > *limit.MaxMemoryAllocatedPercent
 }
 
-// memoryUsedBytes returns the figure max_memory_used_percent compares and the
-// meter that produced it. The working set is read only when the meter asks
-// for it and the node reports it; otherwise the raw memory_used applies.
-func memoryUsedBytes(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (uint64, string) {
-	if limit.ResolvedMemoryUsedMeter() == config.MemoryUsedMeterWorkingSet && s.MemoryWorkingSetBytes != nil {
-		return s.GetMemoryWorkingSetBytes(), config.MemoryUsedMeterWorkingSet
+// memoryUsedBytes returns the figure max_memory_used_percent compares, the
+// meter that produced it and, when that is not the configured meter, the reason
+// naming the field the node did not report. The meters chain down so a node
+// that lacks the selected field is never admitted free: unreclaimable falls
+// back to the working set and then to raw, and working_set falls back to raw.
+func memoryUsedBytes(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) (uint64, string, string) {
+	switch limit.ResolvedMemoryUsedMeter() {
+	case config.MemoryUsedMeterUnreclaimable:
+		if s.MemoryUnreclaimableBytes != nil {
+			return s.GetMemoryUnreclaimableBytes(), config.MemoryUsedMeterUnreclaimable, ""
+		}
+		if s.MemoryWorkingSetBytes != nil {
+			return s.GetMemoryWorkingSetBytes(), config.MemoryUsedMeterWorkingSet, reasonUnreclaimableAbsent
+		}
+		return s.GetMemoryUsedBytes(), config.MemoryUsedMeterRaw, reasonUnreclaimableAbsent
+	case config.MemoryUsedMeterWorkingSet:
+		if s.MemoryWorkingSetBytes != nil {
+			return s.GetMemoryWorkingSetBytes(), config.MemoryUsedMeterWorkingSet, ""
+		}
+		return s.GetMemoryUsedBytes(), config.MemoryUsedMeterRaw, reasonWorkingSetAbsent
+	default:
+		return s.GetMemoryUsedBytes(), config.MemoryUsedMeterRaw, ""
 	}
-	return s.GetMemoryUsedBytes(), config.MemoryUsedMeterRaw
-}
-
-// memoryMeterFellBack reports a node evaluated on the raw figure although the
-// working_set meter is configured.
-func memoryMeterFellBack(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit) bool {
-	_, meter := memoryUsedBytes(s, limit)
-	return meter != limit.ResolvedMemoryUsedMeter()
 }
 
 func memoryUsedCheck(s *schedulerv1.NodeSnapshot, limit *config.NodeResourceLimit, base uint64) (uint32, uint32, bool) {
 	if limit.MaxMemoryUsedPercent == nil || base == 0 {
 		return 0, 0, false
 	}
-	used, _ := memoryUsedBytes(s, limit)
+	used, _, _ := memoryUsedBytes(s, limit)
 	observed := percentOf(used, base)
 	return observed, *limit.MaxMemoryUsedPercent, observed > *limit.MaxMemoryUsedPercent
 }
@@ -388,12 +412,14 @@ func FilterByResourceLimitObservedBy(nodes []RichNode, limit *config.NodeResourc
 		if limit.ResolvedAdmissionMode() == config.AdmissionModeShadow {
 			observeShadowAdmission(n, limit, observers.Shadow)
 		}
-		if observers.MeterFallback != nil && memoryMeterFellBack(n.Snapshot, limit) {
-			observers.MeterFallback(n.ID)
+		if observers.MeterFallback != nil {
+			if _, meter, reason := memoryUsedBytes(n.Snapshot, limit); reason != "" {
+				observers.MeterFallback(n.ID, meter, reason)
+			}
 		}
 		violation, violated := limitViolated(n, limit)
 		if violated {
-			_, violation.Meter = memoryUsedBytes(n.Snapshot, limit)
+			_, violation.Meter, _ = memoryUsedBytes(n.Snapshot, limit)
 			if observers.Reject != nil {
 				observers.Reject(n.ID, violation)
 			}
