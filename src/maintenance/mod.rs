@@ -15,7 +15,7 @@ mod paused_artifacts;
 
 pub use deferred_compaction::{
     DeferredCompactionReport, DeferredCompactionWorker, DEFERRED_COMPACTION_INTERVAL,
-    DEFERRED_COMPACTION_LOG,
+    DEFERRED_COMPACTION_LOG, DEFERRED_RECLAIM_LOG,
 };
 
 pub use gateway_sandboxes::GatewaySandboxList;

@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentenv::cfg::ConfigManager;
+use agentenv::maintenance::DeferredCompactionWorker;
+use agentenv::orchestrator::PausedArtifactCandidate;
 use agentenv::sandbox::{
     BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, ProcessOutput,
     SandboxBackend, SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
 };
+use agentenv::types::SandboxId;
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::ImageConfig;
@@ -1610,6 +1613,252 @@ async fn consecutive_deferred_pauses_leave_the_chain_to_the_worker() -> Result<(
     );
     sandbox.resume().await?;
     sandbox.stop().await?;
+    Ok(())
+}
+
+/// Allocated bytes of a set of paths, deduplicated by device and inode, the way
+/// `du` charges a node that shares an inode between two generations.
+fn allocated_bytes_deduped(paths: impl IntoIterator<Item = PathBuf>) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for path in paths {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if seen.insert((metadata.dev(), metadata.ino())) {
+            total = total.saturating_add(metadata.blocks().saturating_mul(512));
+        }
+    }
+    total
+}
+
+/// Allocated bytes of every layer a set of image configs names.
+fn reachable_bytes(config_paths: &[PathBuf]) -> Result<u64> {
+    let mut layers = Vec::new();
+    for config_path in config_paths {
+        layers.extend(lower_file_paths_from_image_config(config_path)?);
+    }
+    Ok(allocated_bytes_deduped(layers))
+}
+
+/// Allocated bytes of the two delta layers a pause writes into its generation.
+fn pause_delta_bytes(generation: &Path) -> u64 {
+    allocated_bytes_deduped([
+        generation.join("mem_overlaybd").join("overlaybd.commit"),
+        generation.join("rootfs").join("snapshot.commit"),
+    ])
+}
+
+/// Write one pause's payload as a fresh region on the guest rootfs, so every
+/// pause leaves a delta compaction cannot reclaim.
+async fn write_pause_payload(
+    sandbox: &mut FirecrackerSandbox,
+    payload_dir: &str,
+    size_mib: u64,
+    index: usize,
+) -> Result<()> {
+    let path = format!("{payload_dir}/gen-{index}");
+    let output = sandbox
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "mkdir -p {payload_dir} && dd if=/dev/urandom of={path} bs=1M count={size_mib}"
+                ),
+            ],
+        )
+        .await
+        .with_context(|| format!("write the pause {index} payload"))?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "pause {index} payload write failed ({}): {}",
+        output.exit_code,
+        output.stderr
+    );
+    Ok(())
+}
+
+/// The 21/11 acceptance on a real guest: two consecutive pauses of a 32g
+/// sandbox, the second one crossing the bound, and the maintenance pass
+/// afterwards. The paused generation must reach the base of the chain plus the
+/// bytes the pauses really wrote — never the compacted copy *and* the delta it
+/// replaced.
+///
+/// The numbers are printed instead of only asserted: the release front repeats
+/// this scenario on the node, where the acceptance is the node's peak SSD below
+/// 85% over 24 hours with the same number of paused sandboxes.
+#[tokio::test]
+async fn two_pauses_of_a_32g_sandbox_hold_the_base_plus_the_dirty_bytes() -> Result<()> {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!(
+            "skipping two_pauses_of_a_32g_sandbox_hold_the_base_plus_the_dirty_bytes: /dev/kvm \
+             is not available on this host"
+        );
+        return Ok(());
+    }
+    common::setup().await;
+
+    const PAYLOAD_MIB: u64 = 256;
+    const PAYLOAD_DIR: &str = "/root/aenv-two-pause-payloads";
+
+    let artifact_root = tempfile::tempdir()?;
+    let mut sandbox = FirecrackerSandbox::new(common::default_sandbox_config()?)?
+        // The first pause carries no bound: it adopts its own delta, which is
+        // the number the second pause's bound is derived from.
+        .with_chain_bytes_ceiling(0)
+        .with_rootfs_chain_disk_multiple(0)
+        .with_persisted_sandbox_store_root(artifact_root.path().to_path_buf());
+    sandbox.start().await?;
+    write_disk_marker(&mut sandbox).await?;
+
+    let first = artifact_root.path().join("gen-1");
+    write_pause_payload(&mut sandbox, PAYLOAD_DIR, PAYLOAD_MIB, 0).await?;
+    let started = std::time::Instant::now();
+    let (first_snapshot, _) = sandbox
+        .pause_to_dir_deferring(&first)
+        .await
+        .context("first pause")?;
+    let first_duration = started.elapsed();
+    let first_memory_delta =
+        allocated_bytes_deduped([first.join("mem_overlaybd").join("overlaybd.commit")]);
+    let first_rootfs_delta =
+        allocated_bytes_deduped([first.join("rootfs").join("snapshot.commit")]);
+    let first_delta = first_memory_delta.saturating_add(first_rootfs_delta);
+
+    // The second pause must cross the bound on BOTH chains, and the absolute
+    // ceiling judges each chain on its own: after the second pause a chain holds
+    // the generation it inherited plus the delta it wrote, roughly twice its own
+    // first delta. A ceiling above the sum of the two would therefore leave both
+    // chains inside their bound, the pause would adopt instead of deferring, and
+    // no work order would reach the worker — which is exactly a run where the
+    // memory chain crosses and the rootfs one does not. Bounding the ceiling by
+    // the smaller delta keeps it below either chain's second-pause suffix, so
+    // both are deferred and the worker is the only one that compacts and frees
+    // them.
+    let second_ceiling = first_memory_delta.min(first_rootfs_delta);
+    anyhow::ensure!(
+        second_ceiling > 0,
+        "the first pause must write a memory and a rootfs delta to bound both chains: \
+         memory {first_memory_delta}, rootfs {first_rootfs_delta}"
+    );
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(&first_snapshot)?
+        .with_chain_bytes_ceiling(second_ceiling)
+        .with_rootfs_chain_disk_multiple(0)
+        .with_persisted_sandbox_store_root(artifact_root.path().to_path_buf());
+    resumed.start().await?;
+    let second = artifact_root.path().join("gen-2");
+    write_pause_payload(&mut resumed, PAYLOAD_DIR, PAYLOAD_MIB, 1).await?;
+    let started = std::time::Instant::now();
+    let (_second_snapshot, _) = resumed
+        .pause_to_dir_deferring(&second)
+        .await
+        .context("second pause")?;
+    let second_duration = started.elapsed();
+    let second_delta = pause_delta_bytes(&second);
+
+    // The second pause crossed the bound on both chains, so it left the rewrite
+    // behind: the delta it wrote is still there, no compacted layer exists yet,
+    // and a durable work order per chain names the layers the worker must fold.
+    // Proving the work order here keeps a fixture that stopped crossing the
+    // bound from failing later on a delta that was never supposed to move.
+    anyhow::ensure!(
+        second.join("mem_overlaybd/overlaybd.commit").is_file()
+            && second.join("rootfs/snapshot.commit").is_file(),
+        "the second pause must write both the memory and the rootfs delta"
+    );
+    deferred_chain_evidence(&second, "mem_image.json", "mem_compacted.commit")
+        .context("the memory chain must leave a deferred compaction work order")?;
+    deferred_chain_evidence(&second.join("rootfs"), "image.json", "managed-base.commit")
+        .context("the rootfs chain must leave a deferred compaction work order")?;
+    let deltas_before = second_delta;
+    let leftover_before = deltas_before;
+
+    // What the node's periodic task does: pass one compacts and swaps, pass two
+    // unlinks the copies the swap replaced. Repeated because each pass starts at
+    // most one rewrite per chain (the node's concurrency default is one).
+    let candidate = PausedArtifactCandidate {
+        sandbox_id: SandboxId::new(),
+        artifact_root: second.clone(),
+        config_paths: vec![
+            second.join("mem_image.json"),
+            second.join("rootfs").join("image.json"),
+        ],
+    };
+    let worker = DeferredCompactionWorker::for_node(1, u64::MAX);
+    let mut passes = 0;
+    for _ in 0..4 {
+        let report = worker.run_once(std::slice::from_ref(&candidate)).await;
+        passes += 1;
+        // A refusal is a different failure from a chain that never deferred: the
+        // worker kept the work order because the node could not prove it holds
+        // the transient bytes, and the deltas stay on purpose. Naming it keeps
+        // the next red run from reading as a reclaim defect.
+        anyhow::ensure!(
+            report.headroom_refused == 0,
+            "the worker refused a deferred rewrite for lack of transient disk: {report:?}"
+        );
+        if report == Default::default() {
+            break;
+        }
+    }
+
+    let second_configs = [
+        second.join("mem_image.json"),
+        second.join("rootfs").join("image.json"),
+    ];
+    // The base the chain shares with every sandbox of the image: whatever the
+    // first generation referenced from outside the paused artifacts.
+    let base_bytes = {
+        let first_configs = [
+            first.join("mem_image.json"),
+            first.join("rootfs").join("image.json"),
+        ];
+        let canonical_artifacts = fs::canonicalize(artifact_root.path())
+            .unwrap_or_else(|_| artifact_root.path().to_path_buf());
+        let mut shared = Vec::new();
+        for config_path in &first_configs {
+            for layer in lower_file_paths_from_image_config(config_path)? {
+                let canonical = fs::canonicalize(&layer).unwrap_or(layer);
+                if !canonical.starts_with(&canonical_artifacts) {
+                    shared.push(canonical);
+                }
+            }
+        }
+        allocated_bytes_deduped(shared)
+    };
+
+    let reachable = reachable_bytes(&second_configs)?;
+    let dirty = first_delta.saturating_add(deltas_before);
+    let model = base_bytes.saturating_add(dirty);
+    eprintln!(
+        "two-pause accounting (information): first_pause={first_duration:?} \
+         second_pause={second_duration:?} base={base_bytes} dirty={dirty} \
+         reachable={reachable} leftover_before={leftover_before} passes={passes}"
+    );
+
+    assert!(
+        !second.join("rootfs/snapshot.commit").exists(),
+        "the rootfs delta the pause wrote must be freed once the compacted copy replaced it"
+    );
+    assert!(
+        !second.join("mem_overlaybd/overlaybd.commit").exists(),
+        "the memory delta the pause wrote must be freed once the compacted copy replaced it"
+    );
+    anyhow::ensure!(
+        model > 0,
+        "the fixture must measure a base plus dirty bytes to compare against"
+    );
+    assert!(
+        reachable <= model + model / 10,
+        "the paused generation must hold the base plus the real dirty bytes ({model}) within \
+         10%, not the compacted copy and the delta it replaced: {reachable}"
+    );
+
+    // The second pause left the sandbox paused; resume before stopping it, like
+    // every other pause fixture in this suite.
+    resumed.resume().await?;
+    resumed.stop().await?;
     Ok(())
 }
 

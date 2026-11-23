@@ -16,7 +16,10 @@
 //! 2. A descriptor already `Swapped` only unlinks the inputs the *current*
 //!    config no longer references, and then removes itself. It never unlinks in
 //!    the same pass that swapped, which is what protects a resume that read the
-//!    old config: its layers stay reachable for the rest of that pass.
+//!    old config: its layers stay reachable for the rest of that pass. The
+//!    pause's inline fallback writes its descriptor already `Swapped` — it
+//!    compacted inside the call and left only the unlink — so the copies a
+//!    compaction replaced do not stay on the node beside the compacted one.
 //!
 //! # What this pass never does
 //!
@@ -34,6 +37,7 @@
 //! from is untouched, so the failure costs a retry, never a sandbox.
 
 use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,6 +64,15 @@ pub const DEFERRED_COMPACTION_INTERVAL: Duration = Duration::from_secs(30);
 /// Named log line of one successful deferred compaction.
 pub const DEFERRED_COMPACTION_LOG: &str = "paused sandbox chain compacted outside the pause";
 
+/// Named log line of the pass that frees the copies a compaction replaced.
+///
+/// A compacted chain that keeps its inputs costs the node the compacted copy
+/// *and* the delta it folded — the 21/11 measurement found 146 GiB in one
+/// generation where about 79 were needed. This line is what an operator reads
+/// to see the bytes actually come back.
+pub const DEFERRED_RECLAIM_LOG: &str =
+    "paused sandbox chain removed the copies its compaction replaced";
+
 /// What one pass did, aggregated across the node.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DeferredCompactionReport {
@@ -74,6 +87,10 @@ pub struct DeferredCompactionReport {
     pub queued: usize,
     /// Descriptors whose swapped-in inputs were unlinked.
     pub unlinked: usize,
+    /// Bytes the node actually got back in this pass: only an inode whose last
+    /// link was removed counts, so an adopted hardlink of a layer an older
+    /// generation still owns adds nothing (the sweep frees it later).
+    pub reclaimed_bytes: u64,
 }
 
 /// The filesystem probe the worker uses before a rewrite. Production reads the
@@ -107,6 +124,20 @@ impl DeferredCompactionWorker {
             #[cfg(test)]
             swap_hook: None,
         }
+    }
+
+    /// The worker a node runs, bound to the process-wide gate the pauses consult
+    /// before they leave work behind.
+    ///
+    /// Used by the server's periodic task and by the integration suite, which
+    /// has to execute the same worker against a real guest to measure the bytes
+    /// a pause leaves on disk.
+    pub fn for_node(max_concurrent: usize, pending_budget: u64) -> Self {
+        Self::new(
+            DeferredCompactionGate::global(),
+            max_concurrent,
+            pending_budget,
+        )
     }
 
     /// Replace the free-bytes probe. Test-only: production always reads the
@@ -157,7 +188,7 @@ impl DeferredCompactionWorker {
                 continue;
             }
             match unlink_swapped_inputs(path, descriptor).await {
-                Ok(()) => {
+                Ok(reclaimed_bytes) => {
                     if let Err(error) = std::fs::remove_file(path) {
                         warn!(
                             path = %path.display(),
@@ -168,6 +199,16 @@ impl DeferredCompactionWorker {
                     }
                     self.gate.complete(path);
                     report.unlinked += 1;
+                    report.reclaimed_bytes += reclaimed_bytes;
+                    record_deferred_compaction(descriptor.kind.as_str(), "reclaimed");
+                    info!(
+                        kind = descriptor.kind.as_str(),
+                        generation = descriptor.generation.as_str(),
+                        reclaimed_bytes,
+                        inputs = descriptor.compactable.len(),
+                        "{}",
+                        DEFERRED_RECLAIM_LOG
+                    );
                 }
                 Err(error) => warn!(
                     path = %path.display(),
@@ -476,7 +517,7 @@ fn swap_config_atomically(
 async fn unlink_swapped_inputs(
     descriptor_path: &Path,
     descriptor: &DeferredCompactionDescriptor,
-) -> Result<()> {
+) -> Result<u64> {
     let directory = descriptor_directory(descriptor_path)?;
     let config_path = directory.join(&descriptor.config_file);
     let bytes = std::fs::read(&config_path)
@@ -494,6 +535,7 @@ async fn unlink_swapped_inputs(
         })
         .unwrap_or_default();
 
+    let mut reclaimed_bytes = 0u64;
     for layer in &descriptor.compactable {
         if referenced.contains(layer.as_str()) {
             continue;
@@ -508,12 +550,24 @@ async fn unlink_swapped_inputs(
             );
             continue;
         }
+        // Only the last link frees bytes; an adopted hardlink of a layer an
+        // older generation still owns costs nothing to remove now and shows up
+        // in the reclaimed total only when the stale-generation sweep takes the
+        // rest. `blocks()` is the allocation actually charged to the node.
+        let freed = std::fs::symlink_metadata(layer_path)
+            .ok()
+            .filter(|metadata| metadata.nlink() == 1)
+            .map(|metadata| metadata.blocks().saturating_mul(512))
+            .unwrap_or(0);
         match tokio::fs::remove_file(layer_path).await {
-            Ok(()) => debug!(
-                kind = descriptor.kind.as_str(),
-                layer = %layer_path.display(),
-                "unlinked a swapped deferred compaction input"
-            ),
+            Ok(()) => {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(freed);
+                debug!(
+                    kind = descriptor.kind.as_str(),
+                    layer = %layer_path.display(),
+                    "unlinked a swapped deferred compaction input"
+                );
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -525,7 +579,7 @@ async fn unlink_swapped_inputs(
             }
         }
     }
-    Ok(())
+    Ok(reclaimed_bytes)
 }
 
 /// Whether the compacted generation still breaches one of the frozen bounds.
@@ -1076,6 +1130,177 @@ mod tests {
         assert_eq!(
             DEFERRED_COMPACTION_LOG,
             "paused sandbox chain compacted outside the pause"
+        );
+        assert_eq!(
+            DEFERRED_RECLAIM_LOG,
+            "paused sandbox chain removed the copies its compaction replaced"
+        );
+    }
+
+    /// Allocated bytes of a set of layers, deduplicated by inode exactly like
+    /// the node's disk accounting.
+    fn allocated_bytes(layers: &[PathBuf]) -> u64 {
+        compactable_allocated_bytes(
+            &layers
+                .iter()
+                .map(|path| overlaybd::config::LayerConfig {
+                    file: path.display().to_string(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The layers an image config names, as paths.
+    fn lowers_of(config_path: &Path) -> Vec<PathBuf> {
+        layers_in(config_path)
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+    }
+
+    /// The card's disk-bytes acceptance, on the worker's side: two consecutive
+    /// pauses of the same sandbox, the second one crossing the bound, and the
+    /// maintenance pass afterwards. The generation the sandbox resumes from
+    /// holds the shared base plus the bytes the pauses really wrote — never the
+    /// compacted copy *and* the delta it replaced, which is what the 21/11
+    /// measurement found (146 GiB in one generation where about 79 were
+    /// needed).
+    ///
+    /// The fixture has the shape the pause leaves: each pause's delta at its own
+    /// path inside its generation, the inherited layer adopted as a hard link,
+    /// and a work order naming exactly the layers that generation holds.
+    #[tokio::test]
+    async fn two_pauses_leave_the_base_plus_the_real_dirty_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging = temp.path().join("staging");
+        let image_cache = temp.path().join("image-cache");
+        let sandbox_root = temp.path().join("artifacts").join("sandbox");
+        let first = sandbox_root.join("gen-1").join("rootfs");
+        let second = sandbox_root.join("gen-2").join("rootfs");
+        for dir in [&staging, &image_cache, &first, &second] {
+            std::fs::create_dir_all(dir).expect("create fixture dir");
+        }
+
+        const DISK_BYTES: u64 = 1024 * 1024;
+        const PART_BYTES: u64 = 256 * 1024;
+        // A base every sandbox of the image shares: it lives in the image cache,
+        // outside the paused artifacts, so the node pays it once.
+        let base = image_cache.join("sha256-base.overlaybd.commit");
+        std::fs::write(&base, vec![0x11u8; 512 * 1024]).expect("write base layer");
+        // Two pauses writing disjoint regions, so a perfect compaction holds the
+        // base plus both deltas and nothing else.
+        let dirty = |first_page: u64, byte: u8| -> Vec<(u64, u8)> {
+            (0..PART_BYTES / 4096)
+                .map(|index| ((first_page + index) * 4096, byte))
+                .collect()
+        };
+
+        // Pause one adopted the delta it wrote, exactly like the no-breach path.
+        let sealed = seal_raw_test_layer(&staging, "first", DISK_BYTES, &dirty(0, 0xAA)).await;
+        let first_delta = first.join("snapshot.commit");
+        std::fs::rename(&sealed, &first_delta).expect("move the first delta");
+        std::fs::write(
+            first.join("image.json"),
+            serde_json::to_vec_pretty(&image_config(&[base.clone(), first_delta.clone()]))
+                .expect("serialize first config"),
+        )
+        .expect("write first config");
+
+        // Pause two: the delta it wrote stays at its own path, the inherited one
+        // is adopted as a hard link beside it, and the order names both.
+        let sealed = seal_raw_test_layer(
+            &staging,
+            "second",
+            DISK_BYTES,
+            &dirty(PART_BYTES / 4096, 0xBB),
+        )
+        .await;
+        let second_delta = second.join("snapshot.commit");
+        std::fs::rename(&sealed, &second_delta).expect("move the second delta");
+        let inherited = second
+            .join("inherited-layers")
+            .join("0000")
+            .join("snapshot.commit");
+        std::fs::create_dir_all(inherited.parent().expect("inherited parent"))
+            .expect("create inherited layer dir");
+        std::fs::hard_link(&first_delta, &inherited).expect("adopt the inherited layer by link");
+        std::fs::write(
+            second.join("image.json"),
+            serde_json::to_vec_pretty(&image_config(&[
+                base.clone(),
+                inherited.clone(),
+                second_delta.clone(),
+            ]))
+            .expect("serialize second config"),
+        )
+        .expect("write second config");
+        let descriptor = DeferredCompactionDescriptor::new(
+            "rootfs",
+            "image.json",
+            "managed-base.commit",
+            vec![
+                inherited.display().to_string(),
+                second_delta.display().to_string(),
+            ],
+            DISK_BYTES,
+            (0, 0),
+            second
+                .parent()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+        descriptor
+            .write(&DeferredCompactionDescriptor::path_in(&second))
+            .expect("write descriptor");
+
+        // The model, measured while the deltas are still on disk.
+        let base_bytes = allocated_bytes(std::slice::from_ref(&base));
+        let dirty_bytes = allocated_bytes(&[first_delta.clone(), second_delta.clone()]);
+        let model = base_bytes + dirty_bytes;
+
+        let gate = DeferredCompactionGate::new_for_test();
+        let worker = DeferredCompactionWorker::new(gate.clone(), 1, u64::MAX)
+            .with_free_bytes_probe(|_| Some(u64::MAX));
+        let candidate = candidate(&second, "image.json");
+        // Pass one compacts and swaps; pass two unlinks the copies it replaced.
+        worker.run_once(std::slice::from_ref(&candidate)).await;
+        worker.run_once(std::slice::from_ref(&candidate)).await;
+
+        assert!(
+            second.join("managed-base.commit").exists(),
+            "the worker must compact the chain"
+        );
+        assert!(
+            !second_delta.exists(),
+            "the delta the pause wrote must be freed once its copy replaced it"
+        );
+        assert!(
+            !inherited.exists(),
+            "the adopted hard link the merge folded must be unlinked"
+        );
+        assert!(
+            !DeferredCompactionDescriptor::path_in(&second).exists(),
+            "the finished order must be removed"
+        );
+        assert!(
+            first_delta.exists(),
+            "a layer outside the generation belongs to the stale-generation sweep"
+        );
+
+        let reachable = allocated_bytes(&lowers_of(&second.join("image.json")));
+        assert!(
+            reachable <= model + model / 20,
+            "the sandbox must hold the base plus the real dirty bytes ({model}) within 5%, \
+             not the compacted copy and the delta it replaced: {reachable}"
+        );
+
+        let compacted = allocated_bytes(&[second.join("managed-base.commit")]);
+        assert!(
+            compacted <= dirty_bytes + dirty_bytes / 20,
+            "the generation must hold the delta over the base, not a second copy of the image: \
+             {compacted} vs {dirty_bytes}"
         );
     }
 }
