@@ -19,7 +19,7 @@ pub struct Args {
 
 #[derive(Subcommand)]
 enum Sub {
-    /// Create a persistent snapshot from a running sandbox
+    /// Create a persistent snapshot from a running or paused sandbox
     Create {
         #[arg(add = crate::commands::completion::add_running_sandbox_candidates())]
         sandbox_id: String,

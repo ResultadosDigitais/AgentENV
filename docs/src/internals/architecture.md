@@ -128,7 +128,7 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
 | API layer | `src/api/` | Axum HTTP server, OpenAPI endpoints, reverse proxy to sandbox services, node/admin APIs |
-| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts |
+| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Publishing, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts |
 | Observability | `src/observability/` | Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting |
 | Sandbox | `src/sandbox/` | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
 | Snapshot + Template Builder | `src/snapshot/`, `src/template/` | `src/snapshot/` owns committed snapshot storage/runtime resolution; `src/template/` provides the user-facing builder that publishes snapshots |
