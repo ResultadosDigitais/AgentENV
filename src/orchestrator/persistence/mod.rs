@@ -16,9 +16,9 @@ pub use file_backed::FileBackedSandboxPersister;
 pub(crate) use file_backed::{QUARANTINE_DIR, QUARANTINE_TTL};
 #[cfg(test)]
 pub(crate) use mock::{RecordingCall, RecordingPersister};
-pub(crate) use publish_lease::{acquire_publish_lease, clear_publish_lease, has_publish_lease};
 #[cfg(test)]
 pub(crate) use publish_lease::PUBLISH_LEASE_FILE;
+pub(crate) use publish_lease::{acquire_publish_lease, clear_publish_lease, has_publish_lease};
 
 pub type PersistenceResult<T> = std::result::Result<T, SandboxPersistenceError>;
 
