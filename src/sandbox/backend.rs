@@ -21,8 +21,8 @@ use super::{
 use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::{
-    RunnableSnapshot, SandboxSnapshotManifest, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotRecord, StartupRecording,
+    PublishReceipt, RunnableSnapshot, SandboxSnapshotManifest, SnapshotManager,
+    SnapshotPublishMetadata, SnapshotRecord, StartupRecording,
 };
 use crate::types::{ResourceLimits, RuntimeArtifactSet, SandboxId, SandboxResources};
 
@@ -42,6 +42,18 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     /// Effective envd control-plane port persisted with the paused runtime, when available.
     fn control_plane_port(&self) -> Option<u16> {
         None
+    }
+
+    /// Derive what a snapshot publication would store for this paused
+    /// generation, without resuming the VM and without reading or
+    /// reconverting the memory image.
+    ///
+    /// `Ok(None)` means this backend cannot publish from a paused state; the
+    /// orchestrator then refuses the publication with a typed error instead of
+    /// guessing. Only backends whose pause already leaves durable artifacts in
+    /// the publishable layout return `Some`.
+    fn paused_snapshot_manifest(&self) -> Result<Option<SandboxSnapshotManifest>> {
+        Ok(None)
     }
 }
 
@@ -218,6 +230,19 @@ pub async fn publish_captured(
     metadata: SnapshotPublishMetadata,
     captured_snapshot: CapturedSandboxSnapshot,
 ) -> RepositoryResult<SnapshotRecord> {
+    publish_captured_with_receipt(snapshots, metadata, captured_snapshot)
+        .await
+        .map(|(record, _)| record)
+}
+
+/// Like [`publish_captured`], returning what the publication transferred and
+/// reused (the pause-publication receipt).
+#[tracing::instrument(skip(snapshots, metadata), fields(snapshot_id = %metadata.id))]
+pub async fn publish_captured_with_receipt(
+    snapshots: &SnapshotManager,
+    metadata: SnapshotPublishMetadata,
+    captured_snapshot: CapturedSandboxSnapshot,
+) -> RepositoryResult<(SnapshotRecord, PublishReceipt)> {
     let manifest = captured_snapshot.manifest().clone();
 
     // Spawn the startup-manifest recording up front (a no-op task when
@@ -237,7 +262,9 @@ pub async fn publish_captured(
             )
         });
 
-    snapshots.publish(metadata, manifest, recording).await
+    snapshots
+        .publish_with_receipt(metadata, manifest, recording)
+        .await
 }
 
 /// Lifecycle interface for a single sandbox instance.

@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
@@ -14,7 +15,8 @@ use super::startup_pack::{
 };
 use super::store::{self, StoredSnapshot};
 use super::{
-    CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, StartupRecording,
+    CommittedSnapshot, PublishReceipt, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
+    StartupRecording,
 };
 use crate::repository::{
     BlobBody, BlobKey, DocumentKey, Repository, RepositoryError, RepositoryResult, SnapshotFile,
@@ -27,6 +29,8 @@ use crate::snapshot::SandboxSnapshotManifest;
 pub struct SnapshotPublication {
     pub record: SnapshotRecord,
     pub(crate) local_layers: Vec<PreparedLayerUpload>,
+    /// Bytes, duration and layer reuse for this publication.
+    pub receipt: PublishReceipt,
 }
 
 pub(crate) async fn publish<R>(
@@ -37,6 +41,7 @@ pub(crate) async fn publish<R>(
 where
     R: Repository + ?Sized,
 {
+    let started = Instant::now();
     validate_attached_drives(&manifest)?;
     // Fail before uploading anything; the commit checks both again.
     ensure_not_committed(repository, &metadata.id).await?;
@@ -51,7 +56,12 @@ where
         attached_drives,
         disk_publications,
         local_layers,
+        bytes_uploaded,
+        layers_uploaded,
+        layers_reused,
+        reused_digests,
     } = stored;
+    let final_layer_digest = memory_layers.last().map(|layer| layer.digest.clone());
     let committed = CommittedSnapshot {
         context: metadata.context.clone(),
         startup: metadata.startup.clone(),
@@ -69,10 +79,19 @@ where
     };
     match catalog::commit(repository, &metadata, committed).await {
         Ok(record) => {
-            debug!(snapshot_id = %record.id, "published snapshot");
+            let receipt = PublishReceipt {
+                bytes_uploaded,
+                duration_ms: started.elapsed().as_millis() as u64,
+                layers_uploaded,
+                layers_reused,
+                final_layer_digest,
+                reused_digests,
+            };
+            debug!(snapshot_id = %record.id, ?receipt, "published snapshot");
             Ok(SnapshotPublication {
                 record,
                 local_layers,
+                receipt,
             })
         }
         Err(error) => {

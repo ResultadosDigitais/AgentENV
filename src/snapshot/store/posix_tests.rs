@@ -402,3 +402,61 @@ async fn store_snapshot_preserves_zfile_memory_lower_bytes() {
         1
     );
 }
+
+/// A first publication uploads its layers and reports zero reuse.
+#[tokio::test]
+async fn store_snapshot_receipt_counts_a_first_publication() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let repository = test_repository(tempdir.path());
+    let local_dir = tempdir.path().join("local");
+    let (_, _, manifest) =
+        write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
+
+    let built = store_snapshot(&repository, &metadata(&SnapshotId::generate()), &manifest)
+        .await
+        .expect("first publication");
+
+    assert!(
+        built.layers_uploaded >= 1,
+        "a first publication uploads at least one managed layer"
+    );
+    assert_eq!(built.layers_reused, 0, "nothing exists to reuse yet");
+    assert!(
+        built.bytes_uploaded > 0,
+        "the receipt counts the bytes written"
+    );
+    assert!(built.reused_digests.is_empty());
+}
+
+/// Republishing the same generation under a new snapshot id uploads no managed
+/// layer twice: every layer is found by digest and reused, so the second
+/// publication's bytes cover only the snapshot-scoped files.
+#[tokio::test]
+async fn store_snapshot_republish_reuses_every_managed_layer() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let repository = test_repository(tempdir.path());
+    let local_dir = tempdir.path().join("local");
+    let (_, _, manifest) =
+        write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
+
+    let first = store_snapshot(&repository, &metadata(&SnapshotId::generate()), &manifest)
+        .await
+        .expect("first publication");
+    let second = store_snapshot(&repository, &metadata(&SnapshotId::generate()), &manifest)
+        .await
+        .expect("second publication");
+
+    assert_eq!(
+        second.layers_uploaded, 0,
+        "no managed layer is uploaded a second time"
+    );
+    assert_eq!(
+        second.layers_reused, first.layers_uploaded,
+        "every layer the first publication uploaded is reused"
+    );
+    assert_eq!(second.reused_digests.len() as u32, second.layers_reused);
+    assert!(
+        second.bytes_uploaded > 0,
+        "the snapshot-scoped files are still written"
+    );
+}

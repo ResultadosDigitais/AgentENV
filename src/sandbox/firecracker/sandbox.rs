@@ -292,6 +292,10 @@ impl PausedSandboxState for FirecrackerPausedState {
             &self.snapshot_config.common,
         ))
     }
+
+    fn paused_snapshot_manifest(&self) -> Result<Option<SandboxSnapshotManifest>> {
+        manifest_from_snapshot_config(&self.snapshot_config).map(Some)
+    }
 }
 
 impl FirecrackerCaptureArtifacts {
@@ -325,6 +329,47 @@ impl FirecrackerCaptureArtifacts {
     pub(crate) fn snapshot_root_guard(&self) -> Arc<PersistentSnapshotRootGuard> {
         Arc::clone(&self.snapshot_root)
     }
+}
+
+/// Describe the publishable layout of a snapshot config.
+///
+/// This is the single derivation both capture paths use: the running capture
+/// (`snapshot_to_dir`) publishes what it just wrote, and the paused publication
+/// (`paused_snapshot_manifest`) publishes the generation the pause already
+/// wrote. They must agree byte for byte, so they share this function instead of
+/// each building a manifest by hand.
+fn manifest_from_snapshot_config(
+    config: &FirecrackerSnapshotConfig,
+) -> Result<SandboxSnapshotManifest> {
+    let rootfs = config
+        .common
+        .rootfs_image_config
+        .as_ref()
+        .context("snapshot config has no rootfs image config")?;
+    let rootfs_virtual_size = config
+        .common
+        .rootfs_virtual_size
+        .context("snapshot config has no rootfs virtual size")?;
+    let manifest_extra_drives = config
+        .common
+        .extra_drives
+        .iter()
+        .filter(|drive| !drive.is_volume())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut manifest = SandboxSnapshotManifest::new(
+        crate::sandbox::FIRECRACKER_BACKEND,
+        config.vm_state_path.clone(),
+        config.mem_overlaybd_config.image_config_path.clone(),
+        config.mem_virtual_size,
+        rootfs.image_config_path.clone(),
+        rootfs_virtual_size,
+        &manifest_extra_drives,
+    )
+    .context("build firecracker snapshot manifest")?;
+    manifest.volume_drive_slots = config.common.volume_drive_slots;
+    manifest.physical_extra_drive_count = manifest_extra_drives.len();
+    Ok(manifest)
 }
 
 fn snapshot_config_for_fork(
@@ -1347,11 +1392,6 @@ impl FirecrackerSandbox {
             .snapshot_extra_drives(snapshot_dir, defer_compaction)
             .await
             .context("snapshot extra drives to persistent dir")?;
-        let manifest_extra_drives = snapshot_extra_drives
-            .iter()
-            .filter(|drive| !drive.is_volume())
-            .cloned()
-            .collect::<Vec<_>>();
         let mut snapshot_common = self.launch.common().clone();
         snapshot_common.network_policy = self.current_network_policy.clone();
         snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
@@ -1379,19 +1419,6 @@ impl FirecrackerSandbox {
         });
         snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
 
-        let mut manifest = SandboxSnapshotManifest::new(
-            crate::sandbox::FIRECRACKER_BACKEND,
-            vm_state_path.clone(),
-            mem_overlaybd_config.image_config_path.clone(),
-            mem_virtual_size,
-            base_rootfs_path,
-            rootfs_virtual_size,
-            &manifest_extra_drives,
-        )
-        .context("build firecracker snapshot manifest")?;
-        manifest.volume_drive_slots = snapshot_common.volume_drive_slots;
-        manifest.physical_extra_drive_count = manifest_extra_drives.len();
-
         let snapshot = FirecrackerSnapshotConfig {
             common: snapshot_common,
             vm_state_path,
@@ -1401,6 +1428,8 @@ impl FirecrackerSandbox {
             pack_recording: false,
             memory_startup_pack: None,
         };
+        let manifest = manifest_from_snapshot_config(&snapshot)
+            .context("build firecracker snapshot manifest")?;
 
         debug!(
             vm_state_path = %snapshot.vm_state_path.display(),

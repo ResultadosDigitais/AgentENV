@@ -3643,7 +3643,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ManagedLayer
     }
 }
 
-/// `report` lists and counts without deleting anything; `enforce` deletes the uncited layers older than the grace period. Enforce is refused until a report has run in this server process.
+/// `report` lists and counts without deleting anything and returns the `reportToken` an enforce consumes; `enforce` deletes the uncited layers older than the grace period, after accepting the receipt that token names. Enforce is refused without a valid, unexpired, unused receipt from a clean report pass.
 /// Enumeration of values.
 /// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
 /// which helps with FFI.
@@ -7032,6 +7032,220 @@ impl std::str::FromStr for OrderDirection {
     }
 }
 
+/// What one snapshot publication transferred and how much it reused. Present on the response of a snapshot creation, never on list or get.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct PublishReceipt {
+    /// Total bytes this publication wrote into the repository: uploaded managed layers plus the snapshot-scoped files (VM state and the manifest). Reused layers contribute zero.
+    #[serde(rename = "bytesUploaded")]
+    pub bytes_uploaded: i64,
+
+    /// Wall-clock time spent storing and committing the publication, in milliseconds, including layer preparation (compression).
+    #[serde(rename = "durationMs")]
+    pub duration_ms: i64,
+
+    /// Managed layers freshly uploaded.
+    #[serde(rename = "layersUploaded")]
+    pub layers_uploaded: i32,
+
+    /// Managed layers reused because the repository already held their digest; they are neither prepared nor uploaded again.
+    #[serde(rename = "layersReused")]
+    pub layers_reused: i32,
+
+    /// Digest of the newest memory layer, when the snapshot has memory layers. Omitted otherwise.
+    #[serde(rename = "finalLayerDigest")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_layer_digest: Option<String>,
+}
+
+impl PublishReceipt {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        bytes_uploaded: i64,
+        duration_ms: i64,
+        layers_uploaded: i32,
+        layers_reused: i32,
+    ) -> PublishReceipt {
+        PublishReceipt {
+            bytes_uploaded,
+            duration_ms,
+            layers_uploaded,
+            layers_reused,
+            final_layer_digest: None,
+        }
+    }
+}
+
+/// Converts the PublishReceipt value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for PublishReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("bytesUploaded".to_string()),
+            Some(self.bytes_uploaded.to_string()),
+            Some("durationMs".to_string()),
+            Some(self.duration_ms.to_string()),
+            Some("layersUploaded".to_string()),
+            Some(self.layers_uploaded.to_string()),
+            Some("layersReused".to_string()),
+            Some(self.layers_reused.to_string()),
+            self.final_layer_digest.as_ref().map(|final_layer_digest| {
+                [
+                    "finalLayerDigest".to_string(),
+                    final_layer_digest.to_string(),
+                ]
+                .join(",")
+            }),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a PublishReceipt value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for PublishReceipt {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub bytes_uploaded: Vec<i64>,
+            pub duration_ms: Vec<i64>,
+            pub layers_uploaded: Vec<i32>,
+            pub layers_reused: Vec<i32>,
+            pub final_layer_digest: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing PublishReceipt".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "bytesUploaded" => intermediate_rep.bytes_uploaded.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "durationMs" => intermediate_rep.duration_ms.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "layersUploaded" => intermediate_rep.layers_uploaded.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "layersReused" => intermediate_rep.layers_reused.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "finalLayerDigest" => intermediate_rep.final_layer_digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing PublishReceipt".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(PublishReceipt {
+            bytes_uploaded: intermediate_rep
+                .bytes_uploaded
+                .into_iter()
+                .next()
+                .ok_or_else(|| "bytesUploaded missing in PublishReceipt".to_string())?,
+            duration_ms: intermediate_rep
+                .duration_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "durationMs missing in PublishReceipt".to_string())?,
+            layers_uploaded: intermediate_rep
+                .layers_uploaded
+                .into_iter()
+                .next()
+                .ok_or_else(|| "layersUploaded missing in PublishReceipt".to_string())?,
+            layers_reused: intermediate_rep
+                .layers_reused
+                .into_iter()
+                .next()
+                .ok_or_else(|| "layersReused missing in PublishReceipt".to_string())?,
+            final_layer_digest: intermediate_rep.final_layer_digest.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<PublishReceipt> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<PublishReceipt>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<PublishReceipt>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for PublishReceipt - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<PublishReceipt> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <PublishReceipt as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into PublishReceipt - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct ResumedSandbox {
@@ -7746,6 +7960,12 @@ pub struct SandboxDetail {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+
+    /// Capabilities this runtime advertises for the sandbox. An older runtime omits the field, so the control plane keeps the snapshot-before-pause behavior. A value of `snapshot.publish-from-paused` means POST /sandboxes/{sandboxID}/snapshots accepts a PAUSED sandbox and publishes its last pause without resuming the VM.
+    #[serde(rename = "runtimeCapabilities")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_capabilities: Option<Vec<String>>,
 }
 
 impl SandboxDetail {
@@ -7783,6 +8003,7 @@ impl SandboxDetail {
             network: None,
             lifecycle: None,
             volume_mounts: None,
+            runtime_capabilities: None,
         }
     }
 }
@@ -7851,6 +8072,19 @@ impl std::fmt::Display for SandboxDetail {
             // Skipping lifecycle in query parameter serialization
 
             // Skipping volumeMounts in query parameter serialization
+            self.runtime_capabilities
+                .as_ref()
+                .map(|runtime_capabilities| {
+                    [
+                        "runtimeCapabilities".to_string(),
+                        runtime_capabilities
+                            .iter()
+                            .map(|x| x.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ]
+                    .join(",")
+                }),
         ];
 
         write!(
@@ -7892,6 +8126,7 @@ impl std::str::FromStr for SandboxDetail {
             pub network: Vec<models::SandboxNetworkConfig>,
             pub lifecycle: Vec<models::SandboxLifecycle>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub runtime_capabilities: Vec<Vec<String>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -8002,6 +8237,12 @@ impl std::str::FromStr for SandboxDetail {
                                 .to_string(),
                         );
                     }
+                    "runtimeCapabilities" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in SandboxDetail"
+                                .to_string(),
+                        );
+                    }
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxDetail".to_string(),
@@ -8080,6 +8321,7 @@ impl std::str::FromStr for SandboxDetail {
             network: intermediate_rep.network.into_iter().next(),
             lifecycle: intermediate_rep.lifecycle.into_iter().next(),
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            runtime_capabilities: intermediate_rep.runtime_capabilities.into_iter().next(),
         })
     }
 }
@@ -10863,6 +11105,11 @@ pub struct SnapshotInfo {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+
+    #[serde(rename = "publishReceipt")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_receipt: Option<models::PublishReceipt>,
 }
 
 impl SnapshotInfo {
@@ -10885,6 +11132,7 @@ impl SnapshotInfo {
             created_at,
             updated_at,
             image_ref: None,
+            publish_receipt: None,
         }
     }
 }
@@ -10917,6 +11165,7 @@ impl std::fmt::Display for SnapshotInfo {
             self.image_ref
                 .as_ref()
                 .map(|image_ref| ["imageRef".to_string(), image_ref.to_string()].join(",")),
+            // Skipping publishReceipt in query parameter serialization
         ];
 
         write!(
@@ -10946,6 +11195,7 @@ impl std::str::FromStr for SnapshotInfo {
             pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub updated_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub image_ref: Vec<String>,
+            pub publish_receipt: Vec<models::PublishReceipt>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -11003,6 +11253,11 @@ impl std::str::FromStr for SnapshotInfo {
                     "imageRef" => intermediate_rep.image_ref.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "publishReceipt" => intermediate_rep.publish_receipt.push(
+                        <models::PublishReceipt as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SnapshotInfo".to_string(),
@@ -11053,6 +11308,7 @@ impl std::str::FromStr for SnapshotInfo {
                 .next()
                 .ok_or_else(|| "updatedAt missing in SnapshotInfo".to_string())?,
             image_ref: intermediate_rep.image_ref.into_iter().next(),
+            publish_receipt: intermediate_rep.publish_receipt.into_iter().next(),
         })
     }
 }

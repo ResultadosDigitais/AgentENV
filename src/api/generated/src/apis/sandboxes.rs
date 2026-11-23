@@ -216,8 +216,8 @@ pub enum SandboxesSandboxIdNetworkPutResponse {
 pub enum SandboxesSandboxIdPausePostResponse {
     /// The sandbox was paused successfully and can be resumed
     Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
-    /// Conflict
-    Status409_Conflict(models::Error),
+    /// The sandbox cannot be paused from its current state, or the pause was refused recoverably to protect the node: the paused-artifact chain is still above its limit after compaction, or the compaction needs more transient disk than the node has. A capacity refusal carries a stable `errorCode` and leaves the sandbox Running, so the pause can be retried once the limit or the node capacity changes.
+    Status409_TheSandboxCannotBePausedFromItsCurrentState(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
     /// Authentication error
@@ -302,6 +302,8 @@ pub enum SandboxesSandboxIdSnapshotsPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }

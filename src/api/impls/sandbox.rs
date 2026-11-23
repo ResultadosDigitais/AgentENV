@@ -7,7 +7,7 @@ use axum_extra::extract::CookieJar;
 use headers::Host;
 use http::Method;
 
-use tracing::warn;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
@@ -22,7 +22,8 @@ use crate::sandbox::custom_extension::HookStatusError;
 use crate::sandbox::{normalize_mount_path, pause_refusal_code, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
+    PublishReceipt, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotRecord, SnapshotVolume,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::volume::{VolumeManager, VolumeMode};
@@ -129,6 +130,7 @@ impl From<SandboxState> for models::SandboxState {
         match state {
             SandboxState::Pausing
             | SandboxState::Paused
+            | SandboxState::Publishing
             | SandboxState::Snapshotting
             | SandboxState::Forking => Self::Paused,
             _ => Self::Running,
@@ -351,6 +353,145 @@ async fn snapshot_sandbox_volumes(
     Ok(snapshots)
 }
 
+/// Turn a successful publication into the 201 body, logging its receipt.
+fn snapshot_info_response(
+    source: &'static str,
+    sandbox_id: SandboxId,
+    (record, receipt): (SnapshotRecord, PublishReceipt),
+) -> SandboxesSandboxIdSnapshotsPostResponse {
+    info!(
+        sandbox_id = %sandbox_id,
+        snapshot_id = %record.id,
+        source,
+        bytes_uploaded = receipt.bytes_uploaded,
+        duration_ms = receipt.duration_ms,
+        layers_uploaded = receipt.layers_uploaded,
+        layers_reused = receipt.layers_reused,
+        final_layer_digest = receipt.final_layer_digest.as_deref().unwrap_or(""),
+        "published sandbox snapshot"
+    );
+    debug!(
+        sandbox_id = %sandbox_id,
+        snapshot_id = %record.id,
+        source,
+        reused_digests = ?receipt.reused_digests,
+        "snapshot publication reused layers"
+    );
+    let mut info = models::SnapshotInfo::from(record);
+    info.publish_receipt = Some(models::PublishReceipt::from(receipt));
+    SandboxesSandboxIdSnapshotsPostResponse::Status201_SnapshotCreatedSuccessfully(info)
+}
+
+/// Publish a PAUSED sandbox's last pause as a durable snapshot.
+///
+/// Volume backing layers are read before the publication window; the
+/// repository writes happen inside
+/// [`Orchestrator::publish_paused_snapshot`], while the sandbox is held in
+/// `Publishing`, and end in `Paused` on every exit.
+async fn publish_paused_snapshot_request(
+    api: &ApiImpl,
+    timer: &SandboxStageTimer,
+    sandbox_id: SandboxId,
+    metadata: SandboxMetadata,
+    alias: Option<SnapshotAlias>,
+) -> Result<SandboxesSandboxIdSnapshotsPostResponse, ()> {
+    let volume_snapshots = match snapshot_sandbox_volumes(api, &metadata).await {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            return Ok(match error.code {
+                500 => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
+                _ => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
+            });
+        }
+    };
+    let manager = std::sync::Arc::clone(&api.snapshot_manager);
+
+    let published = timer
+        .time(
+            "publish",
+            api.orchestrator
+                .publish_paused_snapshot(sandbox_id, move |metadata, captured| {
+                    let manager = std::sync::Arc::clone(&manager);
+                    async move {
+                        let publish_metadata = SnapshotPublishMetadata {
+                            id: SnapshotId::generate(),
+                            alias,
+                            source: SnapshotPublishSource::Sandbox {
+                                source_sandbox_id: metadata.id.to_string(),
+                                source_sandbox_metadata: metadata.user_metadata.clone(),
+                            },
+                            context: metadata.context.clone(),
+                            startup: metadata.startup.clone(),
+                            resources: metadata.resources,
+                            runtime_versions: metadata.runtime_versions.clone(),
+                            virtualization_mode: metadata.virtualization_mode,
+                            image_configs: metadata.image_configs.clone(),
+                            volume_snapshots,
+                            custom_extension_params: metadata.custom_extension_params.clone(),
+                        };
+                        crate::sandbox::publish_captured_with_receipt(
+                            &manager,
+                            publish_metadata,
+                            captured,
+                        )
+                        .await
+                        .map_err(|source| OrchestratorError::SnapshotPublishFailed { source })
+                    }
+                }),
+        )
+        .await;
+
+    match published {
+        Ok(published) => Ok(snapshot_info_response("paused", sandbox_id, published)),
+        Err(OrchestratorError::SandboxNotFound(id)) => Ok(
+            SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(sandbox_not_found(id)),
+        ),
+        Err(OrchestratorError::PausedSnapshotUnavailable { reason, .. }) => {
+            Ok(SandboxesSandboxIdSnapshotsPostResponse::Status409_Conflict(
+                ApiImpl::error(409, reason),
+            ))
+        }
+        Err(OrchestratorError::SandboxOperationConflict { .. }) => Ok(
+            SandboxesSandboxIdSnapshotsPostResponse::Status409_Conflict(ApiImpl::error(
+                409,
+                "a snapshot publication is already in progress for this sandbox".to_string(),
+            )),
+        ),
+        Err(OrchestratorError::InvalidSandboxState {
+            state: SandboxState::Publishing,
+            ..
+        }) => Ok(SandboxesSandboxIdSnapshotsPostResponse::Status409_Conflict(
+            ApiImpl::error(
+                409,
+                "a snapshot publication is already in progress for this sandbox".to_string(),
+            ),
+        )),
+        Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
+            SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(ApiImpl::error(
+                400,
+                format!("sandbox cannot be snapshotted from {state} state"),
+            )),
+        ),
+        Err(OrchestratorError::SnapshotPublishFailed { source }) => {
+            let error =
+                ApiImpl::bad_request_for_repository_build_error(&source).unwrap_or_else(|| {
+                    warn!(error = ?source, %sandbox_id, "failed to publish paused snapshot");
+                    ApiImpl::error(500, source.to_string())
+                });
+            Ok(ApiImpl::client_or_server_response(
+                error,
+                SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest,
+                SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError,
+            ))
+        }
+        Err(err) => Ok(
+            SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
+                ApiImpl::internal_error(&err),
+            ),
+        ),
+    }
+}
+
 async fn restore_snapshot_volume_mounts(
     api: &ApiImpl,
     snapshot: &crate::snapshot::RunnableSnapshot,
@@ -477,6 +618,13 @@ fn allow_internet_access_from_base_policy(policy: BaseSandboxNetworkPolicy) -> N
     }
 }
 
+/// Runtime capability: `POST /sandboxes/{id}/snapshots` accepts a PAUSED
+/// sandbox and publishes its last pause without resuming the VM.
+///
+/// An older runtime omits `runtimeCapabilities` entirely, so the control plane
+/// keeps snapshotting before pausing during a mixed-fleet rollout.
+pub(crate) const CAPABILITY_SNAPSHOT_PUBLISH_FROM_PAUSED: &str = "snapshot.publish-from-paused";
+
 impl From<SandboxMetadata> for models::SandboxDetail {
     fn from(m: SandboxMetadata) -> Self {
         let network = (!m.network_policy.allow_public_traffic
@@ -511,6 +659,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
                 on_timeout: m.timeout_action.into(),
             }),
             volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
+            runtime_capabilities: Some(vec![CAPABILITY_SNAPSHOT_PUBLISH_FROM_PAUSED.to_string()]),
         }
     }
 }
@@ -1477,7 +1626,7 @@ impl Sandboxes<()> for ApiImpl {
                     sandbox_not_found(sandbox_id),
                 ));
             }
-            SandboxState::Pausing | SandboxState::Paused => {}
+            SandboxState::Pausing | SandboxState::Paused | SandboxState::Publishing => {}
         }
 
         // try to resume the sandbox
@@ -1986,15 +2135,16 @@ impl Sandboxes<()> for ApiImpl {
                 SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status409_Conflict(Self::error(
-                    409,
-                    format!("sandbox cannot be paused from {} state", state),
-                )),
+                SandboxesSandboxIdPausePostResponse::Status409_TheSandboxCannotBePausedFromItsCurrentState(
+                    Self::error(409, format!("sandbox cannot be paused from {} state", state)),
+                ),
             ),
             Err(err) => match pause_refusal_error(&err) {
-                Some(refusal) => {
-                    Ok(SandboxesSandboxIdPausePostResponse::Status409_Conflict(refusal))
-                }
+                Some(refusal) => Ok(
+                    SandboxesSandboxIdPausePostResponse::Status409_TheSandboxCannotBePausedFromItsCurrentState(
+                        refusal,
+                    ),
+                ),
                 None => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
                     err.into(),
                 )),
@@ -2034,23 +2184,12 @@ impl Sandboxes<()> for ApiImpl {
             None => None,
         };
 
-        let capture = match timer
-            .time("capture", self.orchestrator.capture_snapshot(sandbox_id))
-            .await
-        {
-            Ok(capture) => capture,
-            Err(OrchestratorError::SandboxNotFound(id)) => {
+        let current = match self.orchestrator.get_sandbox(&sandbox_id).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
                 return Ok(SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
+                    sandbox_not_found(sandbox_id),
                 ));
-            }
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
-                return Ok(
-                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
-                        400,
-                        format!("sandbox cannot be snapshotted from {} state", state),
-                    )),
-                );
             }
             Err(err) => {
                 return Ok(
@@ -2061,60 +2200,122 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
-        let volume_snapshots = match snapshot_sandbox_volumes(self, &capture.metadata).await {
-            Ok(snapshots) => snapshots,
-            Err(error) => {
-                return Ok(match error.code {
-                    500 => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
-                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
-                });
+        match current.state {
+            SandboxState::Killing => {
+                Ok(SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(
+                    sandbox_not_found(sandbox_id),
+                ))
             }
-        };
-
-        let published = match timer
-            .time(
-                "publish",
-                crate::sandbox::publish_captured(
-                    &self.snapshot_manager,
-                    SnapshotPublishMetadata {
-                        id: SnapshotId::generate(),
-                        alias: alias.clone(),
-                        source: SnapshotPublishSource::Sandbox {
-                            source_sandbox_id: capture.metadata.id.to_string(),
-                            source_sandbox_metadata: capture.metadata.user_metadata.clone(),
-                        },
-                        context: capture.metadata.context.clone(),
-                        startup: capture.metadata.startup.clone(),
-                        resources: capture.metadata.resources,
-                        runtime_versions: capture.metadata.runtime_versions.clone(),
-                        virtualization_mode: capture.metadata.virtualization_mode,
-                        image_configs: capture.metadata.image_configs.clone(),
-                        volume_snapshots,
-                        custom_extension_params: capture.metadata.custom_extension_params.clone(),
-                    },
-                    capture.captured_snapshot,
-                ),
-            )
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                let error =
-                    Self::bad_request_for_repository_build_error(&err).unwrap_or_else(|| {
-                        warn!(error = ?err, %sandbox_id, "failed to publish captured snapshot");
-                        Self::error(500, err.to_string())
-                    });
-                return Ok(Self::client_or_server_response(
-                    error,
-                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest,
-                    SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError,
-                ));
+            SandboxState::Publishing => Ok(
+                SandboxesSandboxIdSnapshotsPostResponse::Status409_Conflict(Self::error(
+                    409,
+                    "a snapshot publication is already in progress for this sandbox".to_string(),
+                )),
+            ),
+            // Publish the artifacts the pause already wrote, without resuming
+            // the VM. The orchestrator holds the sandbox in Publishing for the
+            // whole operation and settles it back to Paused.
+            SandboxState::Paused => {
+                publish_paused_snapshot_request(self, &timer, sandbox_id, current, alias).await
             }
-        };
+            SandboxState::Running => {
+                let capture = match timer
+                    .time("capture", self.orchestrator.capture_snapshot(sandbox_id))
+                    .await
+                {
+                    Ok(capture) => capture,
+                    Err(OrchestratorError::SandboxNotFound(id)) => {
+                        return Ok(SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(
+                            sandbox_not_found(id),
+                        ));
+                    }
+                    Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                        return Ok(
+                            SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(
+                                Self::error(
+                                    400,
+                                    format!("sandbox cannot be snapshotted from {} state", state),
+                                ),
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        return Ok(
+                            SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
+                                Self::internal_error(&err),
+                            ),
+                        );
+                    }
+                };
 
-        let info = models::SnapshotInfo::from(published);
+                let volume_snapshots = match snapshot_sandbox_volumes(self, &capture.metadata).await
+                {
+                    Ok(snapshots) => snapshots,
+                    Err(error) => {
+                        return Ok(match error.code {
+                            500 => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
+                                error,
+                            ),
+                            _ => {
+                                SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error)
+                            }
+                        });
+                    }
+                };
 
-        Ok(SandboxesSandboxIdSnapshotsPostResponse::Status201_SnapshotCreatedSuccessfully(info))
+                let published = match timer
+                    .time(
+                        "publish",
+                        crate::sandbox::publish_captured_with_receipt(
+                            &self.snapshot_manager,
+                            SnapshotPublishMetadata {
+                                id: SnapshotId::generate(),
+                                alias: alias.clone(),
+                                source: SnapshotPublishSource::Sandbox {
+                                    source_sandbox_id: capture.metadata.id.to_string(),
+                                    source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                                },
+                                context: capture.metadata.context.clone(),
+                                startup: capture.metadata.startup.clone(),
+                                resources: capture.metadata.resources,
+                                runtime_versions: capture.metadata.runtime_versions.clone(),
+                                virtualization_mode: capture.metadata.virtualization_mode,
+                                image_configs: capture.metadata.image_configs.clone(),
+                                volume_snapshots,
+                                custom_extension_params: capture
+                                    .metadata
+                                    .custom_extension_params
+                                    .clone(),
+                            },
+                            capture.captured_snapshot,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(published) => published,
+                    Err(err) => {
+                        let error = Self::bad_request_for_repository_build_error(&err)
+                            .unwrap_or_else(|| {
+                                warn!(error = ?err, %sandbox_id, "failed to publish captured snapshot");
+                                Self::error(500, err.to_string())
+                            });
+                        return Ok(Self::client_or_server_response(
+                            error,
+                            SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest,
+                            SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError,
+                        ));
+                    }
+                };
+
+                Ok(snapshot_info_response("running", sandbox_id, published))
+            }
+            other => Ok(
+                SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    format!("sandbox cannot be snapshotted from {other} state"),
+                )),
+            ),
+        }
     }
 
     async fn sandboxes_sandbox_id_refreshes_post(
@@ -2269,10 +2470,15 @@ impl Sandboxes<()> for ApiImpl {
         query_params: &models::V2SandboxesGetQueryParams,
     ) -> Result<V2SandboxesGetResponse, ()> {
         let states = if query_params.state.len() == 1 {
-            Some(vec![match query_params.state[0] {
-                models::SandboxState::Running => SandboxState::Running,
-                models::SandboxState::Paused => SandboxState::Paused,
-            }])
+            // A sandbox publishing its paused artifacts still has its VM down and
+            // must stay visible to the paused listing (managed-layer GC and the
+            // paused placar read it), so `paused` covers both states.
+            Some(match query_params.state[0] {
+                models::SandboxState::Running => vec![SandboxState::Running],
+                models::SandboxState::Paused => {
+                    vec![SandboxState::Paused, SandboxState::Publishing]
+                }
+            })
         } else {
             // Only two states are supported. If multiple states are provided,
             // treat it as no state filter (i.e. return all sandboxes regardless of state)
@@ -2365,6 +2571,24 @@ mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
     use crate::sandbox::SandboxCaptureError;
+
+    #[test]
+    fn sandbox_detail_advertises_publish_from_paused() {
+        let detail = models::SandboxDetail::from(SandboxMetadata::default());
+        assert_eq!(
+            detail.runtime_capabilities,
+            Some(vec![CAPABILITY_SNAPSHOT_PUBLISH_FROM_PAUSED.to_string()]),
+            "an old runtime omits the field; this one must declare the capability"
+        );
+    }
+
+    #[test]
+    fn publishing_maps_to_the_paused_wire_state() {
+        assert!(matches!(
+            models::SandboxState::from(SandboxState::Publishing),
+            models::SandboxState::Paused
+        ));
+    }
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {

@@ -14,8 +14,8 @@ use super::{SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver};
 use crate::p2p::P2pTransport;
 use crate::repository::Repository;
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SandboxSnapshotManifest, SnapshotId,
-    SnapshotPublishMetadata, SnapshotRecord,
+    ManagedLayer, OverlaybdLayerRef, PublishReceipt, RunnableSnapshot, SandboxSnapshotManifest,
+    SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -112,6 +112,19 @@ impl SnapshotManager {
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
+        self.publish_with_receipt(metadata, manifest, recording)
+            .await
+            .map(|(record, _)| record)
+    }
+
+    /// Like [`Self::publish`], returning what the publication transferred and
+    /// reused.
+    pub async fn publish_with_receipt(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
+    ) -> crate::repository::RepositoryResult<(SnapshotRecord, PublishReceipt)> {
         self.publish_with_recording(metadata, manifest, recording)
             .await
     }
@@ -124,7 +137,7 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
-    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
+    ) -> crate::repository::RepositoryResult<(SnapshotRecord, PublishReceipt)> {
         let publication = self
             .repository
             .publish_with_local_layers(metadata, manifest.clone())
@@ -137,7 +150,7 @@ impl SnapshotManager {
             );
         }
         self.publish_p2p_artifacts(&publication, &manifest).await;
-        Ok(publication.record)
+        Ok((publication.record, publication.receipt))
     }
 
     /// Best effort attempt to publish snapshot artifacts to P2P.

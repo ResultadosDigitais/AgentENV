@@ -83,6 +83,10 @@ pub enum SandboxState {
     Forking,
     Pausing,
     Paused,
+    /// A paused sandbox whose pause artifacts are being published as a durable
+    /// snapshot. The VM stays paused; this state only fences the publication
+    /// against resume, delete and deferred chain compaction.
+    Publishing,
     Killing,
 }
 
@@ -96,6 +100,7 @@ impl Display for SandboxState {
             SandboxState::Forking => "forking",
             SandboxState::Pausing => "pausing",
             SandboxState::Paused => "paused",
+            SandboxState::Publishing => "publishing",
             SandboxState::Killing => "killing",
         };
         write!(f, "{s}")

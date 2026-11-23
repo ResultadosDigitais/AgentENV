@@ -7,7 +7,7 @@ use std::path::Path;
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
 use overlaybd::dense_export;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput};
 use super::recontainerize::{prepare_layer_upload_with, PreparedLayerUpload};
@@ -32,6 +32,14 @@ pub(crate) struct StoredSnapshot {
     pub(crate) disk_publications: Vec<PersistedDiskImagePublication>,
     /// The exact files stored as layers, kept for post-commit P2P publication.
     pub(crate) local_layers: Vec<PreparedLayerUpload>,
+    /// Bytes this store wrote into the repository, layers and snapshot files.
+    pub(crate) bytes_uploaded: u64,
+    /// Managed layers freshly uploaded.
+    pub(crate) layers_uploaded: u32,
+    /// Managed layers reused because the repository already held the digest.
+    pub(crate) layers_reused: u32,
+    /// Digests of the reused layers, for the publication log.
+    pub(crate) reused_digests: Vec<String>,
 }
 
 /// Stores one captured snapshot's files and layers. On failure it removes
@@ -52,6 +60,10 @@ where
             attached_drives,
             disk_publications: store.disk_publications,
             local_layers: store.local_layers,
+            bytes_uploaded: store.bytes_uploaded,
+            layers_uploaded: store.layers_uploaded,
+            layers_reused: store.layers_reused,
+            reused_digests: store.reused_digests,
         }),
         Err(error) => {
             if let Err(cleanup) =
@@ -111,6 +123,10 @@ struct LayerStore<'a, R: ?Sized> {
     managed_layers_repo_blob_url: Option<String>,
     disk_publications: Vec<PersistedDiskImagePublication>,
     local_layers: Vec<PreparedLayerUpload>,
+    bytes_uploaded: u64,
+    layers_uploaded: u32,
+    layers_reused: u32,
+    reused_digests: Vec<String>,
 }
 
 impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
@@ -125,6 +141,28 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             managed_layers_repo_blob_url: repository.managed_layers_repo_blob_url(),
             disk_publications: Vec::new(),
             local_layers: Vec::new(),
+            bytes_uploaded: 0,
+            layers_uploaded: 0,
+            layers_reused: 0,
+            reused_digests: Vec::new(),
+        }
+    }
+
+    /// Whether the repository already holds a layer with `digest`.
+    ///
+    /// A repository that does not support the probe (returns `Unsupported`)
+    /// answers "absent" so the caller falls back to uploading, which is always
+    /// correct. Any other error is propagated: silently re-uploading gigabytes
+    /// on a transient failure hides a real repository problem.
+    async fn layer_is_present(&self, digest: &str, role: LayerRole) -> RepositoryResult<bool> {
+        let key = BlobKey::Layer {
+            digest: digest.to_string(),
+            role,
+        };
+        match self.repository.has_blob(&key).await {
+            Ok(present) => Ok(present),
+            Err(RepositoryError::Unsupported { .. }) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
@@ -161,6 +199,18 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             .store_memory_layers(&manifest.memory.image_config_path)
             .await?;
 
+        let vm_state_size = tokio::fs::metadata(&manifest.vm_state.path)
+            .await
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!(
+                        "read vm state metadata '{}'",
+                        manifest.vm_state.path.display()
+                    ),
+                    error,
+                )
+            })?
+            .len();
         self.repository
             .put_blob(
                 &BlobKey::Snapshot(id.clone(), SnapshotFile::VmState),
@@ -169,6 +219,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             .await?;
         let manifest_bytes = serde_json::to_vec_pretty(manifest)
             .map_err(|error| RepositoryError::backend("serialize firecracker manifest", error))?;
+        self.bytes_uploaded += vm_state_size + manifest_bytes.len() as u64;
         self.repository
             .put_blob(
                 &BlobKey::Snapshot(id.clone(), SnapshotFile::FirecrackerManifest),
@@ -398,7 +449,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         role: LayerRole,
     ) -> RepositoryResult<ManagedLayer> {
         let canonical = canonicalize(source)?;
-        if let Some((_, size)) = descriptor {
+        if let Some((digest, size)) = descriptor {
             let source_size = std::fs::metadata(&canonical)
                 .map_err(|error| {
                     RepositoryError::backend(
@@ -416,6 +467,26 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                         source_size
                     ),
                     source: None,
+                });
+            }
+            // Only in raw mode does the stored bytes' digest equal the capture
+            // descriptor: with publish compression the prepared digest differs,
+            // so a raw-digest hit must never be read as "already stored". The
+            // compressed duplicate is caught after preparation instead.
+            if matches!(self.compression, OverlaybdCompactOutput::Raw)
+                && self.layer_is_present(digest, role).await?
+            {
+                self.layers_reused += 1;
+                self.reused_digests.push(digest.to_string());
+                debug!(
+                    digest = %digest,
+                    role = ?role,
+                    "reusing managed layer already stored in the repository"
+                );
+                return Ok(ManagedLayer {
+                    digest: digest.to_string(),
+                    size,
+                    uuid: None,
                 });
             }
         }
@@ -446,9 +517,27 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             digest: layer.digest.clone(),
             role,
         };
+        // The prepared digest may already exist even though the raw digest did
+        // not: two raw layers can compress to identical zfile bytes, and a
+        // paused generation republished under a new snapshot id reuses every
+        // layer. Skip the upload, count it as reused, and keep the prepared
+        // file so post-commit P2P publication can still copy it.
+        if self.layer_is_present(&layer.digest, role).await? {
+            self.layers_reused += 1;
+            self.reused_digests.push(layer.digest.clone());
+            debug!(
+                digest = %layer.digest,
+                role = ?role,
+                "reusing prepared managed layer already stored in the repository"
+            );
+            self.local_layers.push(upload);
+            return Ok(layer);
+        }
         self.repository
             .put_blob(&key, BlobBody::File(upload.path()))
             .await?;
+        self.bytes_uploaded += layer.size;
+        self.layers_uploaded += 1;
         self.local_layers.push(upload);
         Ok(layer)
     }

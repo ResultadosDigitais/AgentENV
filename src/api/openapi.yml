@@ -335,6 +335,48 @@ components:
             OverlayBD-native OCI image reference for the snapshot rootfs when
             source-registry image publication was enabled and succeeded.
             Omitted when no rootfs image was published.
+        publishReceipt:
+          $ref: "#/components/schemas/PublishReceipt"
+
+    PublishReceipt:
+      type: object
+      description: >
+        What one snapshot publication transferred and how much it reused.
+        Present on the response of a snapshot creation, never on list or get.
+      required:
+        - bytesUploaded
+        - durationMs
+        - layersUploaded
+        - layersReused
+      properties:
+        bytesUploaded:
+          type: integer
+          format: int64
+          description: >
+            Total bytes this publication wrote into the repository: uploaded
+            managed layers plus the snapshot-scoped files (VM state and the
+            manifest). Reused layers contribute zero.
+        durationMs:
+          type: integer
+          format: int64
+          description: >
+            Wall-clock time spent storing and committing the publication, in
+            milliseconds, including layer preparation (compression).
+        layersUploaded:
+          type: integer
+          format: int32
+          description: Managed layers freshly uploaded.
+        layersReused:
+          type: integer
+          format: int32
+          description: >
+            Managed layers reused because the repository already held their
+            digest; they are neither prepared nor uploaded again.
+        finalLayerDigest:
+          type: string
+          description: >
+            Digest of the newest memory layer, when the snapshot has memory
+            layers. Omitted otherwise.
 
     EnvVars:
       additionalProperties:
@@ -684,6 +726,17 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        runtimeCapabilities:
+          type: array
+          items:
+            type: string
+          description: >
+            Capabilities this runtime advertises for the sandbox. An older
+            runtime omits the field, so the control plane keeps the
+            snapshot-before-pause behavior. A value of
+            `snapshot.publish-from-paused` means POST
+            /sandboxes/{sandboxID}/snapshots accepts a PAUSED sandbox and
+            publishes its last pause without resuming the VM.
 
     ListedSandbox:
       required:
@@ -2938,7 +2991,13 @@ paths:
   /sandboxes/{sandboxID}/snapshots:
     post:
       summary: Create snapshot
-      description: Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new sandboxes and persist beyond the original sandbox's lifetime.
+      description: >
+        Create a persistent snapshot from the sandbox's current state.
+        Snapshots can be used to create new sandboxes and persist beyond the
+        original sandbox's lifetime. A RUNNING sandbox is captured in place and
+        keeps running. A PAUSED sandbox publishes the artifacts its last pause
+        already wrote, without resuming the VM and without reconverting memory;
+        the sandbox stays PAUSED afterward.
       tags: [sandboxes]
       security:
         - ApiKeyAuth: []
@@ -2967,6 +3026,8 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 
