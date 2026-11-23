@@ -46,6 +46,34 @@ pub struct SnapshotPublishMetadata {
     pub custom_extension_params: Option<CustomExtensionParams>,
 }
 
+/// What one snapshot publication transferred and how much it reused.
+///
+/// Bytes and layer counters describe the managed layers this repository stores
+/// plus the snapshot-scoped files (`vm_state` and the manifest); a source
+/// registry publication keeps its own accounting. A layer found already present
+/// by digest is reused: it is neither prepared nor uploaded, and contributes
+/// zero bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishReceipt {
+    /// Total bytes this publication wrote into the repository.
+    pub bytes_uploaded: u64,
+    /// Wall-clock time spent storing and committing the publication, in
+    /// milliseconds. Layer preparation (compression) is included here and is
+    /// reported separately by the caller's own measurement.
+    pub duration_ms: u64,
+    /// Managed layers freshly uploaded.
+    pub layers_uploaded: u32,
+    /// Managed layers reused because the repository already held their digest.
+    pub layers_reused: u32,
+    /// Digest of the newest memory layer, when the snapshot has memory layers.
+    pub final_layer_digest: Option<String>,
+    /// Digests of the layers this publication reused. Internal observability
+    /// only: it never crosses the wire, so the DTO stays the wire contract.
+    #[serde(skip)]
+    pub reused_digests: Vec<String>,
+}
+
 #[cfg(test)]
 impl SnapshotPublishMetadata {
     pub fn mock() -> Self {

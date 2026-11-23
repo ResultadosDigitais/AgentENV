@@ -30,7 +30,9 @@ use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, PausedSandboxResources,
     SandboxContribution,
 };
-use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
+use super::persistence::{
+    acquire_publish_lease, DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister,
+};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::resize::{ResizePolicy, ResourceRequest};
 use super::store::*;
@@ -1230,6 +1232,7 @@ where
                     | SandboxState::Snapshotting
                     | SandboxState::Forking
                     | SandboxState::Pausing
+                    | SandboxState::Publishing
                     | SandboxState::Resuming => {
                         // An in-progress operation is currently holding the sandbox in this
                         // transitional state.  Wait for it to finish so our Killing transition
@@ -2052,6 +2055,172 @@ where
             metadata,
             captured_snapshot,
         })
+    }
+
+    /// Publishes the artifacts of a PAUSED sandbox as a durable snapshot,
+    /// without resuming the VM and without recapturing or reconverting its
+    /// memory.
+    ///
+    /// The backend derives the manifest from the generation the pause already
+    /// wrote; `publish` only stores it. The sandbox is held in [`Publishing`]
+    /// for the whole operation so a resume or delete cannot run underneath it,
+    /// a node-local publish lease fences the deferred chain-compaction worker,
+    /// and the state returns to [`Paused`] on every exit. The publication never
+    /// calls the backend, never resumes, and never rewrites the persisted
+    /// record.
+    ///
+    /// [`Publishing`]: SandboxState::Publishing
+    /// [`Paused`]: SandboxState::Paused
+    pub async fn publish_paused_snapshot<T, Cb, Fut>(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        publish: Cb,
+    ) -> Result<T>
+    where
+        Cb: FnOnce(SandboxMetadata, crate::sandbox::CapturedSandboxSnapshot) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+        T: Send + 'static,
+    {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("publish_snapshot", sandbox_id, async move {
+            this.publish_paused_snapshot_inner(sandbox_id, publish)
+                .await
+        })
+        .await
+    }
+
+    async fn publish_paused_snapshot_inner<T, Cb, Fut>(
+        &self,
+        sandbox_id: SandboxId,
+        publish: Cb,
+    ) -> Result<T>
+    where
+        Cb: FnOnce(SandboxMetadata, crate::sandbox::CapturedSandboxSnapshot) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+        T: Send + 'static,
+    {
+        self.ensure_accepting_lifecycle_operations()?;
+
+        // Paused -> Publishing, and nothing else may hold the sandbox while the
+        // publication reads its generation.
+        if let Err(error) = self
+            .store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Publishing,
+                &[SandboxState::Paused],
+            )
+            .await
+        {
+            return Err(match error {
+                StoreError::StateConflict {
+                    actual_state: SandboxState::Killing,
+                    ..
+                } => OrchestratorError::SandboxNotFound(sandbox_id),
+                StoreError::StateConflict {
+                    actual_state: SandboxState::Publishing,
+                    ..
+                } => OrchestratorError::SandboxOperationConflict {
+                    sandbox_id,
+                    operation: SandboxOperation::Snapshot,
+                },
+                StoreError::StateConflict { actual_state, .. } => {
+                    OrchestratorError::InvalidSandboxState {
+                        sandbox_id,
+                        state: actual_state,
+                    }
+                }
+                error => OrchestratorError::from(error),
+            });
+        }
+
+        let result = self
+            .publish_paused_snapshot_guarded(sandbox_id, publish)
+            .await;
+
+        // The sandbox must always settle back to Paused, the only state a resume
+        // or delete can start from. A failure to write it is reported but never
+        // hides the publication's own outcome.
+        if let Err(error) = self
+            .store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Paused,
+                &[SandboxState::Publishing],
+            )
+            .await
+        {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %error,
+                "failed to restore Paused state after publishing paused snapshot"
+            );
+        }
+        result
+    }
+
+    async fn publish_paused_snapshot_guarded<T, Cb, Fut>(
+        &self,
+        sandbox_id: SandboxId,
+        publish: Cb,
+    ) -> Result<T>
+    where
+        Cb: FnOnce(SandboxMetadata, crate::sandbox::CapturedSandboxSnapshot) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+        T: Send + 'static,
+    {
+        let mut metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        let paused_state = metadata.paused_state.clone().ok_or_else(|| {
+            OrchestratorError::PausedSnapshotUnavailable {
+                sandbox_id,
+                reason: "the paused record carries no runtime state on this node".to_string(),
+            }
+        })?;
+        let manifest = paused_state
+            .paused_snapshot_manifest()
+            .map_err(|error| OrchestratorError::PausedSnapshotUnavailable {
+                sandbox_id,
+                reason: format!("could not derive the paused manifest: {error:#}"),
+            })?
+            .ok_or_else(|| OrchestratorError::PausedSnapshotUnavailable {
+                sandbox_id,
+                reason: "this backend cannot publish from a paused state".to_string(),
+            })?;
+
+        // The lease must exist before any config or layer file is read by the
+        // publication, so the compaction worker never acts on this generation
+        // underneath it.
+        let generation_dir = manifest
+            .vm_state
+            .path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| OrchestratorError::PausedSnapshotUnavailable {
+                sandbox_id,
+                reason: "the paused generation has no containing directory".to_string(),
+            })?;
+        let _lease = acquire_publish_lease(&generation_dir, &sandbox_id).map_err(|error| {
+            OrchestratorError::InternalError(format!(
+                "failed to take the publish lease in '{}': {error}",
+                generation_dir.display()
+            ))
+        })?;
+
+        // The caller's provenance sees the in-flight state, not the stale
+        // `Paused` it was read with.
+        metadata.state = SandboxState::Publishing;
+        let captured = crate::sandbox::CapturedSandboxSnapshot::new(manifest, ());
+        publish(metadata, captured).await
     }
 
     pub async fn replace_sandbox_network_policy(
@@ -3163,6 +3332,7 @@ where
                     | SandboxState::Snapshotting
                     | SandboxState::Forking
                     | SandboxState::Pausing
+                    | SandboxState::Publishing
                     | SandboxState::Resuming
                     | SandboxState::Killing => {
                         match self.wait_for_transition(sandbox_id, metadata.state).await {

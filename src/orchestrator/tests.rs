@@ -6635,3 +6635,345 @@ async fn resume_and_fork_reapply_limits() -> Result<()> {
     );
     Ok(())
 }
+
+// ── Publishing a PAUSED sandbox ──────────────────────────────────────────────
+
+/// A paused state whose backend derives a manifest, the way the Firecracker
+/// pause path does.
+#[derive(Debug)]
+struct PublishablePausedState {
+    manifest: crate::snapshot::SandboxSnapshotManifest,
+}
+
+impl PausedSandboxState for PublishablePausedState {
+    fn encode(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({}))
+    }
+
+    fn runtime_artifacts(&self) -> RuntimeArtifactSet {
+        RuntimeArtifactSet::empty()
+    }
+
+    fn paused_snapshot_manifest(
+        &self,
+    ) -> anyhow::Result<Option<crate::snapshot::SandboxSnapshotManifest>> {
+        Ok(Some(self.manifest.clone()))
+    }
+}
+
+fn publishable_manifest(generation_dir: &Path) -> crate::snapshot::SandboxSnapshotManifest {
+    crate::snapshot::SandboxSnapshotManifest::new(
+        crate::snapshot::FIRECRACKER_BACKEND,
+        generation_dir.join("vm_state.bin"),
+        generation_dir.join("mem_image.json"),
+        4096,
+        generation_dir.join("rootfs").join("image.json"),
+        4096,
+        &[],
+    )
+    .expect("test manifest")
+}
+
+async fn add_paused_sandbox_with_state(
+    orchestrator: &Arc<
+        TestOrchestrator<InMemoryMetadataStore, MockBackendFactory, DisabledSandboxPersister>,
+    >,
+    sandbox_id: SandboxId,
+    state: SandboxState,
+    paused_state: Option<Arc<dyn PausedSandboxState>>,
+) -> anyhow::Result<()> {
+    let mut metadata = paused_resume_metadata(sandbox_id);
+    metadata.state = state;
+    metadata.paused_state = paused_state;
+    orchestrator.store.add(metadata).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn publish_paused_snapshot_runs_while_paused_and_restores_paused() -> anyhow::Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let generation = TempDir::new()?;
+    let sandbox_id = SandboxId::new();
+    let manifest = publishable_manifest(generation.path());
+    add_paused_sandbox_with_state(
+        &orchestrator,
+        sandbox_id,
+        SandboxState::Paused,
+        Some(Arc::new(PublishablePausedState {
+            manifest: manifest.clone(),
+        })),
+    )
+    .await?;
+
+    let observed = Arc::new(StdMutex::new(None));
+    let observed_in = Arc::clone(&observed);
+    let published: SandboxId = orchestrator
+        .publish_paused_snapshot(sandbox_id, move |metadata, captured| async move {
+            *observed_in.lock().unwrap() =
+                Some((metadata.state, captured.manifest().vm_state.path.clone()));
+            Ok(metadata.id)
+        })
+        .await?;
+
+    assert_eq!(published, sandbox_id);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some((SandboxState::Publishing, manifest.vm_state.path.clone())),
+        "the publication runs under Publishing and sees the paused manifest"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox survives the publication")
+            .state,
+        SandboxState::Paused,
+        "the sandbox settles back to Paused"
+    );
+    assert!(
+        !generation.path().join("publish.lease").exists(),
+        "the publish lease is removed when the publication ends"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn publish_paused_snapshot_failure_restores_paused_and_removes_the_lease(
+) -> anyhow::Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let generation = TempDir::new()?;
+    let sandbox_id = SandboxId::new();
+    let manifest = publishable_manifest(generation.path());
+    add_paused_sandbox_with_state(
+        &orchestrator,
+        sandbox_id,
+        SandboxState::Paused,
+        Some(Arc::new(PublishablePausedState { manifest })),
+    )
+    .await?;
+
+    let error = orchestrator
+        .publish_paused_snapshot(sandbox_id, |_, _| async {
+            Err::<(), _>(OrchestratorError::InternalError(
+                "publication failed".to_string(),
+            ))
+        })
+        .await
+        .expect_err("the publication failure propagates");
+    assert!(matches!(error, OrchestratorError::InternalError(_)));
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox survives the failed publication")
+            .state,
+        SandboxState::Paused
+    );
+    assert!(!generation.path().join("publish.lease").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn publish_paused_snapshot_refuses_wrong_states_and_unpublishable_records(
+) -> anyhow::Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+
+    // Killing maps to not found.
+    let killing_id = SandboxId::new();
+    add_paused_sandbox_with_state(
+        &orchestrator,
+        killing_id,
+        SandboxState::Killing,
+        Some(Arc::new(MockSnapshot)),
+    )
+    .await?;
+    let error = orchestrator
+        .publish_paused_snapshot(killing_id, |_, _| async { Ok::<(), OrchestratorError>(()) })
+        .await
+        .expect_err("Killing is not publishable");
+    assert!(matches!(error, OrchestratorError::SandboxNotFound(id) if id == killing_id));
+
+    // A running (or any non-paused) sandbox is refused typed.
+    let running_id = SandboxId::new();
+    add_paused_sandbox_with_state(
+        &orchestrator,
+        running_id,
+        SandboxState::Running,
+        Some(Arc::new(MockSnapshot)),
+    )
+    .await?;
+    let error = orchestrator
+        .publish_paused_snapshot(running_id, |_, _| async { Ok::<(), OrchestratorError>(()) })
+        .await
+        .expect_err("Running is not publishable from the paused path");
+    assert!(matches!(
+        error,
+        OrchestratorError::InvalidSandboxState {
+            state: SandboxState::Running,
+            ..
+        }
+    ));
+
+    // A paused record with no runtime state on this node is refused typed.
+    let state_less_id = SandboxId::new();
+    add_paused_sandbox_with_state(&orchestrator, state_less_id, SandboxState::Paused, None).await?;
+    let error = orchestrator
+        .publish_paused_snapshot(state_less_id, |_, _| async {
+            Ok::<(), OrchestratorError>(())
+        })
+        .await
+        .expect_err("a record without runtime state is not publishable");
+    assert!(matches!(
+        error,
+        OrchestratorError::PausedSnapshotUnavailable { .. }
+    ));
+
+    // A backend that cannot publish from paused is refused typed too.
+    let unsupported_id = SandboxId::new();
+    add_paused_sandbox_with_state(
+        &orchestrator,
+        unsupported_id,
+        SandboxState::Paused,
+        Some(Arc::new(MockSnapshot)),
+    )
+    .await?;
+    let error = orchestrator
+        .publish_paused_snapshot(unsupported_id, |_, _| async {
+            Ok::<(), OrchestratorError>(())
+        })
+        .await
+        .expect_err("a backend without a paused manifest is not publishable");
+    assert!(matches!(
+        error,
+        OrchestratorError::PausedSnapshotUnavailable { .. }
+    ));
+
+    // A refusal never mutates the sandbox: the running one stays Running and
+    // the paused ones stay Paused.
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&running_id)
+            .await?
+            .expect("survives")
+            .state,
+        SandboxState::Running
+    );
+    for id in [state_less_id, unsupported_id] {
+        assert_eq!(
+            orchestrator
+                .get_sandbox(&id)
+                .await?
+                .expect("survives")
+                .state,
+            SandboxState::Paused
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_is_refused_while_a_paused_publication_is_in_flight() -> anyhow::Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let generation = TempDir::new()?;
+    let sandbox_id = SandboxId::new();
+    let manifest = publishable_manifest(generation.path());
+    add_paused_sandbox_with_state(
+        &orchestrator,
+        sandbox_id,
+        SandboxState::Paused,
+        Some(Arc::new(PublishablePausedState { manifest })),
+    )
+    .await?;
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let publishing = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .publish_paused_snapshot(sandbox_id, move |_, _| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Ok::<(), OrchestratorError>(())
+                })
+                .await
+        }
+    });
+    started_rx.await.expect("publication started");
+
+    let error = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .await
+        .expect_err("resume must be refused while publishing");
+    assert!(matches!(
+        error,
+        OrchestratorError::InvalidSandboxState {
+            state: SandboxState::Publishing,
+            ..
+        }
+    ));
+
+    release_tx.send(()).expect("release publication");
+    publishing.await.expect("publication task panicked")?;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("survives")
+            .state,
+        SandboxState::Paused
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_waits_for_an_in_flight_paused_publication() -> anyhow::Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let generation = TempDir::new()?;
+    let sandbox_id = SandboxId::new();
+    let manifest = publishable_manifest(generation.path());
+    add_paused_sandbox_with_state(
+        &orchestrator,
+        sandbox_id,
+        SandboxState::Paused,
+        Some(Arc::new(PublishablePausedState { manifest })),
+    )
+    .await?;
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let publishing = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .publish_paused_snapshot(sandbox_id, move |_, _| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Ok::<(), OrchestratorError>(())
+                })
+                .await
+        }
+    });
+    started_rx.await.expect("publication started");
+
+    let deleting = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.delete_sandbox(sandbox_id).await }
+    });
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !deleting.is_finished(),
+        "delete must wait for the publication to settle"
+    );
+
+    release_tx.send(()).expect("release publication");
+    publishing.await.expect("publication task panicked")?;
+    deleting.await.expect("delete task panicked")?;
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    Ok(())
+}

@@ -9,6 +9,11 @@ same point instead of rebuilding the environment and rerunning setup work.
 - **Warm-started sandboxes** restore the state of a committed template or snapshot.
 - **Running sandboxes** can produce new snapshots, capturing their current
   state for later reuse or branching.
+- **Paused sandboxes** can be published as a durable snapshot from the artifacts
+  their last pause already wrote, without resuming the VM. The publication is
+  incremental: layers already in the repository are reused by digest, so only
+  the new ones are uploaded. Publishing a paused sandbox never resumes it; it
+  stays paused afterward.
 
 ## What a Snapshot Preserves
 
@@ -27,7 +32,7 @@ A snapshot preserves:
 
 Where to Go Next:
 
-- [Create a Snapshot](./create.md) — capture a reusable checkpoint from a running sandbox.
+- [Create a Snapshot](./create.md) — capture a reusable checkpoint from a running or a paused sandbox.
 - [Manage Snapshots](./manage.md) — list, inspect, and delete snapshots.
 - [Rootfs as an OCI Image](./use.md) — publish or export only the captured root filesystem.
 - [Optional P2P Visibility](./p2p.md) — accelerate committed snapshot artifact distribution between nodes.

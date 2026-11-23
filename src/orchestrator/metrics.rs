@@ -105,7 +105,10 @@ pub(crate) struct SandboxContribution {
 
 impl SandboxContribution {
     pub(crate) fn new(state: SandboxState, resources: SandboxResources) -> Self {
-        let is_paused = matches!(state, SandboxState::Paused);
+        // `Publishing` is a paused sandbox mid-publication: the VM is down, so it
+        // must count as paused (resources released, visible to the paused placar)
+        // and never as running.
+        let is_paused = matches!(state, SandboxState::Paused | SandboxState::Publishing);
         let counts_as_running = matches!(
             state,
             SandboxState::Running
@@ -210,6 +213,19 @@ mod tests {
 
         let legacy = aggregate([&default_req]);
         assert_eq!(legacy.requested_memory_bytes, legacy.allocated_memory_bytes);
+    }
+
+    #[test]
+    fn publishing_counts_as_paused_and_never_as_running() {
+        let publishing = meta(SandboxState::Publishing, 2, 512);
+        let metrics = aggregate([&publishing]);
+        assert_eq!(metrics.running_sandbox_count, 0);
+        assert_eq!(metrics.starting_sandbox_count, 0);
+        assert_eq!(metrics.allocated_cpu, 0);
+        assert_eq!(metrics.allocated_memory_bytes, 0);
+        assert_eq!(metrics.paused_sandbox_count, 1);
+        assert_eq!(metrics.paused_allocated_cpu, 2);
+        assert_eq!(metrics.paused_allocated_memory_bytes, 512u64 << 20);
     }
 
     #[test]

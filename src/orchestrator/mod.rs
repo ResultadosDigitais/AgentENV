@@ -90,6 +90,26 @@ pub enum OrchestratorError {
         operation: SandboxOperation,
     },
 
+    /// The sandbox is paused but this runtime has no publishable manifest for
+    /// its last pause (the record carries no runtime state, or the backend
+    /// cannot publish from a paused generation). It is a client-visible
+    /// conflict: the pause artifacts may live on another node, so retrying on
+    /// the node that owns them can succeed.
+    #[error("sandbox {sandbox_id} has no publishable paused snapshot: {reason}")]
+    PausedSnapshotUnavailable {
+        sandbox_id: SandboxId,
+        reason: String,
+    },
+
+    /// The repository rejected or failed the publication itself. The wrapped
+    /// error keeps the existing client/server mapping the running capture path
+    /// uses.
+    #[error("snapshot publication failed: {source}")]
+    SnapshotPublishFailed {
+        #[source]
+        source: crate::repository::RepositoryError,
+    },
+
     #[error("store operation failed: {0}")]
     StoreOperationFailed(#[source] store::StoreError),
 

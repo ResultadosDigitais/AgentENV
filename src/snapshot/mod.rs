@@ -26,9 +26,10 @@ pub use startup_pack::{
 pub(crate) use types::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,
-    OverlaybdLayerRef, PersistedDiskImagePublication, ResolvedAttachedDrive, RunnableSnapshot,
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand,
-    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
+    OverlaybdLayerRef, PersistedDiskImagePublication, PublishReceipt, ResolvedAttachedDrive,
+    RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotVolume,
+    StartupCommand, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };
 pub use types::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};

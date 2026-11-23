@@ -12,7 +12,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{
-    PausedArtifactCandidate, PersistenceResult, SandboxPersistenceError, SandboxPersister,
+    clear_publish_lease, has_publish_lease, PausedArtifactCandidate, PersistenceResult,
+    SandboxPersistenceError, SandboxPersister,
 };
 use crate::cfg::ConfigManager;
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
@@ -906,6 +907,10 @@ impl SandboxPersister for FileBackedSandboxPersister {
                     node_mode = %self.virtualization_mode,
                     "loading paused sandbox metadata without resumable runtime state because its virtualization mode is incompatible"
                 );
+                // No publication can be in flight at boot, so any lease left in
+                // a retained generation is stale; clearing it here keeps one
+                // crashed publication from starving compaction until restart.
+                clear_publish_lease(&record.artifact_root);
                 retained_artifacts.insert(sandbox_id);
                 sandboxes.push(record.into_metadata_without_runtime_state());
                 outcomes.observe(LoadOutcome::RetainedWithoutRuntimeState);
@@ -914,12 +919,14 @@ impl SandboxPersister for FileBackedSandboxPersister {
 
             match record.decode_runtime_metadata(factory) {
                 Ok(metadata) => {
+                    clear_publish_lease(&record.artifact_root);
                     retained_artifacts.insert(sandbox_id);
                     sandboxes.push(metadata);
                     outcomes.observe(LoadOutcome::LoadedFromLocal);
                 }
                 Err(err) => {
                     self.retain_unusable_record(&sandbox_id, &err);
+                    clear_publish_lease(&record.artifact_root);
                     retained_artifacts.insert(sandbox_id);
                     sandboxes.push(record.into_metadata_without_runtime_state());
                     outcomes.observe(LoadOutcome::RetainedWithoutRuntimeState);
@@ -1069,6 +1076,21 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 }
             };
             if record.lifecycle != PersistedPausedLifecycle::Paused {
+                continue;
+            }
+            // A generation holds a publish lease while its artifacts are being
+            // published: the publication reads the configs and layer files the
+            // worker would rewrite or unlink, so the worker must skip it for
+            // this pass. The lease is taken before the manifest is read, which
+            // closes the window; the one-pass gap between a swap and its unlink
+            // keeps a lease-free pass from colliding with a publication that
+            // started after this listing.
+            if has_publish_lease(&record.artifact_root) {
+                debug!(
+                    sandbox_id = %record.metadata.id,
+                    artifact_root = %record.artifact_root.display(),
+                    "deferred compaction skipped a generation holding a publish lease"
+                );
                 continue;
             }
             candidates.push(PausedArtifactCandidate {
@@ -2519,5 +2541,43 @@ mod tests {
             labels.iter().all(|label| label.is_ascii()),
             "label values stay greppable in metrics output"
         );
+    }
+
+    /// A leased generation is never handed to the deferred-compaction worker,
+    /// and boot clears a stale lease because no publication can be in flight.
+    #[tokio::test]
+    async fn publish_lease_hides_a_generation_from_compaction_and_boot_clears_it(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let snapshot_root = temp.path().join("artifacts").join("generation");
+        let (sandbox_id, _state) = persist_test_record(&persister, &snapshot_root).await?;
+        let lease_path = snapshot_root.join(super::super::PUBLISH_LEASE_FILE);
+
+        let lease = super::super::acquire_publish_lease(&snapshot_root, &sandbox_id)?;
+        assert!(lease_path.exists(), "acquiring the lease writes the file");
+        assert!(
+            persister.paused_artifact_candidates().await?.is_empty(),
+            "a leased generation is not handed to the worker"
+        );
+
+        drop(lease);
+        assert!(!lease_path.exists(), "dropping the lease removes the file");
+        assert_eq!(
+            persister.paused_artifact_candidates().await?.len(),
+            1,
+            "an unleased generation is a candidate again"
+        );
+
+        // A publication that crashes leaves the file behind; the next boot
+        // clears it before serving anything.
+        std::fs::write(&lease_path, b"stale")?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            !lease_path.exists(),
+            "load_all clears a stale publish lease at boot"
+        );
+        Ok(())
     }
 }

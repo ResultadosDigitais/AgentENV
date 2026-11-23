@@ -34,9 +34,10 @@ pub use crate::types::{
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    publish_captured, CapturedSandboxSnapshot, PausedSandboxState, ResourceLimitPlan,
-    ResourceLimitStatus, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
-    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    publish_captured, publish_captured_with_receipt, CapturedSandboxSnapshot, PausedSandboxState,
+    ResourceLimitPlan, ResourceLimitStatus, SandboxBackend, SandboxBackendFactory,
+    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
+    SandboxRuntimeInfo,
 };
 pub use cpu_quota::CpuQuota;
 pub use envd::EnvdApi;

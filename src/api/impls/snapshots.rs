@@ -8,7 +8,7 @@ use http::Method;
 use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
-use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource};
+use crate::snapshot::{PublishReceipt, SnapshotId, SnapshotRecord, SnapshotSource};
 
 use super::pagination::PaginationCursor;
 use super::ApiImpl;
@@ -35,6 +35,19 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
                 record.updated_at_unix_ms,
             )),
             image_ref,
+            publish_receipt: None,
+        }
+    }
+}
+
+impl From<PublishReceipt> for models::PublishReceipt {
+    fn from(receipt: PublishReceipt) -> Self {
+        Self {
+            bytes_uploaded: receipt.bytes_uploaded as i64,
+            duration_ms: receipt.duration_ms as i64,
+            layers_uploaded: receipt.layers_uploaded as i32,
+            layers_reused: receipt.layers_reused as i32,
+            final_layer_digest: receipt.final_layer_digest,
         }
     }
 }
@@ -200,6 +213,38 @@ mod tests {
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommittedSnapshot, PersistedDiskImagePublication,
     };
+
+    #[test]
+    fn snapshot_info_from_record_omits_the_publish_receipt() {
+        // List and get responses are built from the record and never carry a
+        // receipt; only the creation response attaches one.
+        let info =
+            models::SnapshotInfo::from(SnapshotRecord::mock_ready(CommittedSnapshot::mock()));
+        assert!(info.publish_receipt.is_none());
+    }
+
+    #[test]
+    fn publish_receipt_serializes_camel_case_counters_and_hides_internal_digests() {
+        let dto = models::PublishReceipt::from(PublishReceipt {
+            bytes_uploaded: 10,
+            duration_ms: 5,
+            layers_uploaded: 2,
+            layers_reused: 1,
+            final_layer_digest: Some("sha256:abc".to_string()),
+            reused_digests: vec!["sha256:old".to_string()],
+        });
+        let value = serde_json::to_value(&dto).expect("receipt serializes");
+
+        assert_eq!(value["bytesUploaded"], 10);
+        assert_eq!(value["durationMs"], 5);
+        assert_eq!(value["layersUploaded"], 2);
+        assert_eq!(value["layersReused"], 1);
+        assert_eq!(value["finalLayerDigest"], "sha256:abc");
+        assert!(
+            value.get("reusedDigests").is_none(),
+            "internal reused digests never cross the wire"
+        );
+    }
 
     #[test]
     fn snapshot_info_includes_published_rootfs_image_ref() {
