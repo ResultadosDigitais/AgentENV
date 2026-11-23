@@ -1720,15 +1720,28 @@ async fn two_pauses_of_a_32g_sandbox_hold_the_base_plus_the_dirty_bytes() -> Res
         .await
         .context("first pause")?;
     let first_duration = started.elapsed();
-    let first_delta = pause_delta_bytes(&first);
+    let first_memory_delta =
+        allocated_bytes_deduped([first.join("mem_overlaybd").join("overlaybd.commit")]);
+    let first_rootfs_delta =
+        allocated_bytes_deduped([first.join("rootfs").join("snapshot.commit")]);
+    let first_delta = first_memory_delta.saturating_add(first_rootfs_delta);
 
-    // The second pause must cross the bound, whatever the image size is: its
-    // ceiling is derived from what the first pause actually wrote.
+    // The second pause must cross the bound on BOTH chains, and the absolute
+    // ceiling judges each chain on its own: after the second pause a chain holds
+    // the generation it inherited plus the delta it wrote, roughly twice its own
+    // first delta. A ceiling above the sum of the two would therefore leave both
+    // chains inside their bound, the pause would adopt instead of deferring, and
+    // no work order would reach the worker — which is exactly a run where the
+    // memory chain crosses and the rootfs one does not. Bounding the ceiling by
+    // the smaller delta keeps it below either chain's second-pause suffix, so
+    // both are deferred and the worker is the only one that compacts and frees
+    // them.
+    let second_ceiling = first_memory_delta.min(first_rootfs_delta);
     anyhow::ensure!(
-        first_delta > 0,
-        "the first pause must write a memory or rootfs delta to measure"
+        second_ceiling > 0,
+        "the first pause must write a memory and a rootfs delta to bound both chains: \
+         memory {first_memory_delta}, rootfs {first_rootfs_delta}"
     );
-    let second_ceiling = first_delta.saturating_mul(3) / 2;
     let mut resumed = FirecrackerSandbox::from_snapshot_config(&first_snapshot)?
         .with_chain_bytes_ceiling(second_ceiling)
         .with_rootfs_chain_disk_multiple(0)
@@ -1744,13 +1757,20 @@ async fn two_pauses_of_a_32g_sandbox_hold_the_base_plus_the_dirty_bytes() -> Res
     let second_duration = started.elapsed();
     let second_delta = pause_delta_bytes(&second);
 
-    // The second pause crossed the bound, so it left the rewrite behind: the
-    // delta it wrote is still there and no compacted layer exists yet.
+    // The second pause crossed the bound on both chains, so it left the rewrite
+    // behind: the delta it wrote is still there, no compacted layer exists yet,
+    // and a durable work order per chain names the layers the worker must fold.
+    // Proving the work order here keeps a fixture that stopped crossing the
+    // bound from failing later on a delta that was never supposed to move.
     anyhow::ensure!(
         second.join("mem_overlaybd/overlaybd.commit").is_file()
-            || second.join("rootfs/snapshot.commit").is_file(),
-        "the second pause must write its deltas"
+            && second.join("rootfs/snapshot.commit").is_file(),
+        "the second pause must write both the memory and the rootfs delta"
     );
+    deferred_chain_evidence(&second, "mem_image.json", "mem_compacted.commit")
+        .context("the memory chain must leave a deferred compaction work order")?;
+    deferred_chain_evidence(&second.join("rootfs"), "image.json", "managed-base.commit")
+        .context("the rootfs chain must leave a deferred compaction work order")?;
     let deltas_before = second_delta;
     let leftover_before = deltas_before;
 
@@ -1770,6 +1790,14 @@ async fn two_pauses_of_a_32g_sandbox_hold_the_base_plus_the_dirty_bytes() -> Res
     for _ in 0..4 {
         let report = worker.run_once(std::slice::from_ref(&candidate)).await;
         passes += 1;
+        // A refusal is a different failure from a chain that never deferred: the
+        // worker kept the work order because the node could not prove it holds
+        // the transient bytes, and the deltas stay on purpose. Naming it keeps
+        // the next red run from reading as a reclaim defect.
+        anyhow::ensure!(
+            report.headroom_refused == 0,
+            "the worker refused a deferred rewrite for lack of transient disk: {report:?}"
+        );
         if report == Default::default() {
             break;
         }
