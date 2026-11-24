@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "../searchindex-8bb79b5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-a4c8b175.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -297,10 +297,11 @@ PVM currently requires x86_64 and the <code>kvm_pvm</code> host module.</p>
 </thead>
 <tbody>
 <tr><td>API layer</td><td><code>src/api/</code></td><td>Axum HTTP server, OpenAPI endpoints, reverse proxy to sandbox services, node/admin APIs</td></tr>
-<tr><td>Orchestrator</td><td><code>src/orchestrator/</code></td><td>Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts</td></tr>
+<tr><td>Orchestrator</td><td><code>src/orchestrator/</code></td><td>Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Publishing, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts</td></tr>
 <tr><td>Observability</td><td><code>src/observability/</code></td><td>Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting</td></tr>
 <tr><td>Sandbox</td><td><code>src/sandbox/</code></td><td>Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools</td></tr>
 <tr><td>Snapshot + Template Builder</td><td><code>src/snapshot/</code>, <code>src/template/</code></td><td><code>src/snapshot/</code> owns committed snapshot storage/runtime resolution; <code>src/template/</code> provides the user-facing builder that publishes snapshots</td></tr>
+<tr><td>Repository maintenance</td><td><code>src/maintenance/</code></td><td>Operations no single catalog owns. Today: collecting managed layers no catalog record cites, in report or enforce mode, under a repository lock. It sits above the catalogs because <code>repository</code> may not import them and <code>snapshot</code> may not import <code>volume</code></td></tr>
 <tr><td>P2P artifact transport</td><td><code>src/p2p/</code></td><td>Optional project-wide artifact lookup, publish, and fetch layer with disabled and iroh-backed transports</td></tr>
 <tr><td>Config</td><td><code>src/cfg.rs</code></td><td>TOML config for firecracker paths, machine specs, timeouts, shared pool tuning, observability metadata, P2P, and scheduler-report settings</td></tr>
 </tbody>

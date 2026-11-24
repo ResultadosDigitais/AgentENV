@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "searchindex-8bb79b5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-d7504e7d.js"></script>
+        <script src="toc-a4c8b175.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -331,8 +331,9 @@ network; 10 Gbps or faster is strongly recommended.</li>
 vim config.toml
 </code></pre>
 <h2 id="2-configure-shared-storage"><a class="header" href="#2-configure-shared-storage">2. Configure shared storage</a></h2>
-<p>AgentENV supports two shared storage backends: POSIXFS and OSS. Choose one of
-the following options.</p>
+<p>AgentENV supports three shared storage backends: POSIXFS, OSS (S3-compatible
+object storage) and GCS (Google Cloud Storage). Choose one of the following
+options.</p>
 <h3 id="option-a-posixfs"><a class="header" href="#option-a-posixfs">Option A: POSIXFS</a></h3>
 <p>Enable the POSIXFS backend, set the shared snapshot location, and increase the
 remote-block cache:</p>
@@ -367,6 +368,26 @@ max_size_gb = 100
 example <a href="https://www.tigrisdata.com/docs/">Tigris</a> or a Cloudflare R2
 deployment — also set <code>addressing_style = "virtual"</code>; see the
 <a href="#backendoss">configuration reference</a> for details.</p>
+<h3 id="option-c-gcs"><a class="header" href="#option-c-gcs">Option C: GCS</a></h3>
+<p>Enable the GCS backend, name the bucket and point <code>credential_path</code> at a
+service-account key or a Workload Identity Federation <code>external_account</code> file:</p>
+<pre><code class="language-toml">[snapshot]
+repository_backend = "gcs"
+
+[backend.gcs]
+bucket = "YOUR_BUCKET"
+prefix = "YOUR_PREFIX"
+credential_path = "/etc/agentenv/gcp/credential.json"
+cache_max_size_gb = 100
+
+[image.cache.remote_blocks]
+max_size_gb = 100
+</code></pre>
+<p>On Kubernetes, follow the
+<a href="#kubernetes-setup">Kubernetes setup</a> so that
+sandboxes cannot reach the credentials. See the
+<a href="#backendgcs">configuration reference</a> for all
+options.</p>
 <h2 id="3-apply-the-configuration"><a class="header" href="#3-apply-the-configuration">3. Apply the configuration</a></h2>
 <p>If AgentENV is running as a systemd service, restart it:</p>
 <pre><code class="language-bash">sudo systemctl restart aenv
@@ -1094,6 +1115,11 @@ that fact and can be skipped.</p>
   }
 }
 </code></pre>
+<p>Static discovery has no Kubernetes node object, so <code>memory_capacity_source</code>
+resolves to <code>total</code> and the admission ceiling keeps the historical
+<code>memory_total</code> math. <code>GET /nodes</code> still publishes the per-layer verdict
+(<code>admission</code> object) computed by the same capacity rule, and a paused-sandbox
+resume goes through that rule before it is proxied.</p>
 <p>Protect the configuration after editing it:</p>
 <pre><code class="language-bash">sudo chown root:agentenv-control /etc/agentenv/control-plane.json
 sudo chmod 0640 /etc/agentenv/control-plane.json
@@ -1312,6 +1338,15 @@ make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 </code></pre>
 <h2 id="service-discovery"><a class="header" href="#service-discovery">Service Discovery</a></h2>
 <p>The scheduler watches EndpointSlices for the headless <code>agentenv-nodes</code> Service and watches Pods for optional label-based discovery policy. It schedules only serving, non-terminating DaemonSet Pods. Pods matching <code>scheduler.discovery.kubernetes.no_schedule_pod_selector</code> stay discoverable as lingering/no-schedule nodes, while Pods matching <code>scheduler.discovery.kubernetes.ignore_pod_selector</code> are excluded. Both IPv4 and IPv6 endpoint addresses are supported.</p>
+<p>The scheduler also watches cluster-scoped Nodes to read <code>status.allocatable.memory</code> for the admission ceiling (<code>memory_capacity_source: allocatable</code>, the default): the ceiling is the allocatable memory minus the runtime overhead, with <code>memory_total</code> as the fallback. This needs a read-only cluster-scoped <code>ClusterRole</code> with <code>get</code>, <code>list</code> and <code>watch</code> on <code>nodes</code> only, bound to the <code>agentenv-scheduler</code> ServiceAccount; the namespaced Role for EndpointSlices and Pods is unchanged. <code>GET /nodes</code> publishes the per-layer verdict in an <code>admission</code> object, and <code>POST /sandboxes/{id}/resume</code> is gated by the same rule (a deferred resume is <code>503</code> with <code>Retry-After</code>).</p>
+<p><code>max_memory_used_percent</code> compares the raw cgroup <code>memory.current</code> of the runtime by default (<code>memory_used_meter: raw</code>), which includes page cache. Two other meters read figures the runtime publishes in the heartbeat next to the unchanged <code>memoryUsedBytes</code>:</p>
+<ul>
+<li><code>memory_used_meter: working_set</code> compares <code>memoryWorkingSetBytes</code> (<code>memory.current</code> minus <code>inactive_file</code>, the figure kubelet reports).</li>
+<li><code>memory_used_meter: unreclaimable</code> compares <code>memoryUnreclaimableBytes</code>, the memory the runtime cgroup cannot give back: <code>anon</code> + <code>file_mapped</code> + <code>shmem</code> + <code>file_dirty</code> + <code>file_writeback</code> plus the unreclaimable kernel pages (<code>kernel_stack</code>, <code>pagetables</code>, <code>percpu</code>, <code>sock</code>, <code>slab_unreclaimable</code>). <code>MemAvailable</code> is not used because it treats <code>file_mapped</code> as reclaimable, and here the mapped pages are restored VM memory. This is the meter that reflects the node’s real occupancy when the runtime holds a large active page cache.</li>
+</ul>
+<p>The meters chain down for a node that does not report the selected field, so a mixed fleet during the rollout is never admitted free: <code>unreclaimable</code> falls back to the working set and then to raw, and <code>working_set</code> falls back to raw. The scheduler logs <code>scheduler memory meter fell back</code> with <code>node_id</code>, <code>configured_meter</code>, <code>meter</code> and <code>reason</code> (<code>memory_unreclaimable_bytes_absent</code> or <code>memory_working_set_bytes_absent</code>), and every <code>scheduler rejected node by resource limit</code> line carries the <code>meter</code> that produced the node figure.</p>
+<p>Under <code>unreclaimable</code> the admission ceiling does not subtract the raw runtime overhead from the capacity base: the figure already counts the runtime’s own pages in the numerator, so subtracting <code>memory_used - allocated</code> again would collapse the base with the page cache. With <code>memory_capacity_source: allocatable</code> the base is <code>min(allocatable, memory_total)</code> and <code>GET /nodes</code> publishes <code>runtimeOverheadBytes: 0</code>, so the decision stays reproducible.</p>
+<p>Roll out the runtime image before the scheduler: confirm <code>memoryUnreclaimableBytes</code> appears in <code>GET /nodes</code> for every node, then set <code>memory_used_meter: unreclaimable</code>. Rollback is config-only: set the value back to <code>working_set</code> or <code>raw</code>, with no runtime deploy and no migration. An unknown value is rejected at startup.</p>
 <blockquote>
 <p>Sandbox bindings remain in-memory, so the scheduler should run as a single replica. Bindings are lost on restart.</p>
 </blockquote>
@@ -2418,6 +2453,191 @@ redirected.</p>
 <p>Deletion is permanent, but snapshots
 previously created from the sandbox are unaffected.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sandbox-resources-and-live-resize"><a class="header" href="#sandbox-resources-and-live-resize">Sandbox Resources and Live Resize</a></h1>
+<p>A sandbox has two sets of CPU and memory numbers:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Meaning</th><th>Changes when</th></tr>
+</thead>
+<tbody>
+<tr><td><code>maxCpuCount</code>, <code>maxMemoryMB</code></td><td>The <strong>VM shape</strong>: vCPUs and guest memory Firecracker was configured with when the VM first booted (template build or cold start)</td><td>Never, for the life of that VM and every restore of it</td></tr>
+<tr><td><code>cpuCount</code>, <code>memoryMB</code></td><td>The <strong>effective limits</strong>: how much of the shape the sandbox may use</td><td>On create (<code>cpuCount</code>/<code>memoryMB</code> in <code>NewSandbox</code>) and live, through <code>PATCH /sandboxes/{sandboxID}/resources</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Live resize moves the effective limits anywhere inside the VM shape. It does
+not change the shape. Node accounting (<code>allocatedCPU</code>, <code>allocatedMemoryBytes</code>),
+lifecycle events, and <code>cpuCount</code>/<code>memoryMB</code> in <code>GET /sandboxes/{sandboxID}</code>
+and the sandbox lists report the effective limits.</p>
+<p>The feature is off by default; enable it per node with
+<a href="#resize"><code>[resize]</code></a>.</p>
+<h2 id="why-the-shape-is-fixed"><a class="header" href="#why-the-shape-is-fixed">Why the shape is fixed</a></h2>
+<p>AgentENV runs Firecracker 1.15 (<code>config/deps_manifest.toml</code>). What it offers
+for changing a VM’s resources:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mechanism</th><th>Firecracker 1.15</th><th>Used</th></tr>
+</thead>
+<tbody>
+<tr><td>vCPU hotplug</td><td>Not supported. <code>PUT /machine-config</code> is pre-boot only and the API has no vCPU hotplug endpoint</td><td>No</td></tr>
+<tr><td>Changing guest memory size</td><td><code>PUT /machine-config</code> is pre-boot only</td><td>No</td></tr>
+<tr><td>Restoring a snapshot onto a different shape</td><td>Not possible: the VM state file holds every vCPU’s registers and the guest memory regions, so a restore recreates the original shape</td><td>No</td></tr>
+<tr><td>virtio-mem memory hotplug (<code>/hotplug/memory</code>)</td><td>Available since 1.14, but the device and its hotpluggable region must be configured before <code>InstanceStart</code>, so only VMs booted with it can grow</td><td>Not yet, see <a href="#future-work">Future work</a></td></tr>
+<tr><td>virtio-balloon (<code>PATCH /balloon</code>)</td><td>Works on running and restored VMs</td><td>Memory limits</td></tr>
+<tr><td>cgroup v2 <code>cpu.max</code> on the VMM process</td><td>Host kernel feature, independent of Firecracker</td><td>CPU limits</td></tr>
+</tbody>
+</table>
+</div>
+<p>Every VM AgentENV boots already has a virtio-balloon device (it enables free
+page reporting), so memory limits work for templates built by earlier
+releases too. A real shape change needs a new VM: capture the rootfs, then
+cold-start or build a template with the larger shape. Processes do not
+survive that; it is a reboot, not a live resize.</p>
+<h2 id="how-limits-are-enforced"><a class="header" href="#how-limits-are-enforced">How limits are enforced</a></h2>
+<pre class="mermaid">flowchart LR
+    API["PATCH /sandboxes/{id}/resources"] --&gt; ORCH["Orchestrator: validate, admit, persist"]
+    ORCH --&gt;|cpuCount &lt; maxCpuCount| CG["cgroup v2 cpu.max on the VMM process"]
+    ORCH --&gt;|memoryMB &lt; maxMemoryMB| BAL["PATCH /balloon amount_mib = maxMemoryMB - memoryMB"]
+    BAL --&gt; GUEST["guest virtio_balloon driver inflates/deflates"]
+</pre>
+
+<p><strong>CPU.</strong> A sandbox below its vCPU count gets its own cgroup, and its
+Firecracker process moves into it with
+<code>cpu.max = "&lt;cpuCount × 100000&gt; 100000"</code>: <code>cpuCount</code> vCPUs worth of CPU time
+per 100 ms period, shared by the vCPU threads and the VMM’s device emulation
+threads. Raising <code>cpuCount</code> back to the vCPU count writes <code>max</code>. Sandboxes
+never limited below their vCPU count never get a cgroup.</p>
+<p>The cgroups live in a threaded subtree under the server’s own cgroup:</p>
+<pre><code class="language-text">&lt;server cgroup&gt;              domain threaded; keeps the server's processes
+└── agentenv-sandboxes       threaded, +cpu
+    └── &lt;sandbox id&gt;         threaded, cpu.max
+</code></pre>
+<p>A cgroup that holds processes cannot enable controllers for its children
+(cgroup v2 “no internal processes”), but a threaded subtree is exempt, so the
+server does not have to move out of its container cgroup and runtimes can
+still exec into it. Memory and I/O stay accounted to the server’s cgroup as
+before. This needs a writable, delegated cgroup v2 hierarchy with the <code>cpu</code>
+controller: a Kubernetes container running privileged (as the bundled
+DaemonSet does), or a systemd unit with <code>Delegate=yes</code>. When the server cannot
+set it up at startup, it logs a warning and only memory can be resized.</p>
+<p><strong>Memory.</strong> The balloon is asked to hold <code>maxMemoryMB - memoryMB</code>. The guest’s
+virtio-balloon driver allocates that much memory and hands it to Firecracker,
+which releases it on the host; deflating gives it back.</p>
+<p><strong>Lifecycle.</strong></p>
+<ul>
+<li><em>Create from a template or snapshot</em>: <code>cpuCount</code>/<code>memoryMB</code> default to the
+snapshot’s shape and may not exceed it. The limits are enforced before the
+create returns. A snapshot captured from a resized sandbox records the VM
+shape, not the limits, so sandboxes launched from it get whole VMs unless
+they ask otherwise; the inherited balloon target is reset on launch.</li>
+<li><em>Cold start</em> (<code>POST /sandboxes-cold</code>): <code>cpuCount</code>/<code>memoryMB</code> define the VM
+shape; the sandbox can then be resized down and back up.</li>
+<li><em>Pause/resume</em>: the limits are kept and enforced again on resume (the CPU
+cgroup belongs to the VMM process, which is new after a resume).</li>
+<li><em>Fork</em>: children inherit the source’s shape and limits.</li>
+<li><em>Template builds</em> always run with their whole VM.</li>
+</ul>
+<h2 id="api"><a class="header" href="#api">API</a></h2>
+<p>Create below the template’s shape (the node needs <code>[resize].enabled</code>):</p>
+<pre><code class="language-bash">curl -X POST "$AENV_API_URL/v2/sandboxes" -H "X-API-Key: $AENV_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"templateID": "my-template", "cpuCount": 2, "memoryMB": 4096}'
+</code></pre>
+<p>Resize a running sandbox; an omitted field keeps its value:</p>
+<pre><code class="language-bash">curl -X PATCH "$AENV_API_URL/sandboxes/$SANDBOX_ID/resources" \
+  -H "X-API-Key: $AENV_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"cpuCount": 4, "memoryMB": 8192}'
+</code></pre>
+<p>The response, also returned by <code>GET /sandboxes/{sandboxID}/resources</code>:</p>
+<pre><code class="language-json">{
+  "cpuCount": 4, "memoryMB": 8192,
+  "maxCpuCount": 8, "maxMemoryMB": 16384,
+  "cpuQuota": 4,
+  "balloonTargetMB": 8192, "balloonActualMB": 6144,
+  "memoryState": "converging"
+}
+</code></pre>
+<p>The PATCH returns once the VMM enforces the new limits. The guest then moves
+the balloon; <code>memoryState</code> reports <code>converged</code>, <code>converging</code>, or
+<code>unobservable</code> (sandbox not running, or a VM booted without balloon
+statistics, see <code>[machine.balloon].stats_polling_interval_s</code>). A balloon
+deflated to zero is reported <code>converged</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>When</th></tr>
+</thead>
+<tbody>
+<tr><td>200</td><td>The VMM enforces the new limits</td></tr>
+<tr><td>400</td><td>Resize is disabled on the node; a value is below its minimum (<code>cpuCount</code> 1, <code>memoryMB</code> <code>[resize].min_memory_mib</code>) or above the VM shape; or <code>cpuCount</code> is below the vCPU count on a node without the CPU quota. Retrying the same request cannot succeed</td></tr>
+<tr><td>404</td><td>No such sandbox</td></tr>
+<tr><td>409</td><td>The sandbox is not running, another operation holds it, or the growth exceeds <code>[resize].max_cpu_allocated_percent</code> / <code>max_memory_allocated_percent</code> of the node</td></tr>
+<tr><td>500</td><td>The VMM rejected the limits; the previous ones were applied again</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>NewSandbox</code>/<code>NewSandboxV2</code> return 400 for the same validation failures.</p>
+<h2 id="limits"><a class="header" href="#limits">Limits</a></h2>
+<ul>
+<li><strong>The shape is the ceiling.</strong> A sandbox cannot grow past the template it was
+launched from. To allow growth, build templates with headroom and launch
+smaller. Headroom is not free: the guest kernel reserves about 1.6% of the
+VM’s memory for page metadata (64 bytes per 4 KiB page) whatever the limit,
+and idle vCPUs cost little but not nothing.</li>
+<li><strong>The guest still sees every vCPU.</strong> The CPU limit is CPU time, not CPU
+count: <code>nproc</code> reports <code>maxCpuCount</code>, thread pools sized from it
+oversubscribe the quota, and a workload that hits the quota is throttled at
+100 ms granularity, which shows up as latency.</li>
+<li><strong>Memory limits need the guest’s cooperation.</strong> The balloon works through
+the guest’s <code>virtio_balloon</code> driver; a guest that unloads it keeps its
+memory. Whether the limit is hard depends on how the VM first booted:
+<ul>
+<li><code>deflate_on_oom = true</code> (every VM booted before this change, and the
+default) lets the guest take balloon memory back under memory pressure, so
+the limit is advisory. The guest’s <code>MemTotal</code> does not shrink.</li>
+<li>With <code>[machine.balloon].deflate_on_oom = false</code> the guest cannot, so a
+workload that outgrows the limit is OOM-killed inside the guest, as on a
+VM of that size. Templates must be rebuilt to get this.</li>
+</ul>
+</li>
+<li><strong>Shrinking below the working set does not complete.</strong> The balloon can only
+take memory the guest can free; <code>memoryState</code> stays <code>converging</code> (with
+statistics) while the guest holds on to it.</li>
+<li><strong>Progress needs balloon statistics,</strong> which are fixed at first boot
+(<code>[machine.balloon].stats_polling_interval_s</code>). Without them the API reports
+the target but not how much the balloon holds.</li>
+<li><strong>Only running sandboxes can be resized.</strong> Resume, then resize.</li>
+<li><strong>Admission is node-local and best-effort.</strong> The scheduler places creates;
+each node checks only growth it is asked for, against its own CPUs and
+<code>MemTotal</code>, and concurrent creates are not counted until they register.</li>
+<li><strong>CPU limits need the cgroup v2 quota.</strong> Without it, only memory can be
+resized and <code>cpuCount</code> must equal the vCPU count.</li>
+<li><strong>Turning <code>[resize]</code> off</strong> with limited sandboxes on the node keeps their
+balloon targets (they live in the VM state) but drops their CPU quotas at the
+next resume.</li>
+<li>Disk size is not part of live resize.</li>
+</ul>
+<h2 id="future-work"><a class="header" href="#future-work">Future work</a></h2>
+<ul>
+<li><strong>Growing past the boot memory with virtio-mem.</strong> Boot templates with a
+hotpluggable region (<code>PUT /hotplug/memory</code>) and plug memory on demand. The
+bundled guest kernel (<code>vmlinux-6.1.175</code>) already has the virtio-mem driver
+and memory hot-remove (<code>virtio_mem_probe</code>, <code>offline_and_remove_memory</code> are
+in its symbol table). The missing pieces are VMM-side: configuring the
+device at template build, the <code>memhp_default_state</code> boot argument, and
+teaching the memory snapshot pipeline (dirty-range packaging and
+ublk-backed restore) the hotplug region, which Firecracker stores as sparse
+holes.</li>
+<li><strong>Accurate <code>nproc</code>.</strong> Offline the guest’s surplus vCPUs through envd
+(<code>/sys/devices/system/cpu/cpuN/online</code>; the guest kernel has CPU hotplug) in
+addition to the quota. Guest root can bring them back, so it complements the
+quota rather than replacing it.</li>
+<li><strong>Shape change by reboot.</strong> Capture the rootfs and cold-start a new VM with
+the requested shape, for callers that accept losing process state.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="auto-eviction"><a class="header" href="#auto-eviction">Auto-Eviction</a></h1>
 <p>Every running sandbox has a time-to-live (TTL). The TTL establishes an
 expiration deadline so a sandbox cannot occupy CPU and memory indefinitely.
@@ -2860,6 +3080,11 @@ the template ID is an alias that resolves to it.</li>
 <li><strong>Warm-started sandboxes</strong> restore the state of a committed template or snapshot.</li>
 <li><strong>Running sandboxes</strong> can produce new snapshots, capturing their current
 state for later reuse or branching.</li>
+<li><strong>Paused sandboxes</strong> can be published as a durable snapshot from the artifacts
+their last pause already wrote, without resuming the VM. The publication is
+incremental: layers already in the repository are reused by digest, so only
+the new ones are uploaded. Publishing a paused sandbox never resumes it; it
+stays paused afterward.</li>
 </ul>
 <h2 id="what-a-snapshot-preserves"><a class="header" href="#what-a-snapshot-preserves">What a Snapshot Preserves</a></h2>
 <p>A snapshot preserves:</p>
@@ -2876,14 +3101,15 @@ environment variables, working directory, user, and startup commands.</li>
 <hr>
 <p>Where to Go Next:</p>
 <ul>
-<li><a href="#create-a-snapshot-from-a-running-sandbox">Create a Snapshot</a> — capture a reusable checkpoint from a running sandbox.</li>
+<li><a href="#create-a-snapshot-from-a-running-or-paused-sandbox">Create a Snapshot</a> — capture a reusable checkpoint from a running or a paused sandbox.</li>
 <li><a href="#manage-snapshots">Manage Snapshots</a> — list, inspect, and delete snapshots.</li>
 <li><a href="#use-a-snapshot-rootfs-as-an-oci-image">Rootfs as an OCI Image</a> — publish or export only the captured root filesystem.</li>
 <li><a href="#optional-p2p-visibility">Optional P2P Visibility</a> — accelerate committed snapshot artifact distribution between nodes.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="create-a-snapshot-from-a-running-sandbox"><a class="header" href="#create-a-snapshot-from-a-running-sandbox">Create a Snapshot from a Running Sandbox</a></h1>
-<p>Capture the current state of a running sandbox:</p>
+<h1 id="create-a-snapshot-from-a-running-or-paused-sandbox"><a class="header" href="#create-a-snapshot-from-a-running-or-paused-sandbox">Create a Snapshot from a Running or Paused Sandbox</a></h1>
+<p>Capture the current state of a running sandbox, or publish the artifacts that a
+paused sandbox already wrote in its last pause:</p>
 <pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
 aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
 </code></pre>
@@ -2893,14 +3119,19 @@ aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
 <tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the running sandbox to capture.</td></tr>
+<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the running or paused sandbox to capture.</td></tr>
 <tr><td><code>--name &lt;name&gt;</code></td><td>None</td><td>Assigns a human-readable alias. If omitted, use the generated snapshot ID returned by the command.</td></tr>
 </tbody>
 </table>
 </div>
-<p>The source sandbox continues running after the snapshot is created. Continue
-with <a href="#use-a-snapshot-rootfs-as-an-oci-image">Use a Snapshot</a> to restore it or publish its rootfs as an OCI
-image.</p>
+<p>A <strong>running</strong> source continues running after the snapshot is created. A
+<strong>paused</strong> source is published from its existing pause artifacts: the VM is
+never resumed and its memory is not reconverted, the sandbox stays paused, and
+only layers the repository does not already hold are uploaded. The creation
+response carries a <code>publishReceipt</code> with the bytes uploaded, the duration, the
+layers uploaded and reused, and the digest of the newest memory layer.</p>
+<p>Continue with <a href="#use-a-snapshot-rootfs-as-an-oci-image">Use a Snapshot</a> to restore it or publish its rootfs as
+an OCI image.</p>
 <p>You can then pass either the snapshot ID or its alias to <code>aenv start</code>:</p>
 <pre><code class="language-bash">aenv start my-checkpoint
 # Or:
@@ -3570,6 +3801,25 @@ file.</p>
 <code>config/deps_manifest.toml</code>. Only the dependencies for the selected mode are
 installed. User configuration should contain runtime behavior and explicit
 local path overrides, not the default dependency catalog.</p>
+<p>The <code>firecracker</code> and <code>kernel</code> catalog entries also carry a <code>sha256</code> pin per
+target architecture. Setup hashes the artifact while downloading it and fails
+closed when the digest differs: the temporary file is removed and nothing is
+installed. A <code>version</code> override selects different bytes and therefore disables
+the bundled pin; a <code>url</code> override alone keeps it, so a mirror must serve the
+same release. An entry without a pin for the current architecture also fails
+closed instead of downloading unverified.</p>
+<p>The scheduler image does not download build-time dependencies from GitHub
+releases. <code>deploy/cloudbuild/agentenv-build-deps.cloudbuild.yaml</code> stages
+<code>grpc_health_probe</code>, the pinned <code>firecracker</code> release tarball and the kernel
+once, verifies every file against <code>config/build_deps.lock.toml</code>, and publishes
+the <code>us-central1-docker.pkg.dev/rd-sre-stg-01/agentenv/agentenv-build-deps</code>
+image. <code>deploy/docker/Dockerfile.scheduler</code> copies the probe from that image by
+digest and re-checks its <code>sha256</code> inside the build. To renew a pin, update the
+entry in both <code>config/build_deps.lock.toml</code> and <code>config/deps_manifest.toml</code>, run
+the Cloud Build command in that config’s header, and commit the digest it
+prints. The <code>docker-compose</code> e2e still resolves these assets through this
+catalog at setup time; moving it to the reserve image is a follow-up that needs
+Workload Identity Federation for the GitHub runner.</p>
 <h2 id="firecracker"><a class="header" href="#firecracker"><code>[firecracker]</code></a></h2>
 <p>Firecracker VM binary and boot configuration.</p>
 <div class="table-wrapper">
@@ -3867,6 +4117,48 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </tbody>
 </table>
 </div>
+<h2 id="machineballoon"><a class="header" href="#machineballoon"><code>[machine.balloon]</code></a></h2>
+<p>The virtio-balloon device a VM gets when it first boots (cold starts and template builds). A VM restored from a snapshot keeps the device its snapshot was taken with, so a change reaches existing templates only after they are rebuilt. See <a href="#sandbox-resources-and-live-resize">Sandbox Resources</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>deflate_on_oom</code></td><td>boolean</td><td><code>true</code></td><td>Let the guest take balloon memory back under memory pressure. <code>true</code> makes a memory limit below the VM shape advisory; <code>false</code> enforces it, so a guest that outgrows the limit OOM-kills inside it</td></tr>
+<tr><td><code>stats_polling_interval_s</code></td><td>integer</td><td><code>0</code></td><td>Balloon statistics polling interval in seconds; <code>0</code> disables them. Without statistics the resources API reports the balloon target but not how much memory the balloon actually holds</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="memory_containment"><a class="header" href="#memory_containment"><code>[memory_containment]</code></a></h2>
+<p>One cgroup v2 domain per microVM. The memory controller only distributes to domain children and a cgroup that holds processes cannot delegate it, so startup moves the runtime’s own processes into a leaf before preparing the subtree. If the node cannot provide it, the reason is logged and the runtime keeps the shared-pod behavior. See <a href="#memory-containment">Memory containment</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>Give every VMM its own cgroup v2 domain with <code>memory.max</code> equal to the VM shape and <code>memory.high</code> below it, so node memory pressure throttles or kills one VM instead of evicting the runtime pod</td></tr>
+<tr><td><code>memory_high_ratio</code></td><td>number</td><td>unset</td><td><code>memory.high</code> as a fraction of <code>memory.max</code>, strictly between 0 and 1. Required when <code>enabled</code> is true; the fraction is measured per node, so there is no default</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="resize"><a class="header" href="#resize"><code>[resize]</code></a></h2>
+<p>Per-sandbox CPU and memory inside the VM shape: <code>cpuCount</code>/<code>memoryMB</code> on snapshot-based creates and live resize through <code>PATCH /sandboxes/{sandboxID}/resources</code>. See <a href="#sandbox-resources-and-live-resize">Sandbox Resources</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>Accept per-sandbox resources below the VM shape and live resize</td></tr>
+<tr><td><code>cpu_quota</code></td><td>boolean</td><td><code>true</code></td><td>Enforce CPU limits below the VM shape with a cgroup v2 <code>cpu.max</code> quota on each VMM process. Needs a writable, delegated cgroup v2 hierarchy with the <code>cpu</code> controller; when setup fails at startup only memory can be resized</td></tr>
+<tr><td><code>min_memory_mib</code></td><td>integer</td><td><code>512</code></td><td>Smallest effective guest memory in MiB</td></tr>
+<tr><td><code>max_cpu_allocated_percent</code></td><td>integer</td><td>unset</td><td>Reject a resize that grows a sandbox when the CPUs allocated to running sandboxes would exceed this percentage of the node’s CPUs</td></tr>
+<tr><td><code>max_memory_allocated_percent</code></td><td>integer</td><td>unset</td><td>Reject a resize that grows a sandbox when the memory allocated to running sandboxes would exceed this percentage of the node’s memory</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="envd"><a class="header" href="#envd"><code>[envd]</code></a></h2>
 <p>In-guest <code>envd</code> daemon settings.</p>
 <div class="table-wrapper">
@@ -3921,6 +4213,11 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tr><td><code>default_sandbox_timeout_secs</code></td><td>integer</td><td><code>15</code></td><td>Default keep-alive timeout for sandboxes</td></tr>
 <tr><td><code>auto_resume_min_sandbox_timeout_secs</code></td><td>integer</td><td><code>300</code></td><td>When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration</td></tr>
 <tr><td><code>persisted_sandbox_store_path</code></td><td>string</td><td><code>"$AENV_HOME/persisted-sandboxes"</code></td><td>Directory for persisted sandbox state</td></tr>
+<tr><td><code>chain_bytes_ceiling</code></td><td>integer (bytes)</td><td><code>51539607552</code> (48 GiB)</td><td>Ceiling for the reclaimable part of one sandbox’s paused artifact chain: its runtime-owned overlaybd generations plus the layer each pause appends. The image-derived stable prefix is reported but not charged, since every sandbox of an image shares those files. A pause that would exceed it does not pay the rewrite: when admission allows (see <code>deferred_compaction_max_concurrent</code> and <code>deferred_compaction_pending_bytes_budget</code>) it adopts the runtime-owned suffix into the generation and leaves a durable <code>deferred-compaction.json</code> beside the image config, and the maintenance worker compacts afterwards; otherwise it compacts the runtime-owned generations into one inline, as before. Either way the stale-generation sweep runs, and the pass that finished the rewrite also frees the copies it replaced, so a compacted generation holds one copy per chain instead of the compacted layer plus the delta it folded; a reclaimable part that stays above the ceiling on the inline path fails with the recoverable <code>CHAIN_BYTES_CEILING_EXCEEDED</code>, the sandbox is resumed in place and keeps running and serving. A pre-flight that already fits skips the post-compaction rejection. <code>0</code> disables the ceiling, the pre-flight and the sweep. The default is provisional, derived from the OPSAI-5494 staging measurement.</td></tr>
+<tr><td><code>rootfs_chain_disk_multiple</code></td><td>integer</td><td><code>2</code></td><td>Relative bound for the whole deduplicated rootfs chain of one sandbox — its immutable stable prefix plus its runtime-owned generations — as a multiple of the guest rootfs disk. This is a second, independent bound, not a replacement: <code>chain_bytes_ceiling</code> protects the node’s disk by capping the reclaimable part, while this one is the invariant that a 64 GiB guest disk cannot leave a 144 GiB chain behind. A pause over either bound compacts the runtime-owned suffix; after compaction the pause is refused with the recoverable <code>ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED</code> only when the whole chain is still above <code>multiple × disk</code>. Only <code>rootfs</code> sets this bound; drive, volume and memory chains keep the absolute ceiling alone. The pre-flight measures both bounds and never refuses. <code>0</code> disables the relative bound. The default <code>2</code> is the floor for admitting a fully allocated disk: the immutable prefix and one complete compacted generation can each approach the disk size, so <code>2 × disk</code> is the smallest multiple that does not refuse a legitimate pause. The incident of 05/11/2026 measured a 144 GB rootfs chain on a 64 GiB guest disk (2.25×), which this bound refuses and compacts; the three-or-more-cycle p50/p90/max distribution is recorded by the seven-day rollout check. Two times the disk admits <code>2 × 64 GiB = 128 GiB</code> for that disk, so the 48 GiB node budget is not reachable per sandbox while a full generation is live; that trade-off is deliberate and measured at rollout.</td></tr>
+<tr><td><code>paused_artifact_reap</code></td><td>string</td><td><code>"off"</code></td><td>Periodic sweep of <code>persisted_sandboxes/artifacts/</code> reclaiming a sandbox directory no record and no cluster list names any more: <code>off</code>, <code>report</code> (list and count only) or <code>enforce</code> (move to <code>artifacts/.trash/{epoch}/</code>, then delete after a second grace). A failed or unconfigured cluster list degrades a pass to a report. See <a href="#orchestrator-persistence">Orchestrator Persistence</a>.</td></tr>
+<tr><td><code>deferred_compaction_max_concurrent</code></td><td>integer</td><td><code>1</code></td><td>How many paused-chain compactions the maintenance worker may run at the same time on this node. A pause whose byte bound is crossed leaves a durable descriptor and returns, so it no longer pays the rewrite; the worker executes at most this many per pass and counts the remainder as queued. A pause that finds this budget full compacts inline, with the same recoverable refusals as before. A parameter, never a kill switch: the boot refuses <code>0</code>. PROVISIONAL default <code>1</code>: the 13/11/2026 measurement rewrote 12 GiB per pause on a 32 GiB VM and a compaction holds its inputs and its output on disk at once.</td></tr>
+<tr><td><code>deferred_compaction_pending_bytes_budget</code></td><td>integer (bytes)</td><td><code>103079215104</code> (96 GiB)</td><td>Transient bytes of deferred compactions this node may have pending (queued plus in flight); a pause whose compaction would cross it compacts inline. The transient bound of one entry is <code>compaction_transient_bytes</code>: the smaller of the device’s virtual size and its inputs’ allocated bytes, plus one eighth for index and metadata. PROVISIONAL default: two times the shipped 48 GiB ceiling — one output in flight plus one queued — from the OPSAI-5494 measurement. A parameter, never a kill switch: the boot refuses <code>0</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -3954,17 +4251,13 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tr><td><code>[pool.firecracker]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background Firecracker process maintenance worker</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Spawn warm Firecracker entries up to the low watermark during server startup</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>fill_concurrency</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of warm Firecracker processes created concurrently by one maintenance refill batch</td></tr>
+<tr><td><code>[pool.firecracker]</code></td><td><code>idle_ttl_secs</code></td><td>integer</td><td><code>600</code></td><td>Seconds without warm-process acquisitions before the refill target decays back to the low watermark and excess warm processes are drained (<code>0</code> disables decay)</td></tr>
 </tbody>
 </table>
 </div>
-<p>Validation rules:</p>
-<ul>
-<li><code>low_watermark &lt;= high_watermark</code></li>
-<li><code>[pool.firecracker].fill_concurrency &gt; 0</code></li>
-</ul>
+<p>Validation rules: <code>low_watermark &lt;= high_watermark</code>, and <code>[pool.firecracker].fill_concurrency &gt; 0</code>.</p>
 <h2 id="node_identity"><a class="header" href="#node_identity"><code>[node_identity]</code></a></h2>
-<p>Stable identity fields for this node. These values appear in node API responses
-and scheduler heartbeats.</p>
+<p>Stable identity fields for this node. These values appear in node API responses and scheduler heartbeats.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -3974,6 +4267,7 @@ and scheduler heartbeats.</p>
 <tr><td><code>node_id</code></td><td>string</td><td>hostname-derived</td><td>Stable node identifier returned by the admin/node APIs</td></tr>
 <tr><td><code>cluster_id</code></td><td>string (UUID)</td><td>nil UUID</td><td>Logical cluster identifier included in node snapshots</td></tr>
 <tr><td><code>service_instance_id</code></td><td>string</td><td>generated UUID</td><td>Unique process/service instance identifier for the current node runtime</td></tr>
+<tr><td><code>pool</code></td><td>string</td><td><code>""</code></td><td>Named node pool reported in the scheduler heartbeat. Empty keeps the node shared: it only receives sandboxes that did not ask for a pool. A pooled node only receives sandboxes that ask for its pool, and a sandbox that asks for a pool never falls back to another pool or to the shared nodes</td></tr>
 </tbody>
 </table>
 </div>
@@ -4068,7 +4362,7 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 </thead>
 <tbody>
 <tr><td><code>local_cache_path</code></td><td>string</td><td><code>"$AENV_HOME/snapshot-local-cache"</code></td><td>Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory.</td></tr>
-<tr><td><code>repository_backend</code></td><td>string</td><td><code>"posix_fs"</code></td><td>Snapshot repository backend. Supported values: <code>"posix_fs"</code> and <code>"oss"</code></td></tr>
+<tr><td><code>repository_backend</code></td><td>string</td><td><code>"posix_fs"</code></td><td>Snapshot repository backend. Supported values: <code>"posix_fs"</code>, <code>"oss"</code> and <code>"gcs"</code></td></tr>
 <tr><td><code>p2p_enabled</code></td><td>boolean</td><td><code>true</code></td><td>When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend.</td></tr>
 </tbody>
 </table>
@@ -4116,7 +4410,7 @@ record names the compressed bytes, so the raw digest key would never be
 looked up by consumers.</p>
 <h2 id="snapshotmemory_startup_pack"><a class="header" href="#snapshotmemory_startup_pack"><code>[snapshot.memory_startup_pack]</code></a></h2>
 <p>Optional startup-memory trace recording and best-effort prefetch for both
-<code>oss</code> and <code>posix_fs</code> repositories. It is disabled by default. Publishing never
+<code>oss</code>, <code>gcs</code> and <code>posix_fs</code> repositories. It is disabled by default. Publishing never
 waits for recording: a completed trace is encoded as a SHA-256-verified
 manifest and attached to the already committed snapshot. Snapshots without a
 descriptor, with a missing/corrupt manifest, or with a failed prefetch always
@@ -4153,6 +4447,28 @@ retaining the device lease until the read finishes. <code>O_DIRECT</code>
 configuration with device prefetch; this is not a claim that device page cache
 is bypassed. The configured I/O engine is never changed. OSS retains its existing
 physical-range planner and executor. Prefetch is not a correctness dependency.</p>
+<h2 id="snapshotmanaged_layer_collect"><a class="header" href="#snapshotmanaged_layer_collect"><code>[snapshot.managed_layer_collect]</code></a></h2>
+<p>Collecting managed layers that no catalog record cites. A managed layer is
+content addressed and shared, so deleting a snapshot leaves its layers in the
+repository. <code>POST /admin/managed-layers/collect</code> sweeps them: <code>mode: report</code>
+lists and counts and returns a <code>reportToken</code>, <code>mode: enforce</code> deletes the
+uncited layers older than the grace period after accepting the receipt that
+token names. Enforce needs <code>gateway_url</code> (below), because a layer a sandbox
+paused on another node still reads must stay cited.
+See
+<a href="#managed-layer-collection">Managed Layer Collection</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enables the endpoint. Disabled, it answers 409 and sweeps nothing. Enforce is refused until a clean report pass has left a valid, unexpired, unused receipt and its token is supplied as <code>reportToken</code>; the two calls may land on different nodes.</td></tr>
+<tr><td><code>grace_secs</code></td><td>integer</td><td><code>7200</code></td><td>How old an uncited layer must be before enforce may delete it. A publish uploads its layers before it writes the record that cites them, so a newer uncited layer may belong to a publish in flight and always stays.</td></tr>
+<tr><td><code>gateway_url</code></td><td>string</td><td>unset</td><td>Base URL of the cluster gateway (for example <code>http://agentenv-gateway:8080</code>). The pass reads <code>GET /v2/sandboxes</code> from it, which fans out to every node, so a sandbox paused on another node keeps its source layers cited. Unset, the pass sees only this node: <code>report</code> still runs, <code>enforce</code> answers 409.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="backendposix_fs"><a class="header" href="#backendposix_fs"><code>[backend.posix_fs]</code></a></h2>
 <p>POSIX filesystem-backed snapshot repository configuration. This section is used when <code>snapshot.repository_backend = "posix_fs"</code>.</p>
 <div class="table-wrapper">
@@ -4205,6 +4521,84 @@ bucket = "agentenv-snapshots"
 region = "auto"
 addressing_style = "virtual"
 </code></pre>
+<h2 id="backendgcs"><a class="header" href="#backendgcs"><code>[backend.gcs]</code></a></h2>
+<p>Google Cloud Storage snapshot repository configuration. This section is required when <code>snapshot.repository_backend = "gcs"</code>.</p>
+<p>The backend talks to Google Cloud Storage through its native JSON and XML APIs rather than the S3 interoperability API, so it needs no HMAC keys and has no endpoint or region. Exactly one way to authenticate must be chosen: <code>credential_path</code> (recommended), <code>allow_application_default_credentials = true</code>, or <code>allow_anonymous = true</code>. With none of them the backend refuses to start; it never picks an identity on its own.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bucket</code></td><td>string</td><td>none</td><td>Bucket name used for committed snapshot state</td></tr>
+<tr><td><code>prefix</code></td><td>string</td><td>empty</td><td>Optional object name prefix under the bucket</td></tr>
+<tr><td><code>credential_path</code></td><td>string</td><td>unset</td><td>Credential JSON file: a service-account key, or an <code>external_account</code> configuration for Workload Identity Federation (see <a href="#kubernetes-setup">Kubernetes setup</a>). This is the only credential source consulted: the environment, the gcloud well-known file and the metadata server are all disabled, so a missing or unparsable file makes requests fail with <code>no valid credential found</code> instead of falling back to another identity. Cannot be combined with the other two options</td></tr>
+<tr><td><code>allow_application_default_credentials</code></td><td>boolean</td><td><code>false</code></td><td>Opt in to Application Default Credentials: <code>GOOGLE_APPLICATION_CREDENTIALS</code>, the gcloud well-known file, then the metadata server. Suitable for a single-tenant VM or a developer workstation. Do not use it where untrusted code can reach the metadata server (see below). Cannot be combined with the other two options</td></tr>
+<tr><td><code>endpoint</code></td><td>string</td><td><code>https://storage.googleapis.com</code></td><td>API endpoint override for emulators such as <code>fake-gcs-server</code>. Leave unset for Google Cloud Storage</td></tr>
+<tr><td><code>allow_anonymous</code></td><td>boolean</td><td><code>false</code></td><td>Send unauthenticated requests. For emulators and public buckets only. Cannot be combined with the other two options</td></tr>
+<tr><td><code>cache_max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the node-local artifact cache in GiB</td></tr>
+</tbody>
+</table>
+</div>
+<p>Notes:</p>
+<ul>
+<li>The service account needs <code>storage.objects.create</code>, <code>get</code>, <code>list</code> and <code>delete</code> on the bucket, for example through <code>roles/storage.objectAdmin</code>. The AgentENV server and the overlaybd runtime (which runs in the <code>uvm-ublk-daemon</code> process) obtain tokens independently, so both must be able to read the file at <code>credential_path</code> and everything it references. In a pod they are in the same container, so one file serves both; each refreshes its own tokens.</li>
+<li>Both the snapshot repository client and the overlaybd runtime (<code>ossConfig.gcs</code> in the generated global config) read the bucket, so layers are loaded on demand directly from <code>gs://</code> objects.</li>
+<li>Object names are kept to ASCII letters, digits, <code>-</code>, <code>_</code>, <code>.</code> and <code>/</code>; any other byte, such as the <code>:</code> of a <code>sha256:</code> digest, is stored as <code>~</code> and two uppercase hex digits (<code>sha256~3A...</code>). The mapping is applied and reversed by AgentENV, so it is visible only when browsing the bucket.</li>
+<li>Google Cloud Storage cannot replace or delete an object only if it is unchanged, so writers of one shared document (catalog records, aliases, the build cache head) take a lease built from create-only objects under <code>locks/</code> instead of an ETag compare-and-swap. A holder that dies releases nothing; another node takes the lock over after 30 seconds. Each node measures the 30 seconds on its own monotonic clock, so nodes need no clock agreement.</li>
+<li>Large layers, such as the memory layers of a snapshot, upload through the XML multipart API in 64 MiB parts, at most 8 at a time, which allows objects of about 625 GiB.</li>
+</ul>
+<pre><code class="language-toml">[snapshot]
+repository_backend = "gcs"
+
+[backend.gcs]
+bucket = "agentenv-snapshots"
+prefix = "prod/"
+credential_path = "/etc/agentenv/gcp/credential.json"
+</code></pre>
+<p>For a local emulator:</p>
+<pre><code class="language-toml">[backend.gcs]
+bucket = "agentenv-snapshots"
+endpoint = "http://127.0.0.1:4443"
+allow_anonymous = true
+</code></pre>
+<h3 id="kubernetes-setup"><a class="header" href="#kubernetes-setup">Kubernetes setup</a></h3>
+<p>Sandboxes are Firecracker guests that run in the same pod as the AgentENV server and share its network. Anything the pod can obtain from the GKE metadata server, including the identity that Workload Identity binds to the pod’s Kubernetes service account, is therefore also reachable from guest code unless guest egress to the metadata server is blocked. A token with write access to the snapshot bucket must not be reachable that way, so do not use Application Default Credentials, node-attached service accounts or a Workload Identity annotation for this backend in a multi-tenant deployment.</p>
+<p>Instead, hand the pod a credential as a <strong>file</strong>, which a guest cannot read, using Workload Identity Federation with a projected service-account token:</p>
+<ol>
+<li>
+<p>Create a workload identity pool and an OIDC provider for the cluster’s issuer. Create a dedicated Google service account with <code>roles/storage.objectAdmin</code> on the snapshot bucket only, and allow the pool’s principal to impersonate it (<code>roles/iam.workloadIdentityUser</code>).</p>
+</li>
+<li>
+<p>Project a token with an explicit audience (the provider’s full resource name) into the pod, and mount it read-only:</p>
+<pre><code class="language-yaml">volumes:
+  - name: gcp-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            audience: //iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER
+            expirationSeconds: 3600
+            path: token
+</code></pre>
+<p>mounted at <code>/var/run/secrets/gcp</code>. The kubelet rotates the file; AgentENV re-reads it on every token refresh.</p>
+</li>
+<li>
+<p>Mount a credential configuration (a ConfigMap is enough, it holds no secret) at <code>/etc/agentenv/gcp/credential.json</code>:</p>
+<pre><code class="language-json">{
+  "type": "external_account",
+  "audience": "//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "token_url": "https://sts.googleapis.com/v1/token",
+  "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/SNAPSHOTS_SA@PROJECT_ID.iam.gserviceaccount.com:generateAccessToken",
+  "credential_source": { "file": "/var/run/secrets/gcp/token" }
+}
+</code></pre>
+</li>
+<li>
+<p>Set <code>credential_path = "/etc/agentenv/gcp/credential.json"</code>.</p>
+</li>
+</ol>
+<p>The pod must be able to reach <code>sts.googleapis.com</code> and <code>iamcredentials.googleapis.com</code> as well as <code>storage.googleapis.com</code>. Keep the mounts out of the guests’ reach (they are not part of any guest filesystem), and still restrict guest egress where you can.</p>
 <p>Other path override:</p>
 <ul>
 <li><code>AENV_DEPS_PATH</code></li>
@@ -4290,6 +4684,7 @@ the default path on every startup.</p>
 <tbody>
 <tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
 <tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>true</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false</code> to disable it.</td></tr>
+<tr><td><code>drop_page_cache_after_write</code></td><td>bool</td><td><code>false</code></td><td>After a memory snapshot layer is sealed, sync it and drop its page cache (<code>posix_fadvise(DONTNEED)</code>) so the snapshot write stops counting toward the runtime pod’s working set. Adds an fsync to the pause path</td></tr>
 </tbody>
 </table>
 </div>
@@ -4386,6 +4781,7 @@ Builder resources do not change the resulting template’s CPU or memory.</p>
 <tr><td><code>AENV_NODE_ID</code></td><td>hostname-derived</td><td>Override the runtime node identifier used in observability/admin snapshots</td></tr>
 <tr><td><code>AENV_CLUSTER_ID</code></td><td>nil UUID</td><td>Override the cluster UUID used for P2P peer discovery and scheduler grouping</td></tr>
 <tr><td><code>AENV_SERVICE_INSTANCE_ID</code></td><td>random UUIDv7</td><td>Override the per-process service instance UUID included in heartbeats</td></tr>
+<tr><td><code>AENV_NODE_POOL</code></td><td>empty</td><td>Named node pool reported in scheduler heartbeats. Empty keeps the node shared; a pooled node only receives sandboxes that ask for its pool</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED</code></td><td>from config</td><td>Enable scheduler heartbeat reporting</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code></td><td>unset</td><td>Override scheduler heartbeat reporting endpoint</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_REPORT_INTERVAL_SECS</code></td><td><code>5</code></td><td>Override heartbeat reporting interval in seconds</td></tr>
@@ -4398,12 +4794,20 @@ Builder resources do not change the resulting template’s CPU or memory.</p>
 <tr><td><code>AENV_VIRTUALIZATION_MODE</code></td><td><code>kvm</code></td><td>Select the node virtualization mode. Leave unset for normal installations; set to <code>pvm</code> only when following the <a href="#pvm-deployment">PVM Deployment</a> guide.</td></tr>
 <tr><td><code>AENV_SNAPSHOT_LOCAL_CACHE_PATH</code></td><td><code>$AENV_HOME/snapshot-local-cache</code></td><td>Override the snapshot manager’s node-local artifact/cache root</td></tr>
 <tr><td><code>AENV_SNAPSHOT_STORE</code></td><td><code>$AENV_HOME/snapshot-store</code></td><td>Override the posix_fs snapshot repository root directory</td></tr>
+<tr><td><code>AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED</code></td><td><code>false</code></td><td>Enable <code>POST /admin/managed-layers/collect</code>, which sweeps managed layers no catalog record cites. Disabled, the endpoint answers 409 and sweeps nothing. Deleting a layer is irreversible, so an <code>enforce</code> needs the <code>reportToken</code> of a clean report pass: the receipt it names lives in the repository and authorizes exactly one enforce, so the two calls may land on different nodes. See <a href="#managed-layer-collection">Managed Layer Collection</a>.</td></tr>
+<tr><td><code>AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS</code></td><td><code>7200</code></td><td>How old an uncited managed layer must be before <code>enforce</code> may delete it. A publish uploads its layers before it writes the record that cites them, so a layer younger than this may belong to a publish in flight.</td></tr>
+<tr><td><code>AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL</code></td><td>unset</td><td>Base URL of the cluster gateway (<code>http://agentenv-gateway:8080</code> in the provided deployment), called as <code>GET /v2/sandboxes</code> with this node’s API key. The gateway fans the list out to every node, so a sandbox paused on another node keeps its source layers cited, and the paused-artifact sweep sees it too. Unset, or when any node of the fan-out fails, <code>enforce</code> answers 409 and only <code>report</code> runs.</td></tr>
+<tr><td><code>AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP</code></td><td><code>off</code></td><td>Periodic sweep of <code>persisted_sandboxes/artifacts/</code> that reclaims a sandbox directory no record and no cluster list names any more: <code>off</code>, <code>report</code> (list and count only) or <code>enforce</code> (move to <code>artifacts/.trash/{epoch}/</code>, then delete after a second grace). Any failed or unconfigured cluster list degrades a pass to a report; see <a href="#orchestrator-persistence">Paused Artifact Reaping</a>.</td></tr>
 <tr><td><code>AENV_UBLK_DAEMON_BINARY_PATH</code></td><td><code>$AENV_HOME/ublk/uvm-ublk-daemon</code></td><td>Override path to the <code>uvm-ublk-daemon</code> binary</td></tr>
 <tr><td><code>AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR</code></td><td><code>0.0.0.0:9103</code></td><td>Override ublk daemon Prometheus metrics listen address; empty string disables it</td></tr>
 <tr><td><code>AENV_FORCE_SYSCTL_TUNING</code></td><td>unset</td><td>Set to <code>1</code> to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers.</td></tr>
 <tr><td><code>AENV_FIRECRACKER_WORK_DIR</code></td><td><code>$AENV_HOME/firecracker-work</code></td><td>Override the parent directory for per-sandbox Firecracker work directories.</td></tr>
 <tr><td><code>AENV_FIRECRACKER_SERIAL_DIR</code></td><td><code>$AENV_HOME/logs/serial</code></td><td>Override the directory for persistent Firecracker serial output. Files are grouped under <code>{serial_dir}/{sandbox_id}/</code>.</td></tr>
 <tr><td><code>AENV_PERSISTED_SANDBOX_STORE_PATH</code></td><td><code>$AENV_HOME/persisted-sandboxes</code></td><td>Override the directory where paused sandbox state is persisted across server restarts.</td></tr>
+<tr><td><code>AENV_CHAIN_BYTES_CEILING</code></td><td><code>51539607552</code> (48 GiB)</td><td>Override the byte ceiling for the reclaimable part of one sandbox’s paused artifact chain (its runtime-owned generations plus each pause’s appended layer; the shared image prefix is reported but not charged). A breach no longer pays the rewrite inside the pause: when admission allows, the pause leaves a durable <code>deferred-compaction.json</code> and the maintenance worker compacts afterwards; otherwise the pause compacts inline and, if the part stays above the ceiling, refuses recoverably — the sandbox is resumed in place and keeps running and serving, so no ceiling path stops the VM. <code>0</code> disables the ceiling, the pre-flight and the stale-generation sweep, restoring the unbounded behavior without a redeploy.</td></tr>
+<tr><td><code>AENV_ROOTFS_CHAIN_DISK_MULTIPLE</code></td><td><code>2</code></td><td>Override the relative bound on the whole deduplicated rootfs chain of one sandbox, in multiples of the guest rootfs disk. Both bounds are judged at pause: the reclaimable part against <code>AENV_CHAIN_BYTES_CEILING</code> and the whole chain (stable prefix included) against this multiple. A breach leaves the runtime-owned suffix uncompacted and a durable descriptor behind (see <code>AENV_DEFERRED_COMPACTION_MAX_CONCURRENT</code>) when admission allows it; otherwise it compacts inline and, if the whole chain is still above the multiple, the pause is refused with the recoverable <code>ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED</code> and the VM is resumed in place. Only the rootfs chain carries this bound; memory, drive and volume keep the absolute ceiling alone. <code>0</code> disables the relative bound without a redeploy.</td></tr>
+<tr><td><code>AENV_DEFERRED_COMPACTION_MAX_CONCURRENT</code></td><td><code>1</code></td><td>Compactions the maintenance worker may run at the same time on this node. A pause whose byte bound is crossed leaves a durable descriptor and returns; a pause that finds this budget full compacts inline. A parameter, not a kill switch: the boot refuses <code>0</code>. PROVISIONAL default from the 13/11/2026 measurement (12 GiB rewritten per pause on a 32 GiB VM).</td></tr>
+<tr><td><code>AENV_DEFERRED_COMPACTION_PENDING_BYTES_BUDGET</code></td><td><code>103079215104</code> (96 GiB)</td><td>Transient bytes of deferred compactions pending on this node (queued plus in flight); a pause whose compaction would cross it compacts inline. PROVISIONAL default: two times the shipped 48 GiB ceiling. A parameter, not a kill switch: the boot refuses <code>0</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -4422,13 +4826,8 @@ Builder resources do not change the resulting template’s CPU or memory.</p>
 </table>
 </div>
 <h3 id="values-by-deployment-mode"><a class="header" href="#values-by-deployment-mode">Values by Deployment Mode</a></h3>
-<p><strong>Manual compile (single node)</strong>:</p>
-<pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8000
-export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=${AENV_API_KEY}
-</code></pre>
-<p><strong>Docker Compose / Kubernetes (multi-node)</strong>:</p>
-<pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8080
+<p><strong>Manual compile (single node)</strong> uses port <code>8000</code>; <strong>Docker Compose / Kubernetes (multi-node)</strong> uses <code>8080</code>:</p>
+<pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8080   # 8000 on a single node
 export E2B_SANDBOX_URL=${E2B_API_URL}
 export E2B_API_KEY=${AENV_API_KEY}
 </code></pre>
@@ -4478,7 +4877,7 @@ export E2B_API_KEY=${AENV_API_KEY}
 <tbody>
 <tr><td><code>SCHEDULER_GRPC_LISTEN_ADDR</code></td><td><code>:9090</code></td><td>gRPC listen address</td></tr>
 <tr><td><code>SCHEDULER_METRICS_LISTEN_ADDR</code></td><td><code>:9101</code></td><td>Prometheus metrics listen address</td></tr>
-<tr><td><code>SCHEDULER_STRATEGY</code></td><td><code>round_robin</code></td><td>Node selection strategy for new sandboxes: <code>round_robin</code> or <code>random</code></td></tr>
+<tr><td><code>SCHEDULER_STRATEGY</code></td><td><code>round_robin</code></td><td>Node selection strategy for new sandboxes: <code>round_robin</code>, <code>random</code> or <code>least_loaded</code> (the less loaded of two sampled nodes, by heartbeat CPU and memory)</td></tr>
 <tr><td><code>SCHEDULER_REDIS_ADDR</code></td><td>unset</td><td>Redis address for persistent sandbox-to-node bindings (for example, <code>redis:6379</code>). Unset = in-memory bindings, lost on scheduler restart.</td></tr>
 <tr><td><code>SCHEDULER_BINDING_TTL</code></td><td><code>30s</code></td><td>How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, <code>1m</code>).</td></tr>
 <tr><td><code>SCHEDULER_ARTIFACT_STORE_CAPACITY</code></td><td><code>1000000</code></td><td>Maximum number of P2P artifact entries held in the scheduler’s in-memory index</td></tr>
@@ -4603,10 +5002,11 @@ PVM currently requires x86_64 and the <code>kvm_pvm</code> host module.</p>
 </thead>
 <tbody>
 <tr><td>API layer</td><td><code>src/api/</code></td><td>Axum HTTP server, OpenAPI endpoints, reverse proxy to sandbox services, node/admin APIs</td></tr>
-<tr><td>Orchestrator</td><td><code>src/orchestrator/</code></td><td>Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts</td></tr>
+<tr><td>Orchestrator</td><td><code>src/orchestrator/</code></td><td>Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Publishing, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts</td></tr>
 <tr><td>Observability</td><td><code>src/observability/</code></td><td>Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting</td></tr>
 <tr><td>Sandbox</td><td><code>src/sandbox/</code></td><td>Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools</td></tr>
 <tr><td>Snapshot + Template Builder</td><td><code>src/snapshot/</code>, <code>src/template/</code></td><td><code>src/snapshot/</code> owns committed snapshot storage/runtime resolution; <code>src/template/</code> provides the user-facing builder that publishes snapshots</td></tr>
+<tr><td>Repository maintenance</td><td><code>src/maintenance/</code></td><td>Operations no single catalog owns. Today: collecting managed layers no catalog record cites, in report or enforce mode, under a repository lock. It sits above the catalogs because <code>repository</code> may not import them and <code>snapshot</code> may not import <code>volume</code></td></tr>
 <tr><td>P2P artifact transport</td><td><code>src/p2p/</code></td><td>Optional project-wide artifact lookup, publish, and fetch layer with disabled and iroh-backed transports</td></tr>
 <tr><td>Config</td><td><code>src/cfg.rs</code></td><td>TOML config for firecracker paths, machine specs, timeouts, shared pool tuning, observability metadata, P2P, and scheduler-report settings</td></tr>
 </tbody>
@@ -5704,6 +6104,118 @@ into it (for example using <code>debugfs</code>).</li>
 <p>The guest must keep a long-running dispatcher (started during the initial
 boot) that watches for these per-instance files and executes them after resume.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="memory-containment"><a class="header" href="#memory-containment">Memory Containment</a></h1>
+<p>Two independent mechanisms keep node memory pressure from evicting the runtime
+pod:</p>
+<ol>
+<li><strong>Snapshot I/O leaves the working set</strong> (<code>[memory_snapshot] drop_page_cache_after_write</code>). After a memory-snapshot layer is sealed, the
+node syncs it and drops its page cache, so the bytes the pause just wrote
+stop counting toward the pod’s working set. Off by default: it adds an fsync
+to the pause path, and whether that is worth it has to be measured first.</li>
+<li><strong>One cgroup per VM</strong> (<code>[memory_containment]</code>). Every VMM lives in its own
+cgroup v2 domain with <code>memory.max</code> equal to the VM shape and <code>memory.high</code>
+below it, so node pressure throttles or OOM-kills a single VM and never the
+pod that holds all of them.</li>
+</ol>
+<p>Both are disabled by default; a node that cannot prepare the cgroup subtree
+logs the reason and keeps today’s behavior.</p>
+<h2 id="layout"><a class="header" href="#layout">Layout</a></h2>
+<pre><code class="language-text">&lt;container cgroup&gt;        domain, no processes, +memory +cpu
+├── agentenv-server/      domain leaf, the runtime's own processes
+└── agentenv-vms/         domain, +cpu (for a nested CPU quota)
+    └── &lt;sandbox id&gt;/     domain, memory.max = shape, memory.high &lt; shape
+        └── cpu/          threaded, cpu.max (when [resize] caps the VMM)
+</code></pre>
+<p>The memory controller distributes only to domain children, and a cgroup that
+holds processes cannot delegate a domain controller. Startup therefore moves
+the runtime’s processes into <code>agentenv-server/</code> before enabling <code>memory</code>; if the
+move or the delegation fails, the processes are put back and the node keeps the
+old layout. A cgroup cannot have both domain and threaded children, so when
+containment is active the CPU quota nests <code>cpu/</code> under each VM’s memory domain
+instead of using the shared <code>agentenv-sandboxes</code> root.</p>
+<p><code>memory.oom.group</code> is set to 1 on the per-VM cgroup: an OOM inside one VM kills
+that VM’s subtree as a unit. The container’s own <code>memory.oom.group</code> is left at
+0, so the pod is never killed with it.</p>
+<h2 id="measurement-opsai-6266"><a class="header" href="#measurement-opsai-6266">Measurement (OPSAI-6266)</a></h2>
+<p>The numbers below decide the option and are <strong>not measured yet</strong>: this change
+was prepared from a sandbox with no cluster access and no <code>/dev/kvm</code>, so every
+value is <code>UNKNOWN</code> with the command that failed. The card owner runs the
+protocol on a drained canary node and fills the table before the feature is
+enabled anywhere.</p>
+<p>Never run <code>drop_caches</code> on a node with live VMs, not even to measure: on
+2026-11-05 a <code>drop_caches</code> on a node with restored VMs forced them to re-read
+guest memory from disk.</p>
+<h3 id="p-1--cgroup-delegation"><a class="header" href="#p-1--cgroup-delegation">p-1 · cgroup delegation</a></h3>
+<pre><code class="language-sh">CGROUP=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup)
+cd "/sys/fs/cgroup${CGROUP}"
+cat cgroup.controllers cgroup.subtree_control
+mkdir -p /tmp/aenv-cgroup-probe &amp;&amp; rmdir /tmp/aenv-cgroup-probe
+mkdir probe-vm &amp;&amp; echo "+memory +cpu" &gt; cgroup.subtree_control
+echo "+memory" &gt; probe-vm/cgroup.subtree_control
+echo $((1024*1024*1024)) &gt; probe-vm/memory.max
+echo $((900*1024*1024)) &gt; probe-vm/memory.high
+cat probe-vm/memory.max probe-vm/memory.high probe-vm/memory.oom.group
+rmdir probe-vm
+</code></pre>
+<p>A failure means the runtime cannot create per-VM memory cgroups on this node:
+the card returns to the owner instead of shipping a fallback that cannot meet
+“one VM dies, the others stay”.</p>
+<h3 id="p-2--vmm-process-topology"><a class="header" href="#p-2--vmm-process-topology">p-2 · VMM process topology</a></h3>
+<pre><code class="language-sh">ps -eo pid,ppid,comm | grep -E 'agentenv|firecracker'
+pstree -p $(pgrep -f 'agentenv.*server' | head -1)
+</code></pre>
+<p>Confirms the VMM of each VM is a direct child of the runtime and can be moved
+alone. A shared VMM process would need a different containment axis.</p>
+<h3 id="p-4--what-the-working-set-is-made-of"><a class="header" href="#p-4--what-the-working-set-is-made-of">p-4 · what the working set is made of</a></h3>
+<p>With one VM, sample the runtime pod’s cgroup before and after pause, restore and
+snapshot:</p>
+<pre><code class="language-sh">CGROUP=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup)
+grep -E '^(anon|file|active_file|inactive_file|slab) ' /sys/fs/cgroup${CGROUP}/memory.stat
+cat /sys/fs/cgroup${CGROUP}/memory.current
+</code></pre>
+<p>Then repeat the same pause/restore cycle with
+<code>[memory_snapshot] drop_page_cache_after_write = true</code> and record the pause and
+resume duration for each variant. The split between snapshot I/O cache and
+guest memory of restored VMs (Firecracker maps the memory file, so read-only
+guest pages count as file cache) is what decides between <code>fadvise(DONTNEED)</code>,
+<code>O_DIRECT</code>, <code>memory.high</code>, and copying restored memory into anonymous memory.
+Only after that split is measured does <code>[memory_containment] memory_high_ratio</code> get a value, and <code>memory.high</code> must not stall a VM past the
+runner grace (90 s).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Value</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td>pod <code>active_file</code> before/after pause</td><td>UNKNOWN</td><td><code>kubectl get ns</code> failed: <code>dial tcp [::1]:8080: connect: connection refused</code> (no cluster credential in the run)</td></tr>
+<tr><td>pod <code>active_file</code> before/after restore</td><td>UNKNOWN</td><td>same failing command</td></tr>
+<tr><td>share of the working set that is snapshot I/O cache</td><td>UNKNOWN</td><td>same failing command</td></tr>
+<tr><td>share that is guest memory mapped from the memory file</td><td>UNKNOWN</td><td>same failing command</td></tr>
+<tr><td>pause time, cache kept / dropped after write</td><td>UNKNOWN</td><td>same failing command</td></tr>
+<tr><td>resume time, cache kept / dropped after write</td><td>UNKNOWN</td><td>same failing command</td></tr>
+<tr><td><code>posix_fadvise(DONTNEED)</code> resident pages after write</td><td>UNKNOWN</td><td>same failing command</td></tr>
+<tr><td><code>O_DIRECT</code> effect on pause and resume</td><td>UNKNOWN</td><td>not implemented: it changes alignment and the GCS backend semantics, so it is only pursued if p-4 shows <code>fadvise</code> is insufficient</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="p-8--canary"><a class="header" href="#p-8--canary">p-8 · canary</a></h3>
+<p>With the pin applied node by node through the drain, induce memory pressure on
+the canary and verify: the VM under pressure dies or is throttled alone, the
+other VMs and the paused sandboxes stay, and the runtime pod is not evicted.
+Record the date, the commands, and the outcome. A single node does not prove the
+pool.</p>
+<h2 id="rollout-and-rollback"><a class="header" href="#rollout-and-rollback">Rollout and rollback</a></h2>
+<ul>
+<li>Roll out by <code>[memory_containment] enabled = true</code> with the measured
+<code>memory_high_ratio</code>, and <code>[memory_snapshot] drop_page_cache_after_write = true</code> once p-4 prices its fsync. One node at a time through the drain; never
+a bulk restart.</li>
+<li>Roll back by setting both back to their defaults and restarting the server.
+The per-VM cgroups and the server leaf are removed by the next startup; a
+stale non-empty cgroup is kept and logged, never deleted under a live VMM.</li>
+<li>A node where the subtree cannot be prepared logs <code>per-VM memory containment unavailable</code> at error level and keeps running uncontained; treat that line as
+a failed canary, not as success.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="template-builder-and-testing"><a class="header" href="#template-builder-and-testing">Template Builder and Testing</a></h1>
 <p>This document explains how the current template-facing build API maps onto the
 snapshot-first internals, how committed snapshots move through the
@@ -6062,7 +6574,7 @@ builds or prevent server startup.</p>
 <tbody>
 <tr><td>Managed live snapshot root</td><td><code>&lt;firecracker-work-base&gt;/managed-snapshots/{sandbox_id}/{uuid}/...</code></td><td>Firecracker snapshot artifacts kept alive in-process</td><td>Holds captured running-sandbox snapshots until publish, and supports in-process pause state</td><td>Created by <code>FirecrackerSandbox::pause()</code> or <code>snapshot()</code>. Removed when <code>PersistentSnapshotRootGuard</code> drops.</td><td>No.</td></tr>
 <tr><td>Snapshot VM state</td><td>snapshot artifact dir <code>vm_state.bin</code></td><td>Firecracker VM state</td><td>Pause/resume and snapshot publish input</td><td>Created by Firecracker’s state-only diff snapshot. Owner depends on caller: persister, managed root, or repository publish input.</td><td>No.</td></tr>
-<tr><td>Memory overlaybd layer</td><td>snapshot artifact dir <code>mem_overlaybd/overlaybd.commit</code></td><td>Sealed OverlayBD layer for memory pages</td><td>Runtime memory restore and publish input</td><td>Created directly from Firecracker dirty/present memory ranges read with <code>process_vm_readv</code>. Imported into repository managed layers during publish.</td><td>No.</td></tr>
+<tr><td>Memory overlaybd layer</td><td>snapshot artifact dir <code>mem_overlaybd/overlaybd.commit</code></td><td>Sealed OverlayBD layer for memory pages</td><td>Runtime memory restore and publish input</td><td>Created directly from Firecracker dirty/present memory ranges read with <code>process_vm_readv</code>. Every 512-byte block that reads back as zeros (a page the host already discarded) is recorded as an unbacked zero segment (<code>SegmentMapping.zeroed</code>) instead of being written, so the layer holds only bytes that still exist in the host; <code>agentenv_memory_snapshot_skipped_bytes</code> and the named <code>memory snapshot skipped host-discarded pages</code> log report the skipped bytes per pause. Imported into repository managed layers during publish.</td><td>No.</td></tr>
 <tr><td>Memory image config</td><td>snapshot artifact dir <code>mem_image.json</code></td><td>Overlaybd image config stacking memory layers</td><td>Resume paused sandbox and publish memory layers</td><td>Written after memory conversion. Later repository resolvers regenerate runtime memory configs from committed layers.</td><td>Yes after publish; no for paused sandbox unless layers are known.</td></tr>
 <tr><td>Rootfs snapshot config</td><td>snapshot artifact dir <code>rootfs/image.json</code></td><td>Overlaybd image config for captured rootfs state</td><td>Resume paused sandbox and publish rootfs layers</td><td>Staged from live runtime config after restack/seal.</td><td>Yes only from associated layers and metadata.</td></tr>
 <tr><td>Rootfs snapshot layer</td><td>snapshot artifact dir <code>rootfs/snapshot.commit</code></td><td>Sealed writable upper from live rootfs</td><td>Captures disk writes since previous lower stack</td><td>Created by ublk daemon restack for writable overlaybd rootfs.</td><td>No.</td></tr>
@@ -6157,13 +6669,42 @@ Firecracker manifest with node-local paths, and resolves the committed
 <tr><td>Shared documents (snapshot records and aliases, volume records and names, build logs, build-cache state)</td><td>Paths named in <code>src/repository/layout.rs</code>. POSIX: one file each, updated under a lock file. OSS: one <code>{name}.json</code> object each. S3 stores replace it only if its ETag is unchanged. Alibaba OSS cannot, so every write holds a lease on the appendable lock object <code>locks/{path}</code> (see <code>src/repository/backends/oss/lease.rs</code>).</td><td>Volume state, reservations, and name bindings; template build logs; the shared build-cache seed</td><td>Updated atomically by the snapshot and volume catalogs and the template builder on every node</td><td>A released lease deletes its lock object. A holder that dies leaves it until a contender takes it over 30 seconds later.</td><td>No.</td></tr>
 <tr><td>Firecracker manifest</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/snapshots/{id}/firecracker-manifest.json</code>; OSS: <code>artifacts/{id}/firecracker-manifest.json</code></td><td>Firecracker snapshot shape, virtual sizes, attached-drive metadata; path fields are hydrated at runtime</td><td>Runtime manifest template for launching committed snapshots</td><td>Persisted during publish. Removed with per-snapshot artifacts.</td><td>Partially, but kept as durable artifact.</td></tr>
 <tr><td>VM state</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/snapshots/{id}/vm_state.bin</code>; OSS: <code>artifacts/{id}/vm_state.bin</code></td><td>Firecracker VM state snapshot</td><td>Required to resume committed snapshots</td><td>Copied/uploaded during publish. Removed with per-snapshot artifacts.</td><td>No.</td></tr>
-<tr><td>Managed snapshot layers</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/managed-layers/{digest}.overlaybd.commit</code>; OSS: <code>managed-layers/{digest}</code></td><td>Content-addressed rootfs, attached-drive, and memory overlaybd commit layers</td><td>Shared immutable layer storage for committed snapshots</td><td>Imported during publish by descriptor or by hashing local descriptor-less layers. Usually not removed with a single snapshot.</td><td>Not from metadata alone; can be re-fetched only if source still exists.</td></tr>
+<tr><td>Managed snapshot layers</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/managed-layers/{digest}.overlaybd.commit</code>; OSS: <code>managed-layers/{digest}</code></td><td>Content-addressed rootfs, attached-drive, and memory overlaybd commit layers</td><td>Shared immutable layer storage for committed snapshots, volume backing, and published images</td><td>Imported during publish by descriptor or by hashing local descriptor-less layers. Not removed with a single snapshot, because other records may cite the layer. A layer no record cites is collected by <code>POST /admin/managed-layers/collect</code> once it is older than <code>[snapshot.managed_layer_collect].grace_secs</code>; see “Managed Layer Collection” below.</td><td>Not from metadata alone; can be re-fetched only if source still exists, and a collected layer is gone for good.</td></tr>
+<tr><td>Managed-layer collection lock</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/maintenance/locks/managed-layer-collect</code>; OSS: <code>maintenance/locks/managed-layer-collect</code></td><td>The holder token of the running collection pass</td><td>Serializes collection passes so two never overlap</td><td>Created by <code>maintenance::collect_managed_layers</code>. POSIX holds an <code>flock</code> the kernel drops with the process; OSS deletes the object on release, and a later pass takes over an object older than 30 minutes. Never under <code>managed-layers/</code>, so a pass never lists its own lock as a layer.</td><td>Yes.</td></tr>
+<tr><td>Managed-layer report receipt</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/maintenance/managed-layer-collect/receipts/{token}.json</code>; OSS: <code>maintenance/managed-layer-collect/receipts/{token}.json</code></td><td><code>{ token, issuedAtUnixMs, counts }</code> for one report pass</td><td>Lets an enforce pass on another node accept the report that authorized it, and is consumed by that enforce</td><td>Written by a report pass under the pass lock and deleted by the enforce that accepts it; each report prunes expired receipts (TTL 15 minutes). Never under <code>managed-layers/</code>, where a pass would count it unreadable. The token is a secret and is never logged, and every backend message that names the receipt’s document is redacted.</td><td>Yes.</td></tr>
 <tr><td>Staging files</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/staging/*</code>; OSS: process temp dir</td><td>Dense-exported and recontainerized layers prepared for storage</td><td>On POSIX, the same filesystem as <code>managed-layers/</code>, so a prepared layer is hard-linked in without a copy</td><td>Temporary files, removed once the publish that made them is done. A process that crashes mid-publish leaves its files behind.</td><td>Yes.</td></tr>
 <tr><td>Source-registry publications</td><td><code>SnapshotRecord.committed.disk_publications</code> plus remote OCI registry objects</td><td>Published rootfs/attached-drive image refs and manifest digests</td><td>Lets compatible snapshot deltas live in their source registry</td><td>Created during OSS publish when image publishing is enabled. Rolled back on failure or delete when possible.</td><td>Registry-owned; record is required to locate.</td></tr>
 </tbody>
 </table>
 </div>
 <p>Repository records are the logical source of truth for committed snapshots. Build-time and runtime <code>image.json</code> files should not become committed truth unless they contain data that cannot be derived from committed metadata.</p>
+<h2 id="managed-layer-collection"><a class="header" href="#managed-layer-collection">Managed Layer Collection</a></h2>
+<p>Owned by <code>src/maintenance/managed_layers.rs</code>.</p>
+<p>A managed layer is content addressed and shared, so deleting a snapshot removes only that snapshot’s own files and leaves every layer behind. Nothing used to notice a layer that no record cited any more, so deleting a record stranded its layers in the bucket for good. <code>POST /admin/managed-layers/collect</code> is that collector.</p>
+<p>The citation set is closed and comes from four places:</p>
+<ul>
+<li><strong>snapshot records</strong> (<code>catalog/records/</code>): committed rootfs, attached-drive, memory and volume-snapshot layers;</li>
+<li><strong>volume records</strong> (<code>volumes/records/</code>): backing layers, which keep a volume’s layers after the snapshots that used it are gone;</li>
+<li><strong>published image descriptions</strong> (<code>images/descriptions/</code>): an image owns its layers;</li>
+<li><strong>live sandboxes</strong>: the source snapshot of every sandbox in the cluster, running or paused. The pass unions the node’s own list with the gateway’s aggregated <code>GET /v2/sandboxes</code>, which fans out to every node, because a sandbox paused on <em>another</em> node still reads its source snapshot’s layers on resume. If a live sandbox’s source is no longer in the catalog, the pass is downgraded to a report for the whole bucket, because the substrate can no longer prove which layers that sandbox may read.</li>
+</ul>
+<p>The cluster list is fail-closed. When <code>[snapshot.managed_layer_collect].gateway_url</code> is unset, when any node of the gateway’s fan-out fails (the gateway answers 502 for the whole page), when a page does not arrive, or when a page token repeats, the pass treats the citation set as unknowable and deletes nothing: <code>enforce</code> is refused with 409 and only <code>report</code> runs. A partial list is never read as a complete one — an enforce pass built from one node’s list deleted 123 layers on staging, one of them a lower layer of a sandbox paused on another node.</p>
+<p><code>BlobKey::Layer</code> is written only by snapshot publication (<code>src/snapshot/store.rs</code>) and volume publication (<code>src/volume/mod.rs</code>); image builds reuse the same two stores, and image descriptions only reference layers those stores wrote.</p>
+<p>The pass runs in two modes. <code>report</code> lists and counts without deleting anything and returns a <code>reportToken</code>. <code>enforce</code> deletes only the uncited layers older than <code>[snapshot.managed_layer_collect].grace_secs</code>, and only after accepting the receipt that token names: the report persists <code>{ token, issuedAtUnixMs, counts }</code> under <code>maintenance/managed-layer-collect/receipts/</code> — never under <code>managed-layers/</code>, where a pass would count it unreadable — under the same repository lock the enforce holds. The enforce requires the receipt to exist, be unexpired, be clean (no downgrade, no unreadable or unknown layer, at least one cited layer) and not have been consumed, reclassifies the whole bucket under the lock, and spends the receipt. One report authorizes exactly one enforce, and the two calls may land on different nodes; each report prunes the receipts that expired. The token is a secret and is never logged. The grace period exists because a publish uploads its layers <em>before</em> it writes the record that cites them: a layer uploaded moments ago and not cited yet belongs to a publish in flight.</p>
+<p>Two things the pass never does:</p>
+<ul>
+<li>it never deletes an object under <code>managed-layers/</code> whose name does not translate back to a <code>sha256:&lt;hex&gt;</code> digest — the substrate cannot prove what such an object is, so it is counted as unreadable and left alone;</li>
+<li>it never deletes while another pass holds the maintenance lock. The lock serializes passes only; it does not exclude publishers, and the grace period covers that race.</li>
+</ul>
+<p>Every pass records cited layers and bytes, orphan layers and bytes, unexpired and unreadable layers, deleted layers and reclaimed bytes, and the objects it could not handle. A single failure never stops the pass.</p>
+<h3 id="rolling-it-out"><a class="header" href="#rolling-it-out">Rolling it out</a></h3>
+<p>Report first, in this order, on a node whose repository is the environment you are cleaning:</p>
+<ol>
+<li>Start one node with <code>AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED=true</code>, and with <code>AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL</code> pointing at the cluster gateway. Without the gateway URL the pass sees only its own node, so a sandbox paused elsewhere looks gone and its layers look uncited: enforce is refused, and report still runs but its <code>orphanLayers</code> is not the cluster’s.</li>
+<li>Run <code>POST /admin/managed-layers/collect</code> with <code>{"mode": "report"}</code> and compare <code>orphanLayers</code>/<code>orphanBytes</code> with what you measured independently. A difference larger than the layers a known publication is uploading means the citation set is missing a source; <strong>stop</strong> and investigate, do not enforce. A report whose <code>downgradedReason</code> is set proves nothing and must not be followed by an enforce.</li>
+<li>Only then run <code>{"mode": "enforce", "reportToken": "&lt;the token the report returned&gt;"}</code>. It applies the same grace period, so the layers a pass in flight is uploading stay. A missing, unknown, already used, expired or unclean receipt is refused and deletes nothing.</li>
+<li>The pass never removes an object whose name is not a digest. A non-zero <code>unreadableLayers</code> is expected from older releases and stays reported every pass.</li>
+</ol>
 <h2 id="snapshot-runtime-resolution"><a class="header" href="#snapshot-runtime-resolution">Snapshot Runtime Resolution</a></h2>
 <p>Owned by <code>src/snapshot/artifact_cache.rs</code>, <code>src/snapshot/runtime_support.rs</code>, and backend runtime resolvers.</p>
 <div class="table-wrapper">
@@ -6189,12 +6730,105 @@ Firecracker manifest with node-local paths, and resolves the committed
 <tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th></tr>
 </thead>
 <tbody>
-<tr><td>Paused sandbox record DB</td><td><code>&lt;persisted_sandbox_store_path&gt;/records.db</code></td><td>RocksDB keyed by sandbox ID; values are compact JSON records containing version, lifecycle, sandbox metadata, artifact root, and backend state</td><td>Restores paused sandboxes after server restart</td><td>Record written after pause succeeds. Marked <code>resuming</code> before resume. Rolled back on resume failure. Deleted on resume/delete.</td></tr>
-<tr><td>Paused sandbox artifact generation</td><td><code>&lt;persisted_sandbox_store_path&gt;/artifacts/{sandbox_id}/{uuid}/...</code></td><td>Firecracker snapshot artifacts generated by <code>pause_to_dir</code></td><td>Durable artifacts for one paused sandbox generation</td><td>Allocated before pause, populated by backend, referenced by paused record. Removed during explicit delete or <code>load_all</code> orphan cleanup.</td></tr>
+<tr><td>Paused sandbox record DB</td><td><code>&lt;persisted_sandbox_store_path&gt;/records.db</code></td><td>RocksDB keyed by sandbox ID; values are compact JSON records containing version, lifecycle, sandbox metadata, artifact root, and backend state</td><td>Restores paused sandboxes after server restart</td><td>Record written after pause succeeds. Marked <code>resuming</code> before resume. Rolled back on resume failure. Deleted on resume/delete. A record whose runtime state cannot be decoded on the loading node is <strong>retained</strong>, not deleted; see “Load outcome”.</td></tr>
+<tr><td>Paused sandbox artifact generation</td><td><code>&lt;persisted_sandbox_store_path&gt;/artifacts/{sandbox_id}/{uuid}/...</code></td><td>Firecracker snapshot artifacts generated by <code>pause_to_dir</code></td><td>Durable artifacts for one paused sandbox generation</td><td>Allocated before pause, populated by backend, referenced by paused record. Each pause adds a generation whose unchanged files are hard links of the previous ones. Removed only by an explicit delete (a control-plane delete removes <code>artifacts/{sandbox_id}</code> and any quarantined copy); boot never deletes one. A generation whose record the loading node does not have is moved to <code>artifacts/.quarantine/{epoch}/{sandbox_id}</code> at boot, preserving its bytes; once the new record is durable, the persister also sweeps stale sibling generations of regular files whose link count is 1. A periodic sweep in <code>src/maintenance/paused_artifacts.rs</code> reclaims the whole <code>{sandbox_id}</code> directory of a sandbox no record and no cluster list names any more, moving it to <code>artifacts/.trash/{epoch}/</code> first and deleting it only after a second grace; see “Paused Artifact Reaping”.</td></tr>
+<tr><td>Paused sandbox artifact quarantine</td><td><code>&lt;persisted_sandbox_store_path&gt;/artifacts/.quarantine/{epoch}/{sandbox_id}/...</code></td><td>A generation boot found with no record on this node</td><td>Keeps a paused sandbox’s bytes when the record is on another node, was lost in an eviction, or was never written</td><td>Written only by <code>load_all</code>, as a rename: boot never copies and never deletes. Expired only by the reaper in enforce mode, once the epoch is older than <code>QUARANTINE_TTL</code> (7 days), or removed by an explicit control-plane delete of that sandbox id. Quarantine preserves bytes, not resumability: the cluster does not list the sandbox until a record exists, and <code>FirecrackerPausedState::decode</code> rebuilds the snapshot config from the record’s state, not from the artifact path.</td></tr>
 </tbody>
 </table>
 </div>
-<p>Paused sandbox artifacts are not committed snapshot repository artifacts. They are owned by the sandbox persister and should not be shared as snapshot truth.</p>
+<p>Paused sandbox artifacts are owned by the sandbox persister, but a pause’s generation is now a valid <strong>source</strong> for a durable snapshot: <code>POST /sandboxes/{id}/snapshots</code> on a PAUSED sandbox publishes the generation’s <code>mem_image.json</code>, <code>rootfs/image.json</code>, attached-drive configs, <code>vm_state.bin</code> and layers through the normal repository store, incrementally by digest, without resuming the VM. Because the publication reads the very configs and layers the deferred-compaction worker rewrites and unlinks, the publication takes a node-local lease (<code>publish.lease</code>) in the generation directory before reading the manifest; <code>paused_artifact_candidates</code> skips a leased generation for that pass, and <code>load_all</code> clears a stale lease at boot because no publication can be in flight then. The sandbox is held in the <code>Publishing</code> state for the whole operation, which fences resume, delete and a second publication, and it settles back to <code>Paused</code> on every exit. A paused generation is therefore still not a committed snapshot record by itself; it becomes one only when the publication commits it. Only an explicit delete removes an <code>artifacts/{sandbox_id}/</code> directory; a destroy that answered <code>404</code>, a record lost between <code>allocate_artifact_root</code> and <code>persist_paused</code>, and the last generation of a sandbox that has since resumed all strand it, and boot quarantines rather than deletes it; <code>src/maintenance/paused_artifacts.rs</code> sweeps those directories periodically, reclaiming one only when no keep condition holds — no local id (running, paused, restoring or template build), no restore open, the id absent from the gateway’s aggregated <code>GET /v2/sandboxes</code>, and an mtime older than <code>ARTIFACT_GRACE</code> — while a symlink, a non-directory, a non-canonical name or a path outside <code>artifacts/</code> is skipped and never followed. The removal is two-phase: a reclaimed directory is renamed to <code>artifacts/.trash/{epoch}/{sandbox_id}</code>, which frees nothing, and deleted by a later pass once the epoch is older than <code>TRASH_GRACE</code>, so a mistaken verdict can be renamed back while its record still resolves; bytes are counted only on the deletion. A third phase empties the boot quarantine, <code>artifacts/.quarantine/{epoch}/{sandbox_id}</code>, under the same rules and only once the epoch is older than <code>QUARANTINE_TTL</code>; report mode counts it and deletes nothing. Neither the boot path nor the reaper deletes without one of those two explicit decisions. An unconfigured gateway, a failed node in the fan-out or a missing page degrades the whole pass to a report, which moves and deletes nothing, quarantine included. <code>AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP</code> selects <code>off</code>, <code>report</code> or <code>enforce</code> and defaults to <code>off</code>; each verdict has a named counter (<code>agentenv_paused_sandbox_artifact_reap_{kept,skipped}_total</code> with a <code>reason</code>, <code>..._{moved,deleted,reclaimed_bytes}_total</code>, and <code>agentenv_paused_sandbox_quarantine_{expired,reclaimed_bytes}_total</code>), the sandbox id is a log field and never a label, and the <code>trashed</code>/<code>removed</code>/quarantine lines carry the id and the bytes.</p>
+<p>A sandbox’s chain of generations is bounded by two independent limits. The absolute <code>orchestrator.chain_bytes_ceiling</code> bounds the reclaimable part of a chain — the runtime-owned overlaybd lowers plus the layer the pause appends, allocated bytes deduplicated by device and inode so hard links count once — because that is the part a sandbox’s own pauses grow. The immutable stable prefix is reported but never charged there: it is materialized once from the image and every sandbox of that image points at the same node-local files, so charging it per sandbox would count one node’s bytes once per sandbox. The second, relative limit is <code>orchestrator.rootfs_chain_disk_multiple</code>: it judges the whole deduplicated rootfs chain, stable prefix included, against a small measured multiple of the guest rootfs disk (default <code>2</code>). Only the rootfs chain carries it; memory, drive and volume keep the absolute ceiling alone. When a pause would push either bound past its limit, the runtime-owned suffix is folded into one complete generation — but not necessarily inside the pause. Since OPSAI-7467 the byte-triggered rewrite is deferred whenever admission proves the node can finish it later: the pause adopts the runtime-owned suffix into the generation (hardlinks under <code>inherited-layers/</code>, as the no-breach path already does) and writes <code>deferred-compaction.json</code> beside the image config with the layer-count trigger and every inline refusal unchanged. The descriptor is a versioned, optional sibling file — never a record field, which keeps record version <code>1</code> and the previous runtime able to resume the generation — carrying the kind, the config to swap, the compacted output name, the layers in chain order, the frozen bounds and the view bytes. <code>src/maintenance/deferred_compaction.rs</code> scans the records that are still <code>Paused</code>, compacts each pending descriptor (repeating the same pre-rewrite headroom refusal), replaces the image config atomically (<code>write tmp + fsync + rename</code>), marks the descriptor <code>Swapped</code>, and only in a later pass unlinks the inputs the current config no longer references. The rewrite does not free its own inputs: a compacted generation that kept the memory delta it folded held both <code>mem_compacted.commit</code> and <code>mem_overlaybd/overlaybd.commit</code>, and a rootfs generation held <code>managed-base.commit</code> plus the <code>snapshot.commit</code> it replaced (146 GiB in one measured generation where about 79 were needed). The delta a pause writes therefore stays at its own path — it is never adopted a second time under <code>inherited-layers/</code> — so the order names the inode the unlink actually frees, and the inline fallback (which already compacted inside the pause) leaves the very same order with the swap done, so only the unlink is left. The pass that frees them records <code>agentenv_paused_sandbox_deferred_chain_compactions_total{kind,outcome="reclaimed"}</code> and one <code>paused sandbox chain removed the copies its compaction replaced</code> line with the kind, the generation, the inputs and the bytes the node got back (a hard link an older generation still owns frees nothing until the sweep takes it). A failure of that unlink keeps the descriptor for the next pass and never touches the generation a paused sandbox resumes from. Admission is the pause’s path decision, never a new refusal: concurrency below <code>deferred_compaction_max_concurrent</code>, pending transient bytes plus the new one within <code>deferred_compaction_pending_bytes_budget</code>, free bytes at the generation at least <code>compaction_transient_bytes</code>, and a writable descriptor; any failure takes today’s inline path with its three named codes. The deferred path records <code>agentenv_paused_sandbox_deferred_chain_compactions_total{kind,outcome}</code> and one <code>paused sandbox chain compacted outside the pause</code> line with kind, bytes before and after, duration and generation (the sandbox id is a log field, never a label). The threshold values, the node disk alert and the per-sandbox disk limit do not change. For disks of 48 GiB and above the absolute reclaimable ceiling usually fires first; for smaller disks the relative bound is the tighter one. The stale-generation sweep treats a regular file as unreferenced only when every hard link it has lives in the swept (stale) set, so an inode shared solely by two stale generations is freed and both directories can empty, while a file the newest generation, a fork child or a live runtime still reaches has a larger link count and is kept; non-regular files are never deleted.</p>
+<p>A pause that still exceeds a limit after compaction fails with the corresponding stable code: <code>CHAIN_BYTES_CEILING_EXCEEDED</code> for the absolute bound, or <code>ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED</code> when the whole rootfs chain is still above <code>multiple × guest disk</code>. Both failures are <strong>recoverable on every device</strong> — rootfs, drive and volume alike. Pause is a capacity optimization: losing the VM loses the sandbox’s work. The rootfs and drive restacks mutate the live runtime before the size is known, so a limit refusal is the one post-restack error that is deliberately not terminal; the pause path resumes the paused-in-memory VM in place, reinserts the handle, restores the proxy route and leaves the sandbox <code>Running</code>. Every other post-restack error (a lost restack reply, a descriptor size mismatch) stays terminal, because the runtime there is genuinely unknown. Before the restack, a pre-flight measures the live chain plus the writable upper’s allocated bytes against both enabled bounds; when that already fits, the post-compaction rejection is provably moot and is skipped, and the pre-flight never refuses on its own (its number is an upper bound, not a floor). A rejected pause cleans up the artifacts it wrote, but never frees a layer a live runtime config references: the sealed layer is copied into the sandbox’s snapshot tree and the config repointed before the generation directory is deleted, and a failure to retain it keeps the directory instead. On the deferred path the worker cannot refuse a pause that already returned: when its rewrite leaves the generation still above a bound it logs the numbers, records outcome <code>still_over_limit</code> and keeps the generation usable, and the next pause folds another generation in. Setting <code>chain_bytes_ceiling</code> to <code>0</code> disables the absolute bound, the pre-flight and the stale-generation sweep; <code>rootfs_chain_disk_multiple = 0</code> disables only the relative bound, restoring the unbounded behavior without a redeploy.</p>
+<p>Each refusal increments <code>agentenv_paused_sandbox_chain_ceiling_exceeded_total{kind}</code>, emits one backend log line with the stable code, the observed bytes, the limit, the appended-upper bytes and the artifact root’s free/total bytes, and one orchestrator line with the node’s paused-sandbox count; the seven-day measurement reads both through the named code. Every pause also records <code>agentenv_paused_sandbox_chain_limit_ratio{kind,limit}</code>, the measured bytes divided by the limit, so the seven-day check can assert that no post-rollout rootfs pause ran above its bound without re-deriving the accounting. The sandbox id is a log field, never a metric label.</p>
+<p>Compaction itself needs transient disk, and a pause refuses before starting one the node cannot finish. <code>compact_layers</code> writes the merged commit to a sibling temp file and renames it into place, so while it runs the inputs and the output coexist on the artifact root; the output is the union of the inputs’ blocks, bounded by the device’s virtual size and by the sum of the inputs’ allocated bytes (each taken as an upper bound, the smaller one used), plus one eighth for the commit index and metadata. The rootfs, drive and volume restacks pass their device’s virtual size, so the first pause of a sandbox far above the bound needs about one guest disk of transient space, not its whole chain: a 144 GB rootfs chain on a 64 GiB guest disk compacts to at most about 64 GiB plus the index margin. When the free bytes at the artifact root are below that bound the pause is refused with the recoverable <code>COMPACTION_HEADROOM_INSUFFICIENT</code> <strong>before</strong> <code>compact_layers</code> is called, so the node never fills its disk half-way through a rewrite; a failed filesystem probe is fail-closed for the same reason. The memory chain keeps the previous behavior. The pause path has no compaction deadline: the only timeout on it is the Firecracker process stop (<code>firecracker.socket_timeout_secs</code>, default 3 s), which runs after the snapshot and the compaction are staged, and there is no server-side HTTP timeout, so a multi-minute compaction completes on the node even when the caller’s client timeout fires first.</p>
+<p>A pause the node declines on purpose is a capacity conflict, not a server failure: the pause endpoint answers <code>409</code> with the <code>code</code> field set to <code>409</code> and a stable <code>errorCode</code> in the body plus the sandbox left <code>Running</code>. The codes are <code>ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED</code>, <code>CHAIN_BYTES_CEILING_EXCEEDED</code> and <code>COMPACTION_HEADROOM_INSUFFICIENT</code>; <code>errorCode</code> is the machine-readable discriminator the platform maps on, so no caller parses the message. Every headroom refusal increments <code>agentenv_paused_sandbox_compaction_headroom_refused_total{kind}</code> and emits a backend log line with the artifact root, the required and free bytes, the device view and the compacted input bytes.</p>
+<h3 id="load-outcome"><a class="header" href="#load-outcome">Load outcome</a></h3>
+<p><code>load_all</code> decides one outcome per paused record and records it in
+<code>agentenv_paused_sandbox_load_total{outcome}</code>. The label values are a closed set,
+so a sandbox ID never becomes a label:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>outcome</code></th><th>Meaning</th><th>Record kept</th><th>Artifacts kept</th></tr>
+</thead>
+<tbody>
+<tr><td><code>loaded_from_local</code></td><td>Runtime state decoded and its artifacts are on this node.</td><td>Yes</td><td>Yes</td></tr>
+<tr><td><code>retained_unreachable</code></td><td>The record is readable but this node holds no resumable runtime state for it — the artifacts are on another node, or its virtualization mode differs. It stays listed as <code>Paused</code> with no runtime state.</td><td>Yes</td><td>Yes</td></tr>
+<tr><td><code>quarantined_no_record</code></td><td>An <code>artifacts/{sandbox_id}</code> directory that no record on this node names. It is renamed to <code>artifacts/.quarantine/{epoch}/{sandbox_id}</code> and kept.</td><td>No</td><td>Yes, moved to the quarantine</td></tr>
+<tr><td><code>discarded</code></td><td>The record is not a paused record at all, or a resume was abandoned in <code>resuming</code>. This is the only branch that deletes a record.</td><td>No</td><td>No for the <code>resuming</code> branch, which removes both; an undecodable record is removed alone, so its directory is then quarantined by name</td></tr>
+</tbody>
+</table>
+</div>
+<p>The distinction matters because a node that cannot decode a paused record is
+exactly what a recreated pod looks like when the artifacts live elsewhere.
+Deleting that record is what made a pod swap permanent loss. The same reasoning
+applies to the artifacts: a generation with no record can be a pause whose
+record never reached the store, or one whose record sits on another node, so the
+boot path moves it to the quarantine instead of deleting it. The boot summary
+line reports <code>quarantined</code> and <code>quarantine_failed</code> beside the outcome tallies; a
+quarantine step that cannot rename logs the sandbox id and both paths and leaves
+the directory in place, so a failed move is never a loss.</p>
+<p><strong>Acceptance query.</strong> Zero paused sandboxes may be lost across a node
+replacement, so the discarded branch is the one to watch:</p>
+<pre><code class="language-promql">sum by (node_id) (increase(agentenv_paused_sandbox_load_total{outcome="discarded"}[7d]))
+</code></pre>
+<p>It must stay at <code>0</code> for the observation window. The alert fires above zero, on the
+reasoning that a single discarded record is already a lost sandbox and the
+discarded branch should only ever see genuinely corrupt bytes. A run that
+discards one record is a bug report, not a threshold to tune.</p>
+<p>The boot must also stop deleting artifact generations, which is a different
+signal: a non-zero <code>quarantined_no_record</code> is the expected outcome of a pod swap
+on a node that still holds the SSD, not an incident. The pair to watch together
+is the quarantine growth (it is inert until the reaper runs in enforce mode) and
+the absence of any new <code>discarded</code>:</p>
+<pre><code class="language-promql">sum by (node_id) (increase(agentenv_paused_sandbox_load_total{outcome="quarantined_no_record"}[24h]))
+</code></pre>
+<p>A window with <code>discarded</code> still at <code>0</code> and a non-zero
+<code>quarantined_no_record</code> is the card’s scenario handled: the generations survived
+the recreated pod. If <code>quarantined_no_record</code> stays at zero across a pod swap
+whose boot log reports no loss, the artifacts were not on the node at all and
+the quarantine path was never exercised.</p>
+<p>The complementary signal, that the bucket path is actually being used, is:</p>
+<pre><code class="language-promql">sum by (node_id) (increase(agentenv_paused_sandbox_load_total{outcome="loaded_from_local"}[1h]))
+</code></pre>
+<p>A node that keeps reporting only <code>loaded_from_local</code> across pod swaps is still
+serving from the SSD, so its bucket path is not exercised.</p>
+<h3 id="where-a-paused-record-and-its-artifacts-live"><a class="header" href="#where-a-paused-record-and-its-artifacts-live">Where a paused record and its artifacts live</a></h3>
+<p>Both live in the same directory, and that is what makes a recreated pod on the
+same node find one with the other. The store root is
+<code>persisted_sandbox_store_path</code>, default <code>$AENV_HOME/persisted-sandboxes</code>
+(<code>src/cfg.rs</code>); <code>$AENV_HOME</code> is <code>home_path</code>, which <code>AENV_HOME_PATH</code> overrides
+because the environment is the first source the config builder adds
+(<code>src/cfg.rs</code>, <code>Config::builder().env().file(path)</code>; see
+<a href="#configuration-reference">Configuration reference</a>). In the runtime image
+<code>AENV_HOME_PATH=/workspace/env</code> (<code>deploy/docker/Dockerfile.agentenv</code>), and
+<code>/workspace</code> is the DaemonSet’s <code>hostPath</code> <code>/var/lib/aenv</code>
+(<code>deploy/k8s/base/agentenv-daemonset.yaml</code>) — the node’s local SSD. So on a
+cluster node:</p>
+<ul>
+<li>the record DB is <code>/workspace/env/persisted-sandboxes/records.db</code>;</li>
+<li>the generations are
+<code>/workspace/env/persisted-sandboxes/artifacts/{sandbox_id}/{uuid}/...</code>;</li>
+<li>both are on the local SSD and survive a pod recreation on the same node; no
+paused record is ever written to an <code>emptyDir</code> or to the container overlay.</li>
+</ul>
+<p>The record therefore cannot disappear in an eviction while its generation
+stays: a generation found without a record was either never given one or had it
+removed. Two paths produce that state, and both run against the same SSD. The
+first is resume, which deletes the record and keeps the generation
+(<code>launch_sandbox</code> calls <code>delete_record</code>, not <code>delete_record_and_artifacts</code>);
+nothing reclaims the directory while <code>paused_artifact_reap</code> is at its default
+<code>off</code>. The second is an eviction inside the window between
+<code>allocate_artifact_root</code> and <code>persist_paused</code>. The log line that separates them
+for one sandbox id is <code>persisting paused sandbox</code>: present in the evicted pod’s
+log means its pause reached the record write, absent means it did not. The lv72
+measurement of 05/11/2026 found five generations and three records: the replica
+that replaced the evicted pod read the three and reported <code>loaded=3 retained=3</code>,
+so the record DB was intact on the SSD and no record was lost with the pod —
+and a record write is fsynced before it is acknowledged, so a record cannot be
+torn. The five were generations of sandboxes that had already resumed.
+Whichever of the two produced them, the boot path now quarantines them instead
+of deleting them.</p>
 <h2 id="p2p-artifact-transport-1"><a class="header" href="#p2p-artifact-transport-1">P2P Artifact Transport</a></h2>
 <p>Owned by <code>src/p2p/*</code>.</p>
 <div class="table-wrapper">
@@ -6256,6 +6890,93 @@ Firecracker manifest with node-local paths, and resolves the committed
 <li>P2P store contents are node-local and optional. Unpublish removes the local catalog entry and related blobs; clearing the store only affects peer-to-peer sharing and may require republishing or refetching artifacts.</li>
 <li>Logs and dependency downloads are operational artifacts. They are not part of sandbox or snapshot correctness, but may require separate retention policy outside image-cache GC.</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="paused-sandbox-cross-node-routing"><a class="header" href="#paused-sandbox-cross-node-routing">Paused Sandbox Cross-Node Routing</a></h1>
+<p>Moving paused sandbox artifacts from node-local SSD to the regional bucket is
+necessary but not sufficient for a paused sandbox to survive a pod swap. The
+gateway resolves where to send a <code>/sandboxes/{id}/resume</code> or
+<code>/sandboxes/{id}/connect</code> request through the scheduler, and that binding —
+not the artifact location — decides whether the request reaches a node at all.</p>
+<p>This document records the two premises that had to be settled before the storage
+switch was designed, with the evidence for each.</p>
+<h2 id="premise-1-a-recreated-node-becomes-the-owner-of-a-paused-sandbox"><a class="header" href="#premise-1-a-recreated-node-becomes-the-owner-of-a-paused-sandbox">Premise 1: a recreated node becomes the owner of a paused sandbox</a></h2>
+<p><strong>Result: it does, with no scheduler or gateway change.</strong></p>
+<p>The chain, end to end:</p>
+<ol>
+<li>A node lists every sandbox its metadata store tracks —
+<code>Orchestrator::list_sandbox_ids</code> (<code>src/orchestrator/service.rs</code>) — which
+includes the paused records restored from the persister at startup
+(<code>new_inner_with_volumes</code> adds every persisted record to the store before the
+orchestrator is built).</li>
+<li>That list is the <code>sandbox_ids</code> field of the node snapshot
+(<code>ObservabilityService::node_snapshot</code>, <code>src/observability/service.rs</code>), sent
+in the heartbeat (<code>ObservabilityReporter</code>, default interval 5 s).</li>
+<li><code>Service.Heartbeat</code> (<code>services/scheduler/internal/service.go</code>) passes
+<code>req.GetSandboxIds()</code> to <code>store.ReconcileNode</code>.</li>
+<li><code>RedisBindingStore.ReconcileNode</code> (<code>services/scheduler/internal/redis_store.go</code>)
+writes the node’s binding record for every desired ID and drops IDs the node
+no longer reports. The Lua script sets the binding for each desired sandbox
+with the binding TTL (default 30 s) and steals the sandbox from another node’s
+reverse index when that node reported it before.</li>
+<li>The recreated pod is a known node before it can heartbeat: the scheduler’s
+node list comes from Kubernetes discovery over the StatefulSet pods
+(<code>services/scheduler/internal/kubernetes_discovery.go</code>), not from the
+heartbeat itself, so <code>Heartbeat</code>’s <code>ErrNodeNotInRegistry</code> applies only to a
+node the discovery never produced.</li>
+</ol>
+<p>So once a recreated node loads a paused record into its store, its next
+heartbeat makes it the sandbox owner, and the gateway’s <code>LookupNode</code> resolves to
+it. Ownership is not the blocker.</p>
+<p><strong>What this premise does not cover, and why it still matters.</strong> Ownership follows
+<em>metadata</em>, so it only works if the recreated node can load the paused record at
+all. That is exactly the load path this card fixes: today a record whose runtime
+state does not decode on the loading node (the case where the artifacts are
+elsewhere) is deleted, so the recreated node reports nothing and no binding is
+ever written. The storage and load fix is what makes premise 1 reachable; the
+routing itself needs no change.</p>
+<p>An artifact generation boot moves to <code>artifacts/.quarantine/</code> because no record
+names it does <strong>not</strong> enter this chain: an interrupted pause produces metadata
+that never existed, so there is no record for the recreated node to list, no
+binding to write, and quarantine preserves bytes without putting the sandbox
+back in the cluster list.</p>
+<h2 id="premise-2-no-path-other-than-lookupnode-refreshes-ownership"><a class="header" href="#premise-2-no-path-other-than-lookupnode-refreshes-ownership">Premise 2: no path other than <code>LookupNode</code> refreshes ownership</a></h2>
+<p><strong>Result: none exists that a paused sandbox can reach.</strong></p>
+<ul>
+<li><code>RecordAssignment</code> (<code>services/scheduler/internal/service.go</code>) is the only other
+writer of a binding. Nothing in this repository calls it for a paused sandbox:
+there is no <code>RecordAssignment</code> call site in <code>src/</code>, and its RPC name is only
+reachable by an explicit gRPC client.</li>
+<li><code>ReportSandboxEvent</code> is explicitly a no-op — it logs and returns an empty
+response, and the scheduler contract states lifecycle events are best-effort
+and do not establish bindings.</li>
+<li>The gateway routes every owner-scoped request through
+<code>s.queryOnlyScheduler.LookupNode</code> (<code>services/gateway/internal/server.go</code>), and
+<code>LookupNode</code> is a read of the binding store. A miss is <code>NotFound</code>.</li>
+</ul>
+<p>Ownership therefore refreshes only through the heartbeat reconcile described in
+premise 1, which is what a recreated node does on its own.</p>
+<h2 id="consequence-for-the-card"><a class="header" href="#consequence-for-the-card">Consequence for the card</a></h2>
+<p>Ownership routing itself needs no change. OPSAI-6200 adds a separate gate on
+top of it: <code>POST /sandboxes/{id}/resume</code> now asks the scheduler
+(<code>ScheduleResume</code>) whether the paused shape fits its owner before proxying. A
+resume that does not fit is deferred (<code>503</code> with <code>Retry-After</code>) or, when
+<code>cross_node_resume</code> is enabled and the shape is known, moved to an admitted node
+and rebound before the proxy. The storage and load path below is still what
+makes a cross-node resume reachable; the gate only decides whether it may happen
+now.</p>
+<p>The acceptance criterion “pause, delete the pod, resume on another node, reach
+READY” is reachable through the storage and load path alone, provided:</p>
+<ul>
+<li>the paused record is still listed by the loading node when its runtime state is
+not decodable there (the retention rule added to <code>load_all</code>), and</li>
+<li>the artifacts travel with the sandbox (the bucket-backed paused store).</li>
+</ul>
+<p>The one assumption this leaves open is node identity stability across a pod
+swap: <code>node_id</code> comes from <code>node_identity.node_id</code> in configuration
+(<code>src/identity.rs</code>), so a recreated pod keeps its identity only while the
+deployment keeps that value stable per replica. This is already the deployment’s
+contract for <code>RecordAssignment</code> and the existing paused-resume flow and is not
+changed here.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="agentenv-proxy-design-and-usage"><a class="header" href="#agentenv-proxy-design-and-usage">AgentENV Proxy Design and Usage</a></h1>
 <p>This document describes the per-node reverse proxy that forwards requests into individual sandboxes. For the distributed routing layer (gateway to scheduler to node), see <a href="#agentenv-architecture">System Architecture</a>.</p>

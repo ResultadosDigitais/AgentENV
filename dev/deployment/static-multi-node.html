@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "../searchindex-8bb79b5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-a4c8b175.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -335,6 +335,11 @@ that fact and can be skipped.</p>
   }
 }
 </code></pre>
+<p>Static discovery has no Kubernetes node object, so <code>memory_capacity_source</code>
+resolves to <code>total</code> and the admission ceiling keeps the historical
+<code>memory_total</code> math. <code>GET /nodes</code> still publishes the per-layer verdict
+(<code>admission</code> object) computed by the same capacity rule, and a paused-sandbox
+resume goes through that rule before it is proxied.</p>
 <p>Protect the configuration after editing it:</p>
 <pre><code class="language-bash">sudo chown root:agentenv-control /etc/agentenv/control-plane.json
 sudo chmod 0640 /etc/agentenv/control-plane.json

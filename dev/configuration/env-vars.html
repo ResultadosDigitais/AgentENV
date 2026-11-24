@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "../searchindex-8bb79b5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-a4c8b175.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -209,6 +209,7 @@
 <tr><td><code>AENV_NODE_ID</code></td><td>hostname-derived</td><td>Override the runtime node identifier used in observability/admin snapshots</td></tr>
 <tr><td><code>AENV_CLUSTER_ID</code></td><td>nil UUID</td><td>Override the cluster UUID used for P2P peer discovery and scheduler grouping</td></tr>
 <tr><td><code>AENV_SERVICE_INSTANCE_ID</code></td><td>random UUIDv7</td><td>Override the per-process service instance UUID included in heartbeats</td></tr>
+<tr><td><code>AENV_NODE_POOL</code></td><td>empty</td><td>Named node pool reported in scheduler heartbeats. Empty keeps the node shared; a pooled node only receives sandboxes that ask for its pool</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED</code></td><td>from config</td><td>Enable scheduler heartbeat reporting</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code></td><td>unset</td><td>Override scheduler heartbeat reporting endpoint</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_REPORT_INTERVAL_SECS</code></td><td><code>5</code></td><td>Override heartbeat reporting interval in seconds</td></tr>
@@ -221,12 +222,20 @@
 <tr><td><code>AENV_VIRTUALIZATION_MODE</code></td><td><code>kvm</code></td><td>Select the node virtualization mode. Leave unset for normal installations; set to <code>pvm</code> only when following the <a href="../deployment/pvm.html">PVM Deployment</a> guide.</td></tr>
 <tr><td><code>AENV_SNAPSHOT_LOCAL_CACHE_PATH</code></td><td><code>$AENV_HOME/snapshot-local-cache</code></td><td>Override the snapshot manager’s node-local artifact/cache root</td></tr>
 <tr><td><code>AENV_SNAPSHOT_STORE</code></td><td><code>$AENV_HOME/snapshot-store</code></td><td>Override the posix_fs snapshot repository root directory</td></tr>
+<tr><td><code>AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_ENABLED</code></td><td><code>false</code></td><td>Enable <code>POST /admin/managed-layers/collect</code>, which sweeps managed layers no catalog record cites. Disabled, the endpoint answers 409 and sweeps nothing. Deleting a layer is irreversible, so an <code>enforce</code> needs the <code>reportToken</code> of a clean report pass: the receipt it names lives in the repository and authorizes exactly one enforce, so the two calls may land on different nodes. See <a href="../internals/persistence-artifact-inventory.html#managed-layer-collection">Managed Layer Collection</a>.</td></tr>
+<tr><td><code>AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GRACE_SECS</code></td><td><code>7200</code></td><td>How old an uncited managed layer must be before <code>enforce</code> may delete it. A publish uploads its layers before it writes the record that cites them, so a layer younger than this may belong to a publish in flight.</td></tr>
+<tr><td><code>AENV_SNAPSHOT_MANAGED_LAYER_COLLECT_GATEWAY_URL</code></td><td>unset</td><td>Base URL of the cluster gateway (<code>http://agentenv-gateway:8080</code> in the provided deployment), called as <code>GET /v2/sandboxes</code> with this node’s API key. The gateway fans the list out to every node, so a sandbox paused on another node keeps its source layers cited, and the paused-artifact sweep sees it too. Unset, or when any node of the fan-out fails, <code>enforce</code> answers 409 and only <code>report</code> runs.</td></tr>
+<tr><td><code>AENV_ORCHESTRATOR_PAUSED_ARTIFACT_REAP</code></td><td><code>off</code></td><td>Periodic sweep of <code>persisted_sandboxes/artifacts/</code> that reclaims a sandbox directory no record and no cluster list names any more: <code>off</code>, <code>report</code> (list and count only) or <code>enforce</code> (move to <code>artifacts/.trash/{epoch}/</code>, then delete after a second grace). Any failed or unconfigured cluster list degrades a pass to a report; see <a href="../internals/persistence-artifact-inventory.html#orchestrator-persistence">Paused Artifact Reaping</a>.</td></tr>
 <tr><td><code>AENV_UBLK_DAEMON_BINARY_PATH</code></td><td><code>$AENV_HOME/ublk/uvm-ublk-daemon</code></td><td>Override path to the <code>uvm-ublk-daemon</code> binary</td></tr>
 <tr><td><code>AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR</code></td><td><code>0.0.0.0:9103</code></td><td>Override ublk daemon Prometheus metrics listen address; empty string disables it</td></tr>
 <tr><td><code>AENV_FORCE_SYSCTL_TUNING</code></td><td>unset</td><td>Set to <code>1</code> to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers.</td></tr>
 <tr><td><code>AENV_FIRECRACKER_WORK_DIR</code></td><td><code>$AENV_HOME/firecracker-work</code></td><td>Override the parent directory for per-sandbox Firecracker work directories.</td></tr>
 <tr><td><code>AENV_FIRECRACKER_SERIAL_DIR</code></td><td><code>$AENV_HOME/logs/serial</code></td><td>Override the directory for persistent Firecracker serial output. Files are grouped under <code>{serial_dir}/{sandbox_id}/</code>.</td></tr>
 <tr><td><code>AENV_PERSISTED_SANDBOX_STORE_PATH</code></td><td><code>$AENV_HOME/persisted-sandboxes</code></td><td>Override the directory where paused sandbox state is persisted across server restarts.</td></tr>
+<tr><td><code>AENV_CHAIN_BYTES_CEILING</code></td><td><code>51539607552</code> (48 GiB)</td><td>Override the byte ceiling for the reclaimable part of one sandbox’s paused artifact chain (its runtime-owned generations plus each pause’s appended layer; the shared image prefix is reported but not charged). A breach no longer pays the rewrite inside the pause: when admission allows, the pause leaves a durable <code>deferred-compaction.json</code> and the maintenance worker compacts afterwards; otherwise the pause compacts inline and, if the part stays above the ceiling, refuses recoverably — the sandbox is resumed in place and keeps running and serving, so no ceiling path stops the VM. <code>0</code> disables the ceiling, the pre-flight and the stale-generation sweep, restoring the unbounded behavior without a redeploy.</td></tr>
+<tr><td><code>AENV_ROOTFS_CHAIN_DISK_MULTIPLE</code></td><td><code>2</code></td><td>Override the relative bound on the whole deduplicated rootfs chain of one sandbox, in multiples of the guest rootfs disk. Both bounds are judged at pause: the reclaimable part against <code>AENV_CHAIN_BYTES_CEILING</code> and the whole chain (stable prefix included) against this multiple. A breach leaves the runtime-owned suffix uncompacted and a durable descriptor behind (see <code>AENV_DEFERRED_COMPACTION_MAX_CONCURRENT</code>) when admission allows it; otherwise it compacts inline and, if the whole chain is still above the multiple, the pause is refused with the recoverable <code>ROOTFS_CHAIN_DISK_MULTIPLE_EXCEEDED</code> and the VM is resumed in place. Only the rootfs chain carries this bound; memory, drive and volume keep the absolute ceiling alone. <code>0</code> disables the relative bound without a redeploy.</td></tr>
+<tr><td><code>AENV_DEFERRED_COMPACTION_MAX_CONCURRENT</code></td><td><code>1</code></td><td>Compactions the maintenance worker may run at the same time on this node. A pause whose byte bound is crossed leaves a durable descriptor and returns; a pause that finds this budget full compacts inline. A parameter, not a kill switch: the boot refuses <code>0</code>. PROVISIONAL default from the 13/11/2026 measurement (12 GiB rewritten per pause on a 32 GiB VM).</td></tr>
+<tr><td><code>AENV_DEFERRED_COMPACTION_PENDING_BYTES_BUDGET</code></td><td><code>103079215104</code> (96 GiB)</td><td>Transient bytes of deferred compactions pending on this node (queued plus in flight); a pause whose compaction would cross it compacts inline. PROVISIONAL default: two times the shipped 48 GiB ceiling. A parameter, not a kill switch: the boot refuses <code>0</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -245,13 +254,8 @@
 </table>
 </div>
 <h3 id="values-by-deployment-mode"><a class="header" href="#values-by-deployment-mode">Values by Deployment Mode</a></h3>
-<p><strong>Manual compile (single node)</strong>:</p>
-<pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8000
-export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=${AENV_API_KEY}
-</code></pre>
-<p><strong>Docker Compose / Kubernetes (multi-node)</strong>:</p>
-<pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8080
+<p><strong>Manual compile (single node)</strong> uses port <code>8000</code>; <strong>Docker Compose / Kubernetes (multi-node)</strong> uses <code>8080</code>:</p>
+<pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8080   # 8000 on a single node
 export E2B_SANDBOX_URL=${E2B_API_URL}
 export E2B_API_KEY=${AENV_API_KEY}
 </code></pre>
@@ -301,7 +305,7 @@ export E2B_API_KEY=${AENV_API_KEY}
 <tbody>
 <tr><td><code>SCHEDULER_GRPC_LISTEN_ADDR</code></td><td><code>:9090</code></td><td>gRPC listen address</td></tr>
 <tr><td><code>SCHEDULER_METRICS_LISTEN_ADDR</code></td><td><code>:9101</code></td><td>Prometheus metrics listen address</td></tr>
-<tr><td><code>SCHEDULER_STRATEGY</code></td><td><code>round_robin</code></td><td>Node selection strategy for new sandboxes: <code>round_robin</code> or <code>random</code></td></tr>
+<tr><td><code>SCHEDULER_STRATEGY</code></td><td><code>round_robin</code></td><td>Node selection strategy for new sandboxes: <code>round_robin</code>, <code>random</code> or <code>least_loaded</code> (the less loaded of two sampled nodes, by heartbeat CPU and memory)</td></tr>
 <tr><td><code>SCHEDULER_REDIS_ADDR</code></td><td>unset</td><td>Redis address for persistent sandbox-to-node bindings (for example, <code>redis:6379</code>). Unset = in-memory bindings, lost on scheduler restart.</td></tr>
 <tr><td><code>SCHEDULER_BINDING_TTL</code></td><td><code>30s</code></td><td>How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, <code>1m</code>).</td></tr>
 <tr><td><code>SCHEDULER_ARTIFACT_STORE_CAPACITY</code></td><td><code>1000000</code></td><td>Maximum number of P2P artifact entries held in the scheduler’s in-memory index</td></tr>

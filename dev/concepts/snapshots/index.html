@@ -36,10 +36,10 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "../../searchindex-8bb79b5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../../toc-d7504e7d.js"></script>
+        <script src="../../toc-a4c8b175.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -191,6 +191,11 @@ the template ID is an alias that resolves to it.</li>
 <li><strong>Warm-started sandboxes</strong> restore the state of a committed template or snapshot.</li>
 <li><strong>Running sandboxes</strong> can produce new snapshots, capturing their current
 state for later reuse or branching.</li>
+<li><strong>Paused sandboxes</strong> can be published as a durable snapshot from the artifacts
+their last pause already wrote, without resuming the VM. The publication is
+incremental: layers already in the repository are reused by digest, so only
+the new ones are uploaded. Publishing a paused sandbox never resumes it; it
+stays paused afterward.</li>
 </ul>
 <h2 id="what-a-snapshot-preserves"><a class="header" href="#what-a-snapshot-preserves">What a Snapshot Preserves</a></h2>
 <p>A snapshot preserves:</p>
@@ -207,7 +212,7 @@ environment variables, working directory, user, and startup commands.</li>
 <hr>
 <p>Where to Go Next:</p>
 <ul>
-<li><a href="./create.html">Create a Snapshot</a> — capture a reusable checkpoint from a running sandbox.</li>
+<li><a href="./create.html">Create a Snapshot</a> — capture a reusable checkpoint from a running or a paused sandbox.</li>
 <li><a href="./manage.html">Manage Snapshots</a> — list, inspect, and delete snapshots.</li>
 <li><a href="./use.html">Rootfs as an OCI Image</a> — publish or export only the captured root filesystem.</li>
 <li><a href="./p2p.html">Optional P2P Visibility</a> — accelerate committed snapshot artifact distribution between nodes.</li>

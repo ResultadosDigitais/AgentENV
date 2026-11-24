@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "../searchindex-8bb79b5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-a4c8b175.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -199,8 +199,9 @@ network; 10 Gbps or faster is strongly recommended.</li>
 vim config.toml
 </code></pre>
 <h2 id="2-configure-shared-storage"><a class="header" href="#2-configure-shared-storage">2. Configure shared storage</a></h2>
-<p>AgentENV supports two shared storage backends: POSIXFS and OSS. Choose one of
-the following options.</p>
+<p>AgentENV supports three shared storage backends: POSIXFS, OSS (S3-compatible
+object storage) and GCS (Google Cloud Storage). Choose one of the following
+options.</p>
 <h3 id="option-a-posixfs"><a class="header" href="#option-a-posixfs">Option A: POSIXFS</a></h3>
 <p>Enable the POSIXFS backend, set the shared snapshot location, and increase the
 remote-block cache:</p>
@@ -235,6 +236,26 @@ max_size_gb = 100
 example <a href="https://www.tigrisdata.com/docs/">Tigris</a> or a Cloudflare R2
 deployment — also set <code>addressing_style = "virtual"</code>; see the
 <a href="../configuration/reference.html#backendoss">configuration reference</a> for details.</p>
+<h3 id="option-c-gcs"><a class="header" href="#option-c-gcs">Option C: GCS</a></h3>
+<p>Enable the GCS backend, name the bucket and point <code>credential_path</code> at a
+service-account key or a Workload Identity Federation <code>external_account</code> file:</p>
+<pre><code class="language-toml">[snapshot]
+repository_backend = "gcs"
+
+[backend.gcs]
+bucket = "YOUR_BUCKET"
+prefix = "YOUR_PREFIX"
+credential_path = "/etc/agentenv/gcp/credential.json"
+cache_max_size_gb = 100
+
+[image.cache.remote_blocks]
+max_size_gb = 100
+</code></pre>
+<p>On Kubernetes, follow the
+<a href="../configuration/reference.html#kubernetes-setup">Kubernetes setup</a> so that
+sandboxes cannot reach the credentials. See the
+<a href="../configuration/reference.html#backendgcs">configuration reference</a> for all
+options.</p>
 <h2 id="3-apply-the-configuration"><a class="header" href="#3-apply-the-configuration">3. Apply the configuration</a></h2>
 <p>If AgentENV is running as a systemd service, restart it:</p>
 <pre><code class="language-bash">sudo systemctl restart aenv

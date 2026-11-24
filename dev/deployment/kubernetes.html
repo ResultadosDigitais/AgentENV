@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "../searchindex-8bb79b5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-a4c8b175.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -286,6 +286,15 @@ make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 </code></pre>
 <h2 id="service-discovery"><a class="header" href="#service-discovery">Service Discovery</a></h2>
 <p>The scheduler watches EndpointSlices for the headless <code>agentenv-nodes</code> Service and watches Pods for optional label-based discovery policy. It schedules only serving, non-terminating DaemonSet Pods. Pods matching <code>scheduler.discovery.kubernetes.no_schedule_pod_selector</code> stay discoverable as lingering/no-schedule nodes, while Pods matching <code>scheduler.discovery.kubernetes.ignore_pod_selector</code> are excluded. Both IPv4 and IPv6 endpoint addresses are supported.</p>
+<p>The scheduler also watches cluster-scoped Nodes to read <code>status.allocatable.memory</code> for the admission ceiling (<code>memory_capacity_source: allocatable</code>, the default): the ceiling is the allocatable memory minus the runtime overhead, with <code>memory_total</code> as the fallback. This needs a read-only cluster-scoped <code>ClusterRole</code> with <code>get</code>, <code>list</code> and <code>watch</code> on <code>nodes</code> only, bound to the <code>agentenv-scheduler</code> ServiceAccount; the namespaced Role for EndpointSlices and Pods is unchanged. <code>GET /nodes</code> publishes the per-layer verdict in an <code>admission</code> object, and <code>POST /sandboxes/{id}/resume</code> is gated by the same rule (a deferred resume is <code>503</code> with <code>Retry-After</code>).</p>
+<p><code>max_memory_used_percent</code> compares the raw cgroup <code>memory.current</code> of the runtime by default (<code>memory_used_meter: raw</code>), which includes page cache. Two other meters read figures the runtime publishes in the heartbeat next to the unchanged <code>memoryUsedBytes</code>:</p>
+<ul>
+<li><code>memory_used_meter: working_set</code> compares <code>memoryWorkingSetBytes</code> (<code>memory.current</code> minus <code>inactive_file</code>, the figure kubelet reports).</li>
+<li><code>memory_used_meter: unreclaimable</code> compares <code>memoryUnreclaimableBytes</code>, the memory the runtime cgroup cannot give back: <code>anon</code> + <code>file_mapped</code> + <code>shmem</code> + <code>file_dirty</code> + <code>file_writeback</code> plus the unreclaimable kernel pages (<code>kernel_stack</code>, <code>pagetables</code>, <code>percpu</code>, <code>sock</code>, <code>slab_unreclaimable</code>). <code>MemAvailable</code> is not used because it treats <code>file_mapped</code> as reclaimable, and here the mapped pages are restored VM memory. This is the meter that reflects the node’s real occupancy when the runtime holds a large active page cache.</li>
+</ul>
+<p>The meters chain down for a node that does not report the selected field, so a mixed fleet during the rollout is never admitted free: <code>unreclaimable</code> falls back to the working set and then to raw, and <code>working_set</code> falls back to raw. The scheduler logs <code>scheduler memory meter fell back</code> with <code>node_id</code>, <code>configured_meter</code>, <code>meter</code> and <code>reason</code> (<code>memory_unreclaimable_bytes_absent</code> or <code>memory_working_set_bytes_absent</code>), and every <code>scheduler rejected node by resource limit</code> line carries the <code>meter</code> that produced the node figure.</p>
+<p>Under <code>unreclaimable</code> the admission ceiling does not subtract the raw runtime overhead from the capacity base: the figure already counts the runtime’s own pages in the numerator, so subtracting <code>memory_used - allocated</code> again would collapse the base with the page cache. With <code>memory_capacity_source: allocatable</code> the base is <code>min(allocatable, memory_total)</code> and <code>GET /nodes</code> publishes <code>runtimeOverheadBytes: 0</code>, so the decision stays reproducible.</p>
+<p>Roll out the runtime image before the scheduler: confirm <code>memoryUnreclaimableBytes</code> appears in <code>GET /nodes</code> for every node, then set <code>memory_used_meter: unreclaimable</code>. Rollback is config-only: set the value back to <code>working_set</code> or <code>raw</code>, with no runtime deploy and no migration. An unknown value is rejected at startup.</p>
 <blockquote>
 <p>Sandbox bindings remain in-memory, so the scheduler should run as a single replica. Bindings are lost on restart.</p>
 </blockquote>
