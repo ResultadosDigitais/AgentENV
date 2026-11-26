@@ -153,3 +153,54 @@ func TestMarginKeyDecodesAndContractIsRecognised(t *testing.T) {
 		t.Fatalf("capacity reason = %q", admission.ReasonCapacityUnknown)
 	}
 }
+
+// The including-paused CPU ceiling is an explicit cap only. Paused sandboxes
+// released their vCPUs, so deriving the ceiling from max_cpu_allocated_percent
+// counted CPU that does not exist: a 14 vCPU node at the 200% overcommit ratio
+// produced 28 cores and refused nodes with 0-67% real CPU usage. With the margin
+// declared and no explicit cap the CPU ceiling is unknown, while the memory
+// ceiling the margin produces is unchanged.
+func TestIncludingPausedCPUCeilingNeedsTheExplicitCap(t *testing.T) {
+	margin := uint64(8) << 30
+	percent := uint32(200)
+	ceilings, reason := admission.IncludingPausedCeilingsOf(&config.NodeResourceLimit{
+		MaxAllocatedMemoryMarginBytes: &margin,
+		MaxCPUAllocatedPercent:        &percent,
+	}, 120925978624, 14)
+
+	if reason != "" {
+		t.Fatalf("unexpected reason %q", reason)
+	}
+	if !ceilings.Applied || !ceilings.MemoryKnown {
+		t.Fatalf("the memory ceiling must stay applied and known, got %+v", ceilings)
+	}
+	if ceilings.MemoryBytes != 112336044032 {
+		t.Fatalf("memory ceiling = %d, want 112336044032", ceilings.MemoryBytes)
+	}
+	if ceilings.CPUKnown {
+		t.Fatalf("the CPU ceiling must be unknown without the explicit cap, got %d cores", ceilings.CPUCores)
+	}
+}
+
+// The explicit cap is the only source of the including-paused CPU ceiling, so it
+// applies as declared instead of being compared against a derived figure.
+func TestIncludingPausedCPUCeilingAppliesTheExplicitCap(t *testing.T) {
+	margin := uint64(8) << 30
+	percent := uint32(200)
+	cap := uint32(20)
+	ceilings, reason := admission.IncludingPausedCeilingsOf(&config.NodeResourceLimit{
+		MaxAllocatedMemoryMarginBytes:  &margin,
+		MaxCPUAllocatedPercent:         &percent,
+		MaxAllocatedCPUIncludingPaused: &cap,
+	}, 120925978624, 14)
+
+	if reason != "" {
+		t.Fatalf("unexpected reason %q", reason)
+	}
+	if !ceilings.CPUKnown || ceilings.CPUCores != 20 {
+		t.Fatalf("explicit cap must be the cpu ceiling, got %+v", ceilings)
+	}
+	if !ceilings.MemoryKnown || ceilings.MemoryBytes != 112336044032 {
+		t.Fatalf("memory ceiling must be unaffected by the cpu cap, got %+v", ceilings)
+	}
+}

@@ -8,35 +8,31 @@
   "vectors": [
     {
       "name": "measured-node-19-11-112.62gib-14vcpu",
-      "detail": "The 19/11 reading on the card: 120925978624 bytes (115324 MiB, the same figure the runtime pod reports) and 14 vCPUs. The 8 GiB margin leaves 107132 MiB, and 14 x 200% floors at 28 cores.",
+      "detail": "The 19/11 reading on the card: 120925978624 bytes (115324 MiB, the same figure the runtime pod reports) and 14 vCPUs. The 8 GiB margin leaves 107132 MiB. The CPU ceiling is unknown: only the explicit including-paused cap creates one, never max_cpu_allocated_percent.",
       "memoryTotalBytes": 120925978624,
       "cpuCount": 14,
-      "wantMemoryCeilingBytes": 112336044032,
-      "wantCpuCeilingCores": 28
+      "wantMemoryCeilingBytes": 112336044032
     },
     {
       "name": "n2-highmem-16-125.8gib-16vcpu",
-      "detail": "128819 MiB (125.8 GiB) and 16 vCPUs from the 05/11 measurement used by filter_capacity_test.go; 117.8 GiB and 32 cores.",
+      "detail": "128819 MiB (125.8 GiB) and 16 vCPUs from the 05/11 measurement used by filter_capacity_test.go; the 8 GiB margin leaves 117.8 GiB and the CPU ceiling is unknown without the explicit cap.",
       "memoryTotalBytes": 135076511744,
       "cpuCount": 16,
-      "wantMemoryCeilingBytes": 126486577152,
-      "wantCpuCeilingCores": 32
+      "wantMemoryCeilingBytes": 126486577152
     },
     {
       "name": "same-node-altered-reading-118gib",
-      "detail": "The same size of node reporting 118 GiB must follow the altered reading: 110 GiB.",
+      "detail": "The same size of node reporting 118 GiB must follow the altered reading: 110 GiB, with no CPU ceiling.",
       "memoryTotalBytes": 126701535232,
       "cpuCount": 16,
-      "wantMemoryCeilingBytes": 118111600640,
-      "wantCpuCeilingCores": 32
+      "wantMemoryCeilingBytes": 118111600640
     },
     {
       "name": "total-below-margin-floors-at-zero",
       "detail": "A total smaller than the margin produces a zero ceiling, never a negative one.",
       "memoryTotalBytes": 4294967296,
       "cpuCount": 16,
-      "wantMemoryCeilingBytes": 0,
-      "wantCpuCeilingCores": 32
+      "wantMemoryCeilingBytes": 0
     },
     {
       "name": "absent-memory-total-is-capacity-unknown",
@@ -62,7 +58,7 @@
     },
     {
       "name": "legacy-cap-squeezes-the-large-node",
-      "detail": "121332826112 bytes (113 GiB) enters only as min: it squeezes the 117.8 GiB ceiling of the 125.8 GiB node down to 113 GiB.",
+      "detail": "121332826112 bytes (113 GiB) enters only as min: it squeezes the 117.8 GiB ceiling of the 125.8 GiB node down to 113 GiB. The declared 32-core cap is the CPU ceiling verbatim.",
       "memoryTotalBytes": 135076511744,
       "cpuCount": 16,
       "applyLegacyCaps": true,
@@ -71,12 +67,12 @@
     },
     {
       "name": "legacy-cap-is-inert-on-the-measured-node",
-      "detail": "The same 113 GiB cap never raises the 104.62 GiB ceiling of the measured node.",
+      "detail": "The same 113 GiB cap never raises the 104.62 GiB ceiling of the measured node, and the declared 32-core cap is the CPU ceiling verbatim.",
       "memoryTotalBytes": 120925978624,
       "cpuCount": 14,
       "applyLegacyCaps": true,
       "wantMemoryCeilingBytes": 112336044032,
-      "wantCpuCeilingCores": 28
+      "wantCpuCeilingCores": 32
     },
     {
       "name": "contract-absent-negative-control",

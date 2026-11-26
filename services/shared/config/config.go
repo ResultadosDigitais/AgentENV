@@ -81,6 +81,12 @@ type NodeResourceLimit struct {
 	// but still occupy persisted state on the node, so operators may want a
 	// separate ceiling on total node footprint (including paused) on top of
 	// the active-only ceilings above.
+	//
+	// MaxAllocatedCPUIncludingPaused is the only source of an including-paused
+	// CPU ceiling. It is never derived from MaxCPUAllocatedPercent: CPU is
+	// compressible and paused sandboxes released their vCPUs, so deriving it
+	// would refuse nodes on CPU that does not exist. The memory ceiling keeps
+	// the margin-derived form because memory is not compressible.
 	MaxSandboxCountIncludingPaused         *uint32 `json:"max_sandbox_count_including_paused"`
 	MaxAllocatedCPUIncludingPaused         *uint32 `json:"max_allocated_cpu_including_paused"`
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
@@ -90,7 +96,8 @@ type NodeResourceLimit struct {
 	// memory_total_bytes - margin), recomputed from the node's own reading at
 	// admission time. Absent (the default) preserves the historical behaviour
 	// byte for byte and is the rollback path. A margin below 8 GiB is refused
-	// by the ceiling leaf, not honoured.
+	// by the ceiling leaf, not honoured. The margin produces a memory ceiling
+	// only; the including-paused CPU ceiling still needs the explicit cap.
 	MaxAllocatedMemoryMarginBytes *uint64 `json:"max_allocated_memory_margin_bytes"`
 
 	// AdmissionLayers are the VM shapes whose admission is published per node
