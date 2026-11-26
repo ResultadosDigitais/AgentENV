@@ -43,17 +43,24 @@ type IncludingPausedCeilings struct {
 // including-paused ceilings:
 //
 //	memory = min(declared memory cap, if any; max(0, memory_total_bytes - margin))
-//	cpu    = min(declared cpu cap, if any; floor(cpu_count * max_cpu_allocated_percent / 100))
+//	cpu    = declared cpu cap, when the operator declares one
 //
 // The legacy caps of 121332826112 bytes and 32 cores enter ONLY as min: they
-// can tighten the per-node ceiling and never raise it. With the margin key
-// absent the function is on the legacy path and returns the declared caps
+// can tighten the per-node memory ceiling and never raise it. With the margin
+// key absent the function is on the legacy path and returns the declared caps
 // unchanged, which is byte for byte the historical decision and the rollback.
 //
+// The including-paused CPU ceiling is an explicit cap and nothing else. It is
+// not derived from max_cpu_allocated_percent (the active-only overcommit
+// ratio) because CPU is a compressible resource: paused sandboxes released
+// their vCPUs, so counting them in a CPU ceiling refuses nodes on CPU that does
+// not exist. Memory is not compressible, which is why its including-paused
+// ceiling keeps the margin-derived form.
+//
 // The margin below MinAllocatedMemoryMarginBytes is a floor, not a preference,
-// and a snapshot without memory total or CPU count cannot produce the
-// ceilings: both return ReasonCapacityUnknown so the caller refuses instead of
-// failing open.
+// and a snapshot without memory total or CPU count is an incomplete reading:
+// both return ReasonCapacityUnknown so the caller refuses instead of failing
+// open.
 func IncludingPausedCeilingsOf(limit *config.NodeResourceLimit, memoryTotalBytes uint64, cpuCount uint32) (IncludingPausedCeilings, string) {
 	if limit == nil {
 		return IncludingPausedCeilings{}, ""
@@ -93,19 +100,9 @@ func IncludingPausedCeilingsOf(limit *config.NodeResourceLimit, memoryTotalBytes
 	ceilings.MemoryKnown = true
 	ceilings.MemoryBytes = memory
 
-	if limit.MaxCPUAllocatedPercent != nil {
-		cores := uint64(cpuCount) * uint64(*limit.MaxCPUAllocatedPercent) / 100
-		if cores > uint64(^uint32(0)) {
-			cores = uint64(^uint32(0))
-		}
-		ceilings.CPUKnown = true
-		ceilings.CPUCores = uint32(cores)
-	}
 	if limit.MaxAllocatedCPUIncludingPaused != nil {
-		if declared := *limit.MaxAllocatedCPUIncludingPaused; !ceilings.CPUKnown || declared < ceilings.CPUCores {
-			ceilings.CPUKnown = true
-			ceilings.CPUCores = declared
-		}
+		ceilings.CPUKnown = true
+		ceilings.CPUCores = *limit.MaxAllocatedCPUIncludingPaused
 	}
 	return ceilings, ""
 }

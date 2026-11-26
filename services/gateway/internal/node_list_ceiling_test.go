@@ -47,8 +47,10 @@ func observedNodeWithSnapshot(snapshot *schedulerv1.NodeSnapshot) stubSchedulerC
 
 // /nodes publishes the per-node ceiling contract the ProductFactory ceiling
 // reader recognises: admission.contract = per_node_ceiling_v1 plus the
-// including-paused ceilings computed from the same reading the scheduler uses.
-func TestNodeListPublishesNodeCeilingContract(t *testing.T) {
+// including-paused figures computed from the same reading the scheduler uses.
+// Without an explicit including-paused CPU cap the memory ceiling is published
+// and the CPU figure is omitted, because paused sandboxes do not consume CPU.
+func TestNodeListPublishesMemoryCeilingWithoutDerivedCPUCeiling(t *testing.T) {
 	margin := uint64(8) << 30
 	percent := uint32(200)
 	server := newTestServer(t, observedNodeWithSnapshot(&schedulerv1.NodeSnapshot{
@@ -82,13 +84,50 @@ func TestNodeListPublishesNodeCeilingContract(t *testing.T) {
 	if got := ceilings["memoryBytes"]; got != float64(112336044032) {
 		t.Fatalf("ceilings.memoryBytes = %v", got)
 	}
-	if got := ceilings["cpuCores"]; got != float64(28) {
-		t.Fatalf("ceilings.cpuCores = %v", got)
+	if _, ok := ceilings["cpuCores"]; ok {
+		t.Fatalf("cpuCores must be omitted without the explicit cap: %v", ceilings)
 	}
-	// A known ceiling pair carries no reason: the field is written only when
-	// the pair could not be computed.
+	// A known ceiling carries no reason: the field is written only when no
+	// ceiling could be computed.
 	if _, ok := admissionObject["contractReason"]; ok {
-		t.Fatalf("contractReason must be absent when the ceilings are known: %v", admissionObject)
+		t.Fatalf("contractReason must be absent when the memory ceiling is known: %v", admissionObject)
+	}
+}
+
+// The explicit including-paused CPU cap is published verbatim beside the memory
+// ceiling.
+func TestNodeListPublishesExplicitIncludingPausedCPUCap(t *testing.T) {
+	margin := uint64(8) << 30
+	percent := uint32(200)
+	cap := uint32(20)
+	server := newTestServer(t, observedNodeWithSnapshot(&schedulerv1.NodeSnapshot{
+		Status:           schedulerv1.NodeStatus_NODE_STATUS_READY,
+		MemoryTotalBytes: 120925978624,
+		CpuCount:         14,
+	}), 5*time.Second, 4<<20, withNodeResourceLimit(&config.NodeResourceLimit{
+		MaxAllocatedMemoryMarginBytes:  &margin,
+		MaxCPUAllocatedPercent:         &percent,
+		MaxAllocatedCPUIncludingPaused: &cap,
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/nodes", nil)
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+
+	node := decodeSingleNode(t, response.Body.Bytes())
+	admissionObject, _ := node["admission"].(map[string]any)
+	ceilings, ok := admissionObject["ceilings"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing ceilings object: %v", admissionObject)
+	}
+	if got := ceilings["cpuCores"]; got != float64(20) {
+		t.Fatalf("ceilings.cpuCores = %v, want 20", got)
+	}
+	if got := ceilings["memoryBytes"]; got != float64(112336044032) {
+		t.Fatalf("ceilings.memoryBytes = %v", got)
 	}
 }
 
@@ -154,10 +193,10 @@ func TestNodeListPublishesContractWithCapacityUnknownOnUnknownReading(t *testing
 	}
 }
 
-// A complete reading without a configured CPU ceiling still yields no ceiling
-// pair: the marker is published with capacity_unknown rather than a half pair,
-// so the reader never trusts a number the scheduler could not compute.
-func TestNodeListPublishesContractWithCapacityUnknownWhenCPUCeilingUnconfigured(t *testing.T) {
+// A readable memory total with no configured CPU ceiling still publishes the
+// memory ceiling: a missing CPU cap is not an unknown capacity, so the contract
+// carries the memory figure and omits only the CPU one.
+func TestNodeListPublishesMemoryCeilingWhenCPUCeilingUnconfigured(t *testing.T) {
 	margin := uint64(8) << 30
 	server := newTestServer(t, observedNodeWithSnapshot(&schedulerv1.NodeSnapshot{
 		Status:           schedulerv1.NodeStatus_NODE_STATUS_READY,
@@ -182,10 +221,17 @@ func TestNodeListPublishesContractWithCapacityUnknownWhenCPUCeilingUnconfigured(
 	if got := admissionObject["contract"]; got != admission.ContractPerNodeCeilingV1 {
 		t.Fatalf("contract = %v, want %q", got, admission.ContractPerNodeCeilingV1)
 	}
-	if _, ok := admissionObject["ceilings"]; ok {
-		t.Fatalf("ceilings must be absent when the CPU ceiling is not computable: %v", admissionObject)
+	ceilings, ok := admissionObject["ceilings"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing ceilings object: %v", admissionObject)
 	}
-	if got := admissionObject["contractReason"]; got != admission.ReasonCapacityUnknown {
-		t.Fatalf("contractReason = %v, want %q", got, admission.ReasonCapacityUnknown)
+	if got := ceilings["memoryBytes"]; got != float64(112336044032) {
+		t.Fatalf("ceilings.memoryBytes = %v", got)
+	}
+	if _, ok := ceilings["cpuCores"]; ok {
+		t.Fatalf("cpuCores must be omitted without the explicit cap: %v", ceilings)
+	}
+	if _, ok := admissionObject["contractReason"]; ok {
+		t.Fatalf("contractReason must be absent when the memory ceiling is known: %v", admissionObject)
 	}
 }

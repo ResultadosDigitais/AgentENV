@@ -119,12 +119,15 @@ func TestNodeCeilingVectorsThroughPublishedVerdict(t *testing.T) {
 			}
 
 			// The CPU ceiling, with the excess paused so max_cpu_allocated_percent
-			// (the active-only check) cannot mask it.
-			node = ceilingNode(vector)
-			node.Snapshot.AllocatedCpu = 1
-			node.Snapshot.PausedAllocatedCpu = *vector.WantCPUCeilingCores + 1
-			if got := EvaluateLayerAdmission(node, config.AdmissionLayer{MemoryGB: 0}, limit); got.Admitted || got.Reason != ReasonCPU {
-				t.Fatalf("one core above the cpu ceiling must be cpu, got %+v (%s)", got, vector.Detail)
+			// (the active-only check) cannot mask it. Vectors without the explicit
+			// including-paused cap carry no CPU ceiling to exercise.
+			if vector.WantCPUCeilingCores != nil {
+				node = ceilingNode(vector)
+				node.Snapshot.AllocatedCpu = 1
+				node.Snapshot.PausedAllocatedCpu = *vector.WantCPUCeilingCores + 1
+				if got := EvaluateLayerAdmission(node, config.AdmissionLayer{MemoryGB: 0}, limit); got.Admitted || got.Reason != ReasonCPU {
+					t.Fatalf("one core above the cpu ceiling must be cpu, got %+v (%s)", got, vector.Detail)
+				}
 			}
 		})
 	}

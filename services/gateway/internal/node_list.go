@@ -62,10 +62,13 @@ type nodeListAdmissionLayer struct {
 
 // nodeListAdmissionCeilings is the including-paused ceiling pair computed from
 // the node's own reading. The ProductFactory ceiling reader looks for the
-// contract marker before trusting them.
+// contract marker before trusting them. CPUCores is present only when the
+// operator declared an explicit including-paused CPU cap: paused sandboxes do
+// not consume CPU, so the ceiling is never derived from the active-only
+// overcommit ratio.
 type nodeListAdmissionCeilings struct {
-	MemoryBytes uint64 `json:"memoryBytes"`
-	CPUCores    uint32 `json:"cpuCores"`
+	MemoryBytes uint64  `json:"memoryBytes"`
+	CPUCores    *uint32 `json:"cpuCores,omitempty"`
 }
 
 type nodeListAdmission struct {
@@ -77,11 +80,12 @@ type nodeListAdmission struct {
 	ReservedCPU            uint32                   `json:"reservedCPU"`
 	Layers                 []nodeListAdmissionLayer `json:"layers"`
 	// Contract marks the per-node ceiling contract the payload was computed
-	// over, Ceilings carries the pair, and ContractReason names the reason the
-	// pair could not be computed. The marker is published whenever the margin
-	// key is declared; Ceilings and ContractReason are mutually exclusive, so a
-	// reader sees unknown instead of a guessed ceiling, and a reading that has
-	// no figures never looks like the legacy path.
+	// over, Ceilings carries the figures that are known (memory always, CPU
+	// only under an explicit including-paused cap), and ContractReason names
+	// the reason no ceiling could be computed. The marker is published whenever
+	// the margin key is declared; Ceilings and ContractReason are mutually
+	// exclusive, so a reader sees unknown instead of a guessed ceiling, and a
+	// reading that has no figures never looks like the legacy path.
 	Contract       string                     `json:"contract,omitempty"`
 	Ceilings       *nodeListAdmissionCeilings `json:"ceilings,omitempty"`
 	ContractReason string                     `json:"contractReason,omitempty"`
@@ -101,13 +105,19 @@ func nodeAdmissionContract(snapshot *schedulerv1.NodeSnapshot, limit *config.Nod
 	if reason != "" {
 		return admission.ContractPerNodeCeilingV1, nil, reason
 	}
-	if ceilings.MemoryKnown && ceilings.CPUKnown {
-		return admission.ContractPerNodeCeilingV1, &nodeListAdmissionCeilings{
-			MemoryBytes: ceilings.MemoryBytes,
-			CPUCores:    ceilings.CPUCores,
-		}, ""
+	// The memory ceiling is always computable from a readable total; the CPU
+	// ceiling exists only under an explicit including-paused cap. Publishing
+	// capacity_unknown for a missing CPU cap would hide the memory ceiling the
+	// node does have, so the pair is published with the CPU figure omitted.
+	if !ceilings.MemoryKnown {
+		return admission.ContractPerNodeCeilingV1, nil, admission.ReasonCapacityUnknown
 	}
-	return admission.ContractPerNodeCeilingV1, nil, admission.ReasonCapacityUnknown
+	published := &nodeListAdmissionCeilings{MemoryBytes: ceilings.MemoryBytes}
+	if ceilings.CPUKnown {
+		cores := ceilings.CPUCores
+		published.CPUCores = &cores
+	}
+	return admission.ContractPerNodeCeilingV1, published, ""
 }
 
 type nodeListItem struct {
